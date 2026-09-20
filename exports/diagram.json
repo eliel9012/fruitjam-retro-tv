@@ -1,0 +1,573 @@
+{
+  "nodes": [
+    {
+      "id": "board",
+      "type": "board",
+      "position": {
+        "x": 650,
+        "y": 100
+      },
+      "data": {
+        "component": {
+          "id": "board",
+          "name": "M5Stack Core2",
+          "aliases": [],
+          "type": "board",
+          "description": "Microcontroller board",
+          "pinRequirements": [],
+          "libraries": []
+        },
+        "instanceId": "board",
+        "label": "M5Stack Core2",
+        "pins": [
+          {
+            "gpio": 0,
+            "label": "G0",
+            "connector": "M5-Bus",
+            "connectorPosition": "24",
+            "functions": [
+              "gpio",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Speaker LRCK and PDM microphone clock",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "audio.lrck-and-microphone-clock",
+            "reservedReason": "builtin"
+          },
+          {
+            "gpio": 1,
+            "label": "G1 / TXD0",
+            "connector": "M5-Bus",
+            "connectorPosition": "14",
+            "functions": [
+              "gpio",
+              "uart",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "TX, GPIO1, TX0",
+            "recommended": false,
+            "reservedReason": "serial"
+          },
+          {
+            "gpio": 2,
+            "label": "G2",
+            "connector": "M5-Bus",
+            "connectorPosition": "23",
+            "functions": [
+              "gpio",
+              "adc",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Built-in NS4168 speaker data",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "speaker.data",
+            "reservedReason": "builtin"
+          },
+          {
+            "gpio": 3,
+            "label": "G3 / RXD0",
+            "connector": "M5-Bus",
+            "connectorPosition": "13",
+            "functions": [
+              "gpio",
+              "uart",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "RX, GPIO3, RX0",
+            "recommended": false,
+            "reservedReason": "serial"
+          },
+          {
+            "gpio": 13,
+            "label": "G13 / RXD2",
+            "connector": "M5-Bus / HY2.0-4P PORT.C",
+            "connectorPosition": "15",
+            "functions": [
+              "gpio",
+              "adc",
+              "pwm",
+              "uart"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "RX2, GPIO13, ADC2_CH4",
+            "recommended": true
+          },
+          {
+            "gpio": 14,
+            "label": "G14 / TXD2",
+            "connector": "M5-Bus / HY2.0-4P PORT.C",
+            "connectorPosition": "16",
+            "functions": [
+              "gpio",
+              "adc",
+              "pwm",
+              "uart"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "TX2, GPIO14, ADC2_CH6",
+            "recommended": true
+          },
+          {
+            "gpio": 18,
+            "label": "G18",
+            "connector": "M5-Bus",
+            "connectorPosition": "11",
+            "functions": [
+              "gpio",
+              "spi",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Shared clock for the built-in display and microSD slot",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "display-and-microsd.sck",
+            "reservedReason": "builtin"
+          },
+          {
+            "gpio": 19,
+            "label": "G19",
+            "connector": "M5-Bus",
+            "connectorPosition": "22",
+            "functions": [
+              "gpio",
+              "spi",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "GPIO19, SPI MISO",
+            "recommended": true
+          },
+          {
+            "gpio": 21,
+            "label": "G21",
+            "connector": "M5-Bus",
+            "connectorPosition": "17",
+            "functions": [
+              "gpio",
+              "i2c",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Internal I2C SDA for touch, IMU, RTC, and power management",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "internal-i2c.sda",
+            "reservedReason": "builtin"
+          },
+          {
+            "gpio": 22,
+            "label": "G22",
+            "connector": "M5-Bus",
+            "connectorPosition": "18",
+            "functions": [
+              "gpio",
+              "i2c",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Internal I2C SCL for touch, IMU, RTC, and power management",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "internal-i2c.scl",
+            "reservedReason": "builtin"
+          },
+          {
+            "gpio": 23,
+            "label": "G23",
+            "connector": "M5-Bus",
+            "connectorPosition": "7",
+            "functions": [
+              "gpio",
+              "spi",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Shared MOSI for the built-in display and microSD slot",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "display-and-microsd.mosi",
+            "reservedReason": "builtin"
+          },
+          {
+            "gpio": 25,
+            "label": "G25",
+            "connector": "M5-Bus",
+            "connectorPosition": "8",
+            "functions": [
+              "gpio",
+              "adc",
+              "uart",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "GPIO25, ADC2_CH8, DAC_1; ESP32 GPIO matrix supports remapping any UART here",
+            "recommended": true
+          },
+          {
+            "gpio": 26,
+            "label": "G26",
+            "connector": "M5-Bus / HY2.0-4P PORT.B",
+            "connectorPosition": "10",
+            "functions": [
+              "gpio",
+              "adc",
+              "uart",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "GPIO26, ADC2_CH9, DAC_2; ESP32 GPIO matrix supports remapping any UART here",
+            "recommended": true
+          },
+          {
+            "gpio": 27,
+            "label": "G27",
+            "connector": "M5-Bus",
+            "connectorPosition": "21",
+            "functions": [
+              "gpio",
+              "adc",
+              "uart",
+              "pwm"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "GPIO27, ADC2_CH7; ESP32 GPIO matrix supports remapping any UART here",
+            "recommended": true
+          },
+          {
+            "gpio": 32,
+            "label": "G32 / SDA",
+            "connector": "M5-Bus / HY2.0-4P PORT.A",
+            "connectorPosition": "19",
+            "functions": [
+              "gpio",
+              "adc",
+              "uart",
+              "pwm",
+              "i2c"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "SDA, GPIO32, ADC1_CH4; ESP32 GPIO matrix supports remapping any UART here",
+            "recommended": true
+          },
+          {
+            "gpio": 33,
+            "label": "G33 / SCL",
+            "connector": "M5-Bus / HY2.0-4P PORT.A",
+            "connectorPosition": "20",
+            "functions": [
+              "gpio",
+              "adc",
+              "uart",
+              "pwm",
+              "i2c"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "SCL, GPIO33, ADC1_CH5; ESP32 GPIO matrix supports remapping any UART here",
+            "recommended": true
+          },
+          {
+            "gpio": 34,
+            "label": "G34",
+            "connector": "M5-Bus",
+            "connectorPosition": "26",
+            "functions": [
+              "gpio",
+              "adc"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "Built-in PDM microphone data",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "microphone.data",
+            "reservedReason": "input_only"
+          },
+          {
+            "gpio": 35,
+            "label": "G35",
+            "connector": "M5-Bus",
+            "connectorPosition": "2",
+            "functions": [
+              "gpio",
+              "adc"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "GPIO35, Input only, ADC1_CH7",
+            "recommended": false,
+            "reservedReason": "input_only"
+          },
+          {
+            "gpio": 36,
+            "label": "G36",
+            "connector": "M5-Bus / HY2.0-4P PORT.B",
+            "connectorPosition": "4",
+            "functions": [
+              "gpio",
+              "adc"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "notes": "GPIO36, Input only, ADC1_CH0 (VP)",
+            "recommended": false,
+            "reservedReason": "input_only"
+          },
+          {
+            "gpio": 38,
+            "label": "G38",
+            "connector": "M5-Bus",
+            "connectorPosition": "9",
+            "functions": [
+              "gpio",
+              "spi"
+            ],
+            "sourceUrl": "https://docs.m5stack.com/en/core/Core2",
+            "recommended": false,
+            "reserved": true,
+            "reservedFor": "display-and-microsd.miso",
+            "reservedReason": "builtin",
+            "notes": "Shared MISO for the built-in display and microSD slot"
+          }
+        ],
+        "specialPins": {
+          "i2c": {
+            "sda": 32,
+            "scl": 33
+          },
+          "uart": {
+            "tx": 14,
+            "rx": 13
+          },
+          "power": {
+            "vcc": 3.3,
+            "gnd": 0,
+            "vin": 5
+          }
+        },
+        "powerRails": [
+          {
+            "id": "power-3v3",
+            "label": "3V3",
+            "voltage": 3.3,
+            "kind": "power"
+          },
+          {
+            "id": "ground",
+            "label": "GND",
+            "kind": "ground"
+          }
+        ],
+        "onboardPeripherals": [
+          {
+            "id": "display",
+            "kind": "tft",
+            "label": "Built-in 2.0 inch 320x240 ILI9342C display",
+            "driver": "ILI9342C via M5Unified",
+            "bus": "VSPI",
+            "pins": {
+              "miso": 38,
+              "mosi": 23,
+              "sck": 18,
+              "cs": 5,
+              "dc": 15
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "display",
+              "screen",
+              "lcd",
+              "tft",
+              "ili9342",
+              "ili9342c"
+            ],
+            "notes": "Include <M5Unified.h>, call M5.begin(), and use M5.Display. Reset, backlight, and panel power are controlled through the onboard AXP192."
+          },
+          {
+            "id": "touch",
+            "kind": "touch",
+            "label": "Built-in FT6336U capacitive touch panel",
+            "driver": "FT6336U via M5Unified",
+            "bus": "internal I2C",
+            "pins": {
+              "sda": 21,
+              "scl": 22,
+              "interrupt": 39
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "touch",
+              "touchscreen",
+              "touch screen",
+              "ft6336",
+              "ft6336u"
+            ],
+            "notes": "Read through M5.Touch after M5.begin(); do not reinitialize its bus."
+          },
+          {
+            "id": "speaker",
+            "kind": "speaker",
+            "label": "Built-in NS4168 I2S speaker amplifier",
+            "driver": "NS4168 via M5Unified",
+            "bus": "I2S",
+            "pins": {
+              "bclk": 12,
+              "lrck": 0,
+              "data": 2
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "speaker",
+              "audio output",
+              "sound",
+              "tone"
+            ],
+            "notes": "Use M5.Speaker; its I2S pins are unavailable for external wiring."
+          },
+          {
+            "id": "microphone",
+            "kind": "audio",
+            "label": "Built-in SPM1423 PDM microphone",
+            "driver": "SPM1423 via M5Unified",
+            "bus": "PDM",
+            "pins": {
+              "clock": 0,
+              "data": 34
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "microphone",
+              "mic",
+              "audio input",
+              "pdm"
+            ],
+            "notes": "Use M5.Mic; GPIO0 is shared with the speaker LRCK signal."
+          },
+          {
+            "id": "imu",
+            "kind": "imu",
+            "label": "Built-in MPU6886 6-axis IMU",
+            "driver": "MPU6886 via M5Unified",
+            "bus": "internal I2C",
+            "pins": {
+              "sda": 21,
+              "scl": 22
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "imu",
+              "accelerometer",
+              "gyroscope",
+              "gyro",
+              "mpu6886"
+            ],
+            "notes": "Use M5.Imu; it shares the internal I2C bus."
+          },
+          {
+            "id": "microsd",
+            "kind": "sd",
+            "label": "Built-in microSD slot",
+            "bus": "VSPI",
+            "pins": {
+              "miso": 38,
+              "mosi": 23,
+              "sck": 18,
+              "cs": 4
+            },
+            "matchTokens": [
+              "sd",
+              "microsd",
+              "micro sd",
+              "tf card",
+              "storage"
+            ],
+            "notes": "Shares SPI data and clock with the display and uses GPIO4 as CS."
+          },
+          {
+            "id": "rtc",
+            "kind": "other",
+            "label": "Built-in BM8563 real-time clock",
+            "driver": "BM8563 via M5Unified",
+            "bus": "internal I2C",
+            "pins": {
+              "sda": 21,
+              "scl": 22
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "rtc",
+              "real-time clock",
+              "realtime clock",
+              "bm8563"
+            ],
+            "notes": "Use M5.Rtc; it shares the internal I2C bus."
+          },
+          {
+            "id": "power-management",
+            "kind": "other",
+            "label": "Built-in AXP192 battery and power management",
+            "driver": "AXP192 via M5Unified",
+            "bus": "internal I2C",
+            "pins": {
+              "sda": 21,
+              "scl": 22
+            },
+            "libraries": [
+              {
+                "name": "M5Unified",
+                "installCommand": "m5stack/M5Unified"
+              }
+            ],
+            "matchTokens": [
+              "battery",
+              "power management",
+              "pmu",
+              "axp192"
+            ],
+            "notes": "Use M5.Power for battery and power control. The display backlight, reset, and power rails are also managed through this chip."
+          }
+        ],
+        "boardId": "m5stack-core2",
+        "platformFamily": "esp32",
+        "integratedPower": {
+          "label": "Alimentado pela porta USB do Core2",
+          "description": "A alimentação chega pela porta USB-C do próprio Core2; não há fonte externa adicionada ao projeto."
+        }
+      }
+    }
+  ],
+  "edges": []
+}

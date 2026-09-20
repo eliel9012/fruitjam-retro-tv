@@ -1,0 +1,8 @@
+.pio/
+.venv/
+__pycache__/
+.DS_Store
+secrets.json
+work/
+weather_music.wav
+*.wav
