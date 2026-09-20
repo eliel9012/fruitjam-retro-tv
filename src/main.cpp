@@ -4,6 +4,7 @@
 #include "PlaybackIO.h"
 #include "UiLogic.h"
 #include "Ascii.h"
+#include "Id3.h"
 #include "SafeStorage.h"
 #include "NetworkManager.h"
 #include <M5Unified.h>
@@ -236,6 +237,9 @@ int musicEntryCount = 0;
 int musicSelection = 0;
 String musicQueue[64]; // faixas (.wav) do diretório corrente, em ordem
 int musicQueueCount = 0, musicQueueIndex = -1;
+id3::TrackMeta musicMeta; // tags da faixa tocando (F2)
+LGFX_Sprite *coverSprite = nullptr; // capa do álbum decodificada (PSRAM RGB565)
+static LGFX_Sprite *coverTarget = nullptr; // alvo do callback JPEGDEC durante o decode
 
 void drawBackButton() {
   if (state == HOME || state == BOOT)
@@ -1456,17 +1460,123 @@ void drawMusicBrowser() {
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
 
+static int coverDraw(JPEGDRAW *draw) {
+  if (coverTarget)
+    coverTarget->pushImage(draw->x, draw->y, draw->iWidth, draw->iHeight,
+                           reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
+  return 1;
+}
+
+static void freeCover() {
+  if (coverSprite) {
+    coverSprite->deleteSprite();
+    delete coverSprite;
+    coverSprite = nullptr;
+  }
+}
+
+// Carrega e decodifica a capa do álbum para `coverSprite` (PSRAM RGB565).
+// Precedência: cover.jpg/folder.jpg/front.jpg na pasta do álbum -> APIC embutido.
+static bool loadAlbumCover(const String &trackPath) {
+  freeCover();
+  uint8_t *buf = nullptr;
+  size_t size = 0;
+
+  const int slash = trackPath.lastIndexOf('/');
+  const String dir = slash > 0 ? trackPath.substring(0, slash) : String("/");
+  const char *names[] = {"cover.jpg", "folder.jpg", "front.jpg"};
+  for (const char *n : names) {
+    const String p = dir + "/" + n;
+    if (SD.exists(p)) {
+      File f = SD.open(p, FILE_READ);
+      if (f && f.size() && f.size() <= MAX_JPEG) {
+        size = f.size();
+        buf = (uint8_t *)ps_malloc(size);
+        if (buf && f.read(buf, size) != size) {
+          free(buf);
+          buf = nullptr;
+        }
+      }
+      if (f)
+        f.close();
+      if (buf)
+        break;
+    }
+  }
+
+  // APIC embutido (offset/tamanho já lidos pelo Id3.h).
+  if (!buf && musicMeta.hasCover && musicMeta.coverSize && musicMeta.coverSize <= MAX_JPEG) {
+    File f = SD.open(trackPath, FILE_READ);
+    if (f && f.seek(musicMeta.coverOffset)) {
+      size = musicMeta.coverSize;
+      buf = (uint8_t *)ps_malloc(size);
+      if (buf && f.read(buf, size) != size) {
+        free(buf);
+        buf = nullptr;
+      }
+    }
+    if (f)
+      f.close();
+  }
+
+  if (!buf)
+    return false;
+
+  if (!jpeg.openRAM(buf, size, coverDraw)) {
+    free(buf);
+    return false;
+  }
+  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  const int fullW = jpeg.getWidth(), fullH = jpeg.getHeight();
+  if (fullW < 1 || fullH < 1) {
+    jpeg.close();
+    free(buf);
+    return false;
+  }
+  int options = 0, scale = 1;
+  if (fullW > 220) {
+    options = JPEG_SCALE_QUARTER;
+    scale = 4;
+  } else if (fullW > 130) {
+    options = JPEG_SCALE_HALF;
+    scale = 2;
+  }
+  const int w = (fullW + scale - 1) / scale;
+  const int h = (fullH + scale - 1) / scale;
+
+  coverSprite = new LGFX_Sprite();
+  coverSprite->setPsram(true);
+  coverSprite->setColorDepth(16);
+  if (!coverSprite->createSprite(w, h)) {
+    delete coverSprite;
+    coverSprite = nullptr;
+    jpeg.close();
+    free(buf);
+    return false;
+  }
+  coverTarget = coverSprite;
+  const bool ok = jpeg.decode(0, 0, options);
+  coverTarget = nullptr;
+  jpeg.close();
+  free(buf);
+  if (!ok)
+    freeCover();
+  return ok;
+}
+
 void drawMusicNowPlaying() {
-  char name[48] = "MUSICA";
-  if (musicQueueIndex >= 0 && musicQueueIndex < musicQueueCount) {
+  char title[64] = "MUSICA";
+  if (musicMeta.title[0])
+    strcpy(title, musicMeta.title);
+  else if (musicQueueIndex >= 0 && musicQueueIndex < musicQueueCount) {
     const String p = musicQueue[musicQueueIndex];
     const int s = p.lastIndexOf('/');
-    ascii::normalize(name, sizeof(name), (s >= 0 ? p.substring(s + 1) : p).c_str());
+    ascii::normalize(title, sizeof(title), (s >= 0 ? p.substring(s + 1) : p).c_str());
   }
   const bool isPaused = paused.load();
   const uint32_t totalSec = (sampleRate && wavDataEnd >= wavDataStart) ? (wavDataEnd - wavDataStart) / (sampleRate * 4UL) : 0;
   const uint32_t curSec = sampleRate ? samplesPlayed.load() / sampleRate : 0;
-  const int pct = totalSec ? (int)((uint64_t)curSec * 292 / totalSec) : 0;
+  const int pct = totalSec ? (int)((uint64_t)curSec * 286 / totalSec) : 0;
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(top_left);
@@ -1475,13 +1585,28 @@ void drawMusicNowPlaying() {
     d->drawString(PTBR::MUSICA, 12, 8);
     d->drawFastHLine(8, 36, 304, TFT_CYAN);
     d->setTextSize(1);
+    // Capa do álbum (esquerda) com borda estilo VHS.
+    if (coverSprite) {
+      const int cw = coverSprite->width(), ch = coverSprite->height();
+      const float sc = min(min(88.0f / cw, 88.0f / ch), 1.6f);
+      coverSprite->setPivot(cw / 2.0f, ch / 2.0f);
+      coverSprite->pushRotateZoom(d, 16 + 44, 52 + 44, 0, sc, sc);
+    }
+    d->drawRect(16, 52, 88, 88, coverSprite ? TFT_CYAN : TFT_DARKCYAN);
+    // Título + tags.
     d->setTextColor(TFT_YELLOW, TFT_NAVY);
-    d->drawString(name, 12, 56);
+    d->drawString(title, 120, 52);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(String(isPaused ? "PAUSA " : "PLAY  ") + playbackClock(), 12, 84);
-    d->drawRect(12, 110, 294, 6, TFT_CYAN);
+    d->drawString(musicMeta.artist[0] ? musicMeta.artist : "---", 120, 82);
+    d->drawString(musicMeta.album[0] ? musicMeta.album : "---", 120, 102);
+    if (musicMeta.year[0])
+      d->drawString(musicMeta.year, 120, 122);
+    // Progresso.
+    d->drawRect(16, 170, 288, 6, TFT_CYAN);
     if (pct > 0)
-      d->fillRect(13, 111, pct, 4, TFT_YELLOW);
+      d->fillRect(17, 171, pct, 4, TFT_YELLOW);
+    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->drawString(String(isPaused ? "PAUSA " : "PLAY  ") + playbackClock(), 16, 184);
   }
   drawBackButton();
 }
@@ -1508,6 +1633,8 @@ bool startMusic(const String &path) {
     xSemaphoreGive(sdMutex);
   if (!ok)
     return false;
+  musicMeta.reset();
+  id3::readTags(wavFile, musicMeta); // melhor esforço (WAV raramente tem ID3; MP3 na F3)
   samplesPlayed = 0;
   playbackFinished = false;
   audioStreamError = false;
@@ -1538,6 +1665,7 @@ bool startMusic(const String &path) {
     musicQueueIndex = musicQueueCount;
     musicQueue[musicQueueCount++] = path;
   }
+  loadAlbumCover(path); // capa do álbum (folder.jpg/cover.jpg ou APIC)
   drawMusicNowPlaying();
   return true;
 }
@@ -1553,6 +1681,7 @@ void stopMusic() {
   mjpegReader.reset();
   if (sdMutex)
     xSemaphoreGive(sdMutex);
+  freeCover();
 }
 
 void musicTick() {
