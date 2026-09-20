@@ -1,7 +1,35 @@
 # M5 RETRO TV — Core2 + Module13.2 RCA M125
 
 Firmware Arduino/ESP32 para reprodução de MJPEG + WAV no cartão microSD, saída composta PAL-M,
-prévia no LCD e consulta de tráfego aéreo por HTTPS. Interface em português.
+pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em português.
+
+## Estrutura do repositório
+
+- Raiz: firmware principal do player (MJPEG/WAV + radar + portal). O LCD deixou de
+  espelhar o vídeo para liberar a banda do SPI compartilhado (microSD + ILI9342C):
+  ele mostra um pôster estático + um HUD de 1 Hz (tempo e barra de progresso) via um
+  `LGFX_Sprite` minúsculo. O vídeo sai somente pela RCA.
+- `weather/`: firmware alternativo, projeto PlatformIO separado — clone do
+  "The Weather Channel Local Forecast" (wttr.in + ticker + smooth jazz em loop).
+  Consulte `weather/README.md`.
+
+## Telas
+
+> Renders 320×240 (escalados 2×) gerados a partir do código de desenho em
+> `tools/render_screens.py`. Substitua por capturas reais do Core2 quando o
+> aparelho estiver conectado via USB.
+
+| Início | Biblioteca | Reprodução |
+|---|---|---|
+| ![Home](docs/screens/home.png) | ![Library](docs/screens/library.png) | ![Playback](docs/screens/playback.png) |
+
+| Radar | Configurações | Sistema |
+|---|---|---|
+| ![Radar](docs/screens/radar.png) | ![Settings](docs/screens/settings.png) | ![Info](docs/screens/info.png) |
+
+| Portal | Erro | Weather Channel |
+|---|---|---|
+| ![Portal](docs/screens/portal.png) | ![Error](docs/screens/error.png) | ![Weather](docs/screens/weather.png) |
 
 ## Compilar
 
