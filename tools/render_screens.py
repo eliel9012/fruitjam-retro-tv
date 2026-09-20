@@ -202,17 +202,15 @@ def error():
 def weather():
     s = Screen()
     s.fill_screen(NAVY)
-    # Header
-    s.text("FRANCA - SP", 160, 16, YELLOW, M, "mc")
-    s.hline(8, 44, 304, CYAN)
-    # Centro: condicao + temperatura + umidade
-    s.text("Ensolarado", 160, 70, WHITE, M, "mc")
-    s.text("+26 C", 160, 106, WHITE, L, "mc")
-    s.text("Umidade 62%   Vento 12 km/h NW", 160, 150, WHITE, S, "mc")
-    s.hline(8, 188, 304, DARKCYAN)
-    # Ticker (rodape rolante)
-    s.rect(0, 192, W, 24, BLUE)
-    s.text("Sex 28/15  Sab 27/14  Dom 26/13  Seg 25/12  ...", 200, 200, CYAN, S)
+    s.text("FRANCA - SP", 160, 6, YELLOW, M, "mc")
+    s.hline(8, 42, 304, CYAN)
+    s.text("SUNNY", 160, 54, WHITE, M, "mc")
+    s.text("26 C", 160, 104, YELLOW, L, "mc")
+    s.text("UMIDADE  62%", 160, 178, WHITE, S, "mc")
+    s.text("VENTO  12 KM/H  NW", 160, 198, WHITE, S, "mc")
+    s.hline(8, 222, 304, CYAN)
+    s.rect(0, 224, W, 16, BLACK)
+    s.text("SEG 26/15 SUNNY    TER 27/14 CLOUDY    QUA 25/12 RAIN ...", 160, 228, WHITE, S, "mc")
     s.save("docs/screens/weather.png")
 
 def main():
