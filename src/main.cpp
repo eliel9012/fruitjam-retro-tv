@@ -96,6 +96,11 @@ String libraryChildPath(const String &root, const String &entryName);
 bool isProgramFolder(const String &path);
 int libraryProgramCount();
 String libraryProgramAt(int wantedIndex);
+void drawWeatherFrame();
+void weatherTick();
+void pollWeather();
+void startWeather();
+void stopWeather();
 
 static constexpr uint8_t CVBS_PIN = 26;
 static constexpr uint8_t RCA_BCK = 19;
@@ -113,6 +118,11 @@ static constexpr int CRT_W = 320, CRT_H = 240;
 // Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
 // 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
 static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
+// Weather Channel: faixa do ticker e cadências de consulta.
+static constexpr int TICKER_H = 16, TICKER_Y = 240 - 16;
+static constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
+static constexpr uint32_t WEATHER_RETRY_MS = 30UL * 1000UL;
+static const char *WEATHER_MUSIC = "/M5RETRO/weather_music.wav";
 
 const char *ROOT = "/M5RETRO";
 const char *VIDEOS = "/M5RETRO/videos";
@@ -149,6 +159,30 @@ uint32_t videoFrameIndex = 0, decodedFrames = 0, renderedFrames = 0, droppedFram
 LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
 uint32_t lastUiUpdate = 0;      // borda de 1 s que dispara o redesenho do HUD
 static bool backlightOn = true; // estado atual do backlight (DCDC3 do AXP192)
+std::atomic<bool> weatherAudio{false}; // música do Weather Channel em loop (I2S1), flag de áudio em loop
+
+// --- Weather Channel (Local Forecast) ---
+struct WeatherDay {
+  char name[8]; // "DOM".."SAB"
+  int maxC = 0, minC = 0;
+};
+struct WeatherData {
+  int tempC = -100, humidity = 0, windKmph = 0;
+  char cond[24] = {0}, windDir[8] = {0};
+  WeatherDay days[3];
+};
+WeatherData weatherShadows[2];
+std::atomic<int> weatherActive{0};
+std::atomic<uint32_t> weatherVersion{0};
+std::atomic<bool> weatherReady{false};
+std::atomic<bool> weatherBusy{false};
+char weatherStatus[32] = "CARREGANDO...";
+uint32_t lastWeatherAttempt = 0, lastWeatherGood = 0;
+uint32_t lastWeatherDraw = 0, lastTickerMs = 0;
+uint16_t lastWeatherBg = 0;
+LGFX_Sprite weatherTicker(&rca);
+String tickerPayload, tickerFull;
+int tickerOffset = 0, tickerWrapAt = 0;
 std::atomic<uint32_t> audioUnderruns{0};
 uint32_t lastTouch = 0, lastRadarDraw = 0, lastApiPoll = 0, lastApiGood = 0, lastStats = 0,
          jpegDecodeTotalMs = 0, jpegDecodeMaxMs = 0;
@@ -496,7 +530,7 @@ void audioTask(void *) {
     }
     // Pause must silence the physical output as well as stop file reads. Clear
     // the RCA DMA queue so a tap does not leave already-buffered PCM playing.
-    if (!playing || paused || !wavFile) {
+    if ((!playing && !weatherAudio.load()) || paused || !wavFile) {
       if (!outputPaused && active == AudioOutput::RCA) {
         i2s_zero_dma_buffer(I2S_NUM_1);
         i2s_stop(I2S_NUM_1);
@@ -533,6 +567,14 @@ void audioTask(void *) {
     }
     const uint32_t position = wavFile.position();
     if (position >= wavDataEnd) {
+      if (weatherAudio.load()) {
+        // Música de fundo do Weather Channel: rebobina e continua em loop.
+        if (!wavFile.seek(wavDataStart))
+          weatherAudio = false;
+        xSemaphoreGive(sdMutex);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        continue;
+      }
       xSemaphoreGive(sdMutex);
       playbackFinished = true;
       playing = false;
@@ -1288,7 +1330,8 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
   drawBackButton();
 }
 void drawHome() {
-  const char *items[] = {PTBR::VIDEOS, PTBR::TRAFEGO, PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA};
+  const char *items[] = {PTBR::VIDEOS, PTBR::TRAFEGO, PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA,
+                         PTBR::WEATHER};
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -1296,8 +1339,8 @@ void drawHome() {
   M5.Display.drawString(PTBR::APP, 12, 8);
   M5.Display.drawFastHLine(8, 36, 304, TFT_CYAN);
   M5.Display.setTextSize(2);
-  for (int i = 0; i < 4; i++) {
-    int y = 48 + i * 32;
+  for (int i = 0; i < 5; i++) {
+    int y = 44 + i * 28;
     bool selected = i == homeSelection;
     if (selected)
       M5.Display.fillRoundRect(12, y - 3, 296, 28, 4, TFT_CYAN);
@@ -1311,8 +1354,8 @@ void drawHome() {
   rca.drawString(PTBR::APP, 12, 8);
   rca.drawFastHLine(8, 36, 304, TFT_CYAN);
   rca.setTextSize(1);
-  for (int i = 0; i < 4; i++) {
-    int y = 55 + i * 30;
+  for (int i = 0; i < 5; i++) {
+    int y = 50 + i * 28;
     rca.setTextColor(i == homeSelection ? TFT_CYAN : TFT_WHITE, TFT_NAVY);
     rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], 28, y);
   }
@@ -1434,6 +1477,314 @@ void drawRadar() {
   }
   drawControllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
 }
+// ============================================================================
+// Weather Channel — "Local Forecast" dos anos 80 (item do menu principal)
+// ============================================================================
+
+static void asciiCopy(char *dst, size_t cap, const char *src) {
+  size_t j = 0;
+  if (src)
+    for (size_t i = 0; src[i] && j + 1 < cap; ++i) {
+      unsigned char c = (unsigned char)src[i];
+      if (c >= 0x20 && c < 0x7F)
+        dst[j++] = c;
+    }
+  dst[j] = 0;
+}
+static void asciiUpper(char *s) {
+  for (; *s; ++s)
+    if (*s >= 'a' && *s <= 'z')
+      *s -= 'a' - 'A';
+}
+// Dia da semana (0=DOM..6=SAB) a partir de "AAAA-MM-DD" (congruência de Zeller).
+static int weekdayFromIso(const char *iso) {
+  int y = 0, m = 0, d = 0;
+  if (sscanf(iso, "%d-%d-%d", &y, &m, &d) != 3)
+    return -1;
+  if (m < 3) {
+    m += 12;
+    --y;
+  }
+  int K = y % 100, J = y / 100;
+  int h = (d + (13 * (m + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+  return (h + 6) % 7;
+}
+static const char *weekdayPt(int wd) {
+  static const char *W[] = {"DOM", "SEG", "TER", "QUA", "QUI", "SEX", "SAB"};
+  return (wd >= 0 && wd <= 6) ? W[wd] : "???";
+}
+
+static bool weatherParse(JsonDocument &doc, WeatherData &out) {
+  JsonArray cc = doc["current_condition"];
+  if (cc.isNull() || cc.size() == 0)
+    return false;
+  JsonObject c = cc[0];
+  if (c.isNull())
+    return false;
+  out.tempC = c["temp_C"] | -100;
+  out.humidity = c["humidity"] | 0;
+  out.windKmph = c["windspeedKmph"] | 0;
+  asciiCopy(out.cond, sizeof(out.cond), c["weatherDesc"][0]["value"] | "");
+  asciiCopy(out.windDir, sizeof(out.windDir), c["winddir16Point"] | "");
+  asciiUpper(out.cond);
+  asciiUpper(out.windDir);
+  JsonArray days = doc["weather"];
+  if (days.isNull() || days.size() < 3)
+    return false;
+  for (int i = 0; i < 3; ++i) {
+    JsonObject d = days[i];
+    if (d.isNull())
+      return false;
+    const char *iso = d["date"] | "";
+    snprintf(out.days[i].name, sizeof(out.days[i].name), "%s", weekdayPt(weekdayFromIso(iso)));
+    out.days[i].maxC = d["maxtempC"] | 0;
+    out.days[i].minC = d["mintempC"] | 0;
+  }
+  return true;
+}
+
+static void weatherFilterBuild(JsonDocument &filter) {
+  filter["current_condition"][0]["temp_C"] = true;
+  filter["current_condition"][0]["humidity"] = true;
+  filter["current_condition"][0]["weatherDesc"][0]["value"] = true;
+  filter["current_condition"][0]["windspeedKmph"] = true;
+  filter["current_condition"][0]["winddir16Point"] = true;
+  for (int i = 0; i < 3; ++i) {
+    filter["weather"][i]["date"] = true;
+    filter["weather"][i]["maxtempC"] = true;
+    filter["weather"][i]["mintempC"] = true;
+  }
+}
+
+static bool weatherFetch(WeatherData &out) {
+  WiFiClientSecure client;
+  client.setInsecure(); // sem CA (economiza RAM)
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  bool ok = false;
+  if (http.begin(client, "https://wttr.in/Franca?format=j1")) {
+    if (http.GET() == HTTP_CODE_OK) {
+      JsonDocument filter;
+      weatherFilterBuild(filter);
+      JsonDocument doc;
+      auto err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter),
+                                 DeserializationOption::NestingLimit(8));
+      if (!err)
+        ok = weatherParse(doc, out);
+    }
+  }
+  http.end();
+  return ok;
+}
+
+void weatherNetworkTask(void *arg) {
+  int writeIndex = (int)(intptr_t)arg;
+  WeatherData local{};
+  local.tempC = -100;
+  const bool ok = weatherFetch(local);
+  if (ok) {
+    weatherShadows[writeIndex] = local; // buffer duplo: escreve no não exibido
+    weatherActive.store(writeIndex);    // publica
+    weatherReady.store(true);
+    weatherVersion.fetch_add(1);
+    lastWeatherGood = millis();
+    snprintf(weatherStatus, sizeof(weatherStatus), "ATUALIZADO");
+    Serial.printf("[M5RETRO] Tempo: %dC umidade:%d%% %s\n", local.tempC, local.humidity, local.cond);
+  } else {
+    snprintf(weatherStatus, sizeof(weatherStatus), "ERRO NA CONSULTA");
+    Serial.println("[M5RETRO] Tempo: falha na consulta");
+  }
+  weatherBusy.store(false);
+  vTaskDelete(nullptr);
+}
+
+void pollWeather() {
+  if (state != WEATHER || weatherBusy.load())
+    return;
+  if (!network.connected()) {
+    if (!weatherReady.load())
+      snprintf(weatherStatus, sizeof(weatherStatus), "SEM WI-FI");
+    return;
+  }
+  const uint32_t now = millis();
+  if (weatherReady.load()) {
+    if (now - lastWeatherGood < WEATHER_REFRESH_MS)
+      return;
+  } else if (lastWeatherAttempt && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+    return;
+  lastWeatherAttempt = now;
+  weatherBusy.store(true);
+  int next = 1 - weatherActive.load();
+  if (xTaskCreatePinnedToCore(weatherNetworkTask, "WEATHER_HTTP", 8192, (void *)(intptr_t)next, 0,
+                              nullptr, 1) != pdPASS) {
+    weatherBusy.store(false);
+    snprintf(weatherStatus, sizeof(weatherStatus), "SEM MEMORIA");
+  }
+}
+
+// Fundo oscilante estilo "Local Forecast": tons escuros variando suavemente entre
+// azul, petróleo e roxo ao longo de um ciclo de ~12 s (quantizado em RGB565).
+static uint16_t weatherBackground() {
+  const float t = (millis() % 12000) / 12000.0f * 2.0f * PI;
+  int r = (int)(2.0f + 2.0f * sin(t));
+  int g = (int)(1.5f + 1.2f * sin(t + 2.09f));
+  int b = (int)(3.0f + 1.0f * sin(t + 4.19f));
+  uint16_t r5 = r * 31 / 4, g6 = g * 63 / 3, b5 = b * 31 / 4;
+  return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+}
+
+static void weatherTickerBuild() {
+  if (!weatherReady.load()) {
+    tickerPayload = "AGUARDANDO PREVISAO DE 3 DIAS...";
+  } else {
+    const WeatherData &w = weatherShadows[weatherActive.load()];
+    tickerPayload = "";
+    for (int i = 0; i < 3; ++i) {
+      if (i)
+        tickerPayload += "    ";
+      tickerPayload += w.days[i].name;
+      tickerPayload += " " + String(w.days[i].maxC) + "/" + String(w.days[i].minC) + "C";
+    }
+  }
+  tickerFull = tickerPayload + "      " + tickerPayload;
+  tickerWrapAt = weatherTicker.textWidth(tickerPayload.c_str()) + weatherTicker.textWidth("      ");
+  tickerOffset = 0;
+}
+
+static void weatherTickerTick() {
+  if (!weatherTicker.getBuffer())
+    return;
+  if (tickerWrapAt > 0 && tickerOffset >= tickerWrapAt)
+    tickerOffset -= tickerWrapAt;
+  weatherTicker.fillSprite(TFT_BLACK);
+  weatherTicker.setTextDatum(top_left);
+  weatherTicker.setTextColor(TFT_CYAN, TFT_BLACK);
+  weatherTicker.drawString(tickerFull.c_str(), -tickerOffset, 0);
+  weatherTicker.pushSprite(0, TICKER_Y);
+}
+
+void drawWeatherFrame() {
+  const uint16_t bg = weatherBackground();
+  lastWeatherBg = bg;
+  rca.fillScreen(bg);
+  rca.setFont(&fonts::Font4);
+  rca.setTextDatum(top_center);
+  rca.setTextSize(1);
+  rca.setTextColor(TFT_YELLOW, bg);
+  rca.drawString("FRANCA - SP", CRT_W / 2, 8);
+  rca.drawFastHLine(8, 44, CRT_W - 16, TFT_CYAN);
+
+  if (weatherReady.load()) {
+    const WeatherData &w = weatherShadows[weatherActive.load()];
+    rca.setTextColor(TFT_WHITE, bg);
+    rca.drawString(w.cond, CRT_W / 2, 56);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d C", w.tempC);
+    rca.setTextSize(2);
+    rca.setTextColor(TFT_YELLOW, bg);
+    rca.drawString(buf, CRT_W / 2, 108);
+    rca.setFont(&fonts::Font2);
+    rca.setTextSize(1);
+    rca.setTextColor(TFT_WHITE, bg);
+    snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
+    rca.drawString(buf, CRT_W / 2, 178);
+    snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
+    rca.drawString(buf, CRT_W / 2, 198);
+  } else {
+    rca.setFont(&fonts::Font2);
+    rca.setTextSize(1);
+    rca.setTextColor(TFT_WHITE, bg);
+    rca.drawString(weatherStatus, CRT_W / 2, 120);
+  }
+  rca.drawFastHLine(8, TICKER_Y - 2, CRT_W - 16, TFT_CYAN);
+}
+
+void weatherTick() {
+  const uint32_t now = millis();
+  static uint32_t lastVersion = UINT32_MAX;
+  const uint32_t version = weatherVersion.load();
+  if (version != lastVersion) {
+    lastVersion = version;
+    weatherTickerBuild();
+    drawWeatherFrame();
+  } else if (now - lastWeatherDraw >= 300) {
+    lastWeatherDraw = now;
+    const uint16_t bg = weatherBackground();
+    if (bg != lastWeatherBg)
+      drawWeatherFrame();
+  }
+  if (now - lastTickerMs >= 33) {
+    lastTickerMs = now;
+    tickerOffset += 2;
+    weatherTickerTick();
+  }
+}
+
+void startWeather() {
+  playing = false;
+  while (audioReady && !audioIdle && !audioFailed)
+    vTaskDelay(pdMS_TO_TICKS(1));
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (mjpegFile)
+    mjpegFile.close();
+  if (wavFile)
+    wavFile.close();
+  mjpegReader.reset();
+  wavFile = SD.open(WEATHER_MUSIC, FILE_READ);
+  const bool ok = wavFile && openWavAndReadHeader();
+  if (!ok && wavFile) {
+    wavFile.close();
+    snprintf(weatherStatus, sizeof(weatherStatus), "SEM MUSICA (TELA ATIVA)");
+  }
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+
+  weatherAudio = ok; // música em loop apenas se o WAV abriu
+  weatherReady = false;
+  lastWeatherAttempt = 0; // força a primeira consulta imediata
+  state = WEATHER;
+
+  // Sprite do ticker (uma única vez).
+  if (!weatherTicker.getBuffer()) {
+    weatherTicker.setPsram(false);
+    weatherTicker.setColorDepth(8);
+    weatherTicker.createSprite(CRT_W, TICKER_H);
+    weatherTicker.setFont(&fonts::Font2);
+  }
+  weatherTickerBuild();
+  drawWeatherFrame();
+
+  // No LCD do Core2, apenas uma placa simples (a experiência é na TV).
+  M5.Display.fillScreen(TFT_NAVY);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+  M5.Display.setTextSize(2);
+  M5.Display.drawString(PTBR::WEATHER, 12, 8);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
+  M5.Display.drawString("EXIBINDO NA TV", 12, 64);
+  M5.Display.drawString("VOLTAR: BOTAO CENTRAL", 12, 88);
+  drawBackButton();
+}
+
+void stopWeather() {
+  weatherAudio = false;
+  playing = false;
+  while (audioReady && !audioIdle && !audioFailed)
+    vTaskDelay(pdMS_TO_TICKS(1));
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (wavFile)
+    wavFile.close();
+  mjpegReader.reset();
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+  state = HOME;
+}
+
 void drawSettings() {
   const char *names[] = {"VIDEO", "VOLUME", "ALCANCE RADAR", "ATUALIZACAO", PTBR::SAIDA_AUDIO,
                          PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "IDIOMA", "CONFIGURAR REDE"};
@@ -1516,6 +1867,7 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (a == NavAction::HOME) {
+    weatherAudio = false; // HOME também encerra a música do Weather Channel
     if (playing || wavFile)
       stopProgram();
     state = HOME;
@@ -1525,9 +1877,9 @@ void handleNavigation(NavAction a) {
   }
   if (state == HOME) {
     if (a == NavAction::LEFT)
-      homeSelection = (homeSelection + 3) % 4;
+      homeSelection = (homeSelection + 4) % 5;
     else if (a == NavAction::RIGHT)
-      homeSelection = (homeSelection + 1) % 4;
+      homeSelection = (homeSelection + 1) % 5;
     else if (a == NavAction::SELECT) {
       state = homeTarget(homeSelection);
       if (state == VIDEO_LIBRARY)
@@ -1536,6 +1888,8 @@ void handleNavigation(NavAction a) {
         drawRadar();
       else if (state == SETTINGS)
         drawSettings();
+      else if (state == WEATHER)
+        startWeather();
       else
         drawInfo();
       return;
@@ -1664,6 +2018,11 @@ void handleNavigation(NavAction a) {
     drawSettings();
     return;
   }
+  if (state == WEATHER) {
+    if (a == NavAction::BACK || a == NavAction::HOME)
+      stopWeather(), drawHome();
+    return;
+  }
   if (state == SYSTEM_INFO) {
     if (a == NavAction::BACK) {
       state = HOME;
@@ -1730,8 +2089,8 @@ void handleTouch() {
       button = touchButton(p.x, p.y);
     else {
       button = -1;
-      if (state == HOME && p.y >= 48 && p.y < 176) {
-        homeSelection = (p.y - 48) / 32;
+      if (state == HOME && p.y >= 44 && p.y < 181) {
+        homeSelection = (p.y - 44) / 28;
         input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
       } else if (state == VIDEO_PLAYBACK)
         input.inject(NavAction::PLAY_PAUSE, InputSource::LCD_BUTTON);
@@ -1888,6 +2247,9 @@ void serviceDiagnostics() {
       lastApiPoll = 0;
       pollAircraft();
       drawRadar();
+    } else if (command == "diag weather") {
+      stopProgram();
+      startWeather();
     } else if (command == "diag play") {
       stopProgram();
       librarySelection = 0;
@@ -2101,6 +2463,10 @@ void loop() {
         drawLibrary();
       Serial.println("[M5RETRO] PLAY encerrado no fim do programa");
     }
+  }
+  if (state == WEATHER) {
+    pollWeather();
+    weatherTick();
   }
   pollAircraft();
   if (state == AIRCRAFT_RADAR) {
