@@ -30,7 +30,7 @@ enum class AudioOutput : uint8_t { RCA, INTERNAL, MUTED };
 
 struct Settings {
   double lat = 0, lon = 0;
-  int rangeKm = 250, refreshSeconds = 5, volume = 75;
+  int rangeKm = 250, refreshSeconds = 10, volume = 75;
   bool vhsOsd = true;
   AudioOutput audioOutput = AudioOutput::RCA;
 } settings;
@@ -206,7 +206,7 @@ bool networkConfigPresent = false;
 
 InputManager input;
 int homeSelection = 0, librarySelection = 0, radarSelection = -1, settingsSelection = 0, infoPage = 0;
-bool settingsEditing = false, radarDetails = false;
+bool settingsEditing = false, radarDetails = false, radarDirty = false;
 uint32_t osdUntil = 0;
 SecretsManager secretsStore;
 NetworkManager network;
@@ -586,6 +586,17 @@ void audioTask(void *) {
     size_t bytes = wavFile.read(buf, min(AUDIO_CHUNK, remaining));
     xSemaphoreGive(sdMutex);
     if (!bytes || bytes % wavBlockAlign) {
+      if (weatherAudio.load()) {
+        // Música do clima: falha transitória de leitura do SD. Rebobina e tenta de novo.
+        audioUnderruns++;
+        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          if (!wavFile.seek(wavDataStart))
+            weatherAudio = false;
+          xSemaphoreGive(sdMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      }
       audioStreamError = true;
       audioUnderruns++;
       playbackFinished = true;
@@ -833,6 +844,7 @@ bool startProgram(const String &dir) {
   Serial.printf("[M5RETRO] Reproduzindo: %s video:%lu bytes wav:%lu bytes\n", dir.c_str(), mjpegFile.size(),
                 wavDataEnd - wavDataStart);
   drawStaticPoster(dir);
+  drawBackButton(); // botão voltar (canto sup. direito) sobre o pôster no LCD
   if (!readAndShowOneFrame()) {
     stopProgram();
     return false;
@@ -1010,6 +1022,7 @@ void pollAircraft() {
     lastHttpMs = result->elapsedMs;
     if (state == AIRCRAFT_RADAR) {
       apiStatus = result->status;
+      radarDirty = true; // redesenha apenas quando há resposta (fim da consulta)
       if (result->parsed) {
         if (parseAircraft(result->data))
           lastApiGood = millis();
@@ -1390,6 +1403,36 @@ void drawLibrary() {
   drawControllerLabels("ANTERIOR", "PLAY", "PROXIMO");
 }
 
+// Desenha um "aviaozinho" top-down orientado pela proa (0 = norte, horario).
+// Coordenadas locais: lx = direita, ly = frente (nariz). Rotaciona por heading.
+static void drawAirplane(M5GFX *d, int px, int py, double headingDeg, uint16_t color) {
+  const double a = headingDeg * DEG_TO_RAD;
+  const double c = cos(a), s = sin(a);
+  auto rot = [&](int lx, int ly, int &sx, int &sy) {
+    sx = px + (int)lround(lx * c + ly * s);
+    sy = py + (int)lround(lx * s - ly * c);
+  };
+  int x0, y0, x1, y1;
+  // Fuselagem (nariz -> cauda).
+  rot(0, 3, x0, y0);
+  rot(0, -3, x1, y1);
+  d->drawLine(x0, y0, x1, y1, color);
+  // Nariz (triângulo apontando para a frente).
+  int nx, ny;
+  rot(0, 3, nx, ny);
+  rot(-2, 1, x0, y0);
+  rot(2, 1, x1, y1);
+  d->fillTriangle(nx, ny, x0, y0, x1, y1, color);
+  // Asas (barra transversal em ly = 0).
+  rot(-5, 0, x0, y0);
+  rot(5, 0, x1, y1);
+  d->drawLine(x0, y0, x1, y1, color);
+  // Cauda (barra menor em ly = -2).
+  rot(-2, -2, x0, y0);
+  rot(2, -2, x1, y1);
+  d->drawLine(x0, y0, x1, y1, color);
+}
+
 void drawRadar() {
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
@@ -1432,7 +1475,7 @@ void drawRadar() {
       const bool sel = (i == radarSelection);
       if (sel)
         d->drawLine(cx, cy, px, py, TFT_CYAN);
-      d->fillTriangle(px, py - 4, px - 3, py + 3, px + 3, py + 3, sel ? TFT_CYAN : TFT_YELLOW);
+      drawAirplane(d, px, py, aircraft[i].heading_deg, sel ? TFT_CYAN : TFT_YELLOW);
     }
 
     // Painel lateral de dados (à direita do scope), sempre acima da barra de
@@ -1561,19 +1604,56 @@ static bool weatherFetch(WeatherData &out) {
   client.setInsecure(); // sem CA (economiza RAM)
   HTTPClient http;
   http.useHTTP10(true);
-  http.setConnectTimeout(5000);
-  http.setTimeout(5000);
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
   bool ok = false;
-  if (http.begin(client, "https://wttr.in/Franca?format=j1")) {
-    if (http.GET() == HTTP_CODE_OK) {
-      JsonDocument filter;
-      weatherFilterBuild(filter);
-      JsonDocument doc;
-      auto err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter),
-                                 DeserializationOption::NestingLimit(8));
-      if (!err)
-        ok = weatherParse(doc, out);
+  if (http.begin(client, "https://wttr.in/Franca,Brazil?format=j1")) {
+    const int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      // Lê o corpo para um buffer contíguo em PSRAM e parseia a partir dele:
+      // o leitor Stream+Filter do ArduinoJson 7.4.2 descarta campos escalares no
+      // ESP32, e getString() retorna vazio com HTTP/1.0. Aqui unimos getStream()
+      // (comprovado no radar) + filtro sobre buffer (comprovado em teste nativo).
+      const int cap = 24000;
+      char *buf = (char *)ps_malloc(cap);
+      if (buf) {
+        Stream &s = http.getStream();
+        size_t len = 0;
+        uint32_t quiet = 0;
+        while (len < cap - 1 && quiet < 1500) {
+          int avail = s.available();
+          if (avail > 0) {
+            int n = s.readBytes(buf + len, min(avail, cap - 1 - (int)len));
+            if (n <= 0)
+              break;
+            len += n;
+            quiet = 0;
+          } else {
+            delay(5);
+            quiet += 5;
+          }
+        }
+        buf[len] = 0;
+        if (len) {
+          JsonDocument filter;
+          weatherFilterBuild(filter);
+          JsonDocument doc;
+          auto err = deserializeJson(doc, buf, DeserializationOption::Filter(filter),
+                                     DeserializationOption::NestingLimit(8));
+          if (!err)
+            ok = weatherParse(doc, out);
+          else
+            Serial.printf("[M5RETRO] Tempo: parse %s (%u bytes)\n", err.c_str(), (unsigned)len);
+        } else {
+          Serial.println("[M5RETRO] Tempo: corpo vazio");
+        }
+        free(buf);
+      }
+    } else {
+      Serial.printf("[M5RETRO] Tempo: HTTP %d\n", code);
     }
+  } else {
+    Serial.println("[M5RETRO] Tempo: begin falhou");
   }
   http.end();
   return ok;
@@ -1884,9 +1964,10 @@ void handleNavigation(NavAction a) {
       state = homeTarget(homeSelection);
       if (state == VIDEO_LIBRARY)
         drawLibrary();
-      else if (state == AIRCRAFT_RADAR)
+      else if (state == AIRCRAFT_RADAR) {
+        lastApiPoll = 0; // consulta imediata ao entrar no radar
         drawRadar();
-      else if (state == SETTINGS)
+      } else if (state == SETTINGS)
         drawSettings();
       else if (state == WEATHER)
         startWeather();
@@ -2019,7 +2100,7 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (state == WEATHER) {
-    if (a == NavAction::BACK || a == NavAction::HOME)
+    if (a == NavAction::BACK || a == NavAction::HOME || a == NavAction::SELECT)
       stopWeather(), drawHome();
     return;
   }
@@ -2469,11 +2550,9 @@ void loop() {
     weatherTick();
   }
   pollAircraft();
-  if (state == AIRCRAFT_RADAR) {
-    if (millis() - lastRadarDraw > 500) {
-      lastRadarDraw = millis();
-      drawRadar();
-    }
+  if (state == AIRCRAFT_RADAR && radarDirty) {
+    radarDirty = false;
+    drawRadar();
   }
   if (millis() - lastStats >= 1000) {
     lastStats = millis();
