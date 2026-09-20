@@ -43,7 +43,6 @@ bool SecretsManager::load(SecretsConfig &s, RadarConfig &r) {
       r.rangeKm = d["radar_radius_km"] | 250;
       r.refreshSeconds = d["refresh_seconds"] | 5;
       r.volume = constrain(d["volume"] | 75, 0, 100);
-      r.experimental320 = String(d["video_quality"] | "240x160") == "320x240";
       r.vhsOsd = d["vhs_osd"] | true;
       r.audioOutput = String(d["audio_output"] | "rca");
       if (!isfinite(r.latitude) || r.latitude < -90 || r.latitude > 90)
@@ -88,7 +87,6 @@ bool SecretsManager::saveSettings(const RadarConfig &r) {
   d["radar_radius_km"] = r.rangeKm;
   d["refresh_seconds"] = r.refreshSeconds;
   d["volume"] = r.volume;
-  d["video_quality"] = r.experimental320 ? "320x240" : "240x160";
   d["vhs_osd"] = r.vhsOsd;
   d["audio_output"] = r.audioOutput;
   String data;

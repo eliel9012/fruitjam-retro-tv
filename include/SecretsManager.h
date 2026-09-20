@@ -9,7 +9,6 @@ struct SecretsConfig {
 struct RadarConfig {
   double latitude = 0.0, longitude = 0.0;
   int rangeKm = 250, refreshSeconds = 5, volume = 75;
-  bool experimental320 = false;
   bool vhsOsd = true;
   String audioOutput = "rca";
 };

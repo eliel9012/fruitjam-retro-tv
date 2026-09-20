@@ -31,7 +31,6 @@ enum class AudioOutput : uint8_t { RCA, INTERNAL, MUTED };
 struct Settings {
   double lat = 0, lon = 0;
   int rangeKm = 250, refreshSeconds = 5, volume = 75;
-  bool experimental320 = false;
   bool vhsOsd = true;
   AudioOutput audioOutput = AudioOutput::RCA;
 } settings;
@@ -82,6 +81,12 @@ void handleNavigation(NavAction action);
 void drawControllerLabels(const char *left, const char *center, const char *right);
 void drawPlaybackOsd();
 void drawPlaybackController();
+void setBacklight(bool on);
+bool drawStaticPoster(const String &dir);
+void uiHudInit();
+void uiHudDraw();
+void uiHudClear();
+void uiHudTick(uint32_t now);
 void setAudioOutput(AudioOutput output);
 void servicePowerButton();
 String playbackClock();
@@ -105,6 +110,9 @@ static constexpr uint8_t SD_MOSI = 23;
 static constexpr size_t MAX_JPEG = 128 * 1024;
 static constexpr size_t AUDIO_CHUNK = 1024;
 static constexpr int CRT_W = 320, CRT_H = 240;
+// Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
+// 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
+static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
 
 const char *ROOT = "/M5RETRO";
 const char *VIDEOS = "/M5RETRO/videos";
@@ -118,8 +126,6 @@ M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::PAL_M,
                 M5ModuleRCA::use_psram_t::psram_no_use, CVBS_PIN, 200);
 JPEGDEC jpeg;
 playback::MjpegReader mjpegReader;
-M5Canvas preview(&M5.Display);
-bool previewThisFrame = false;
 bool videoReadError = false;
 int videoWidth = 240, videoHeight = 160;
 std::atomic<bool> audioIdle{true}, audioReady{false}, audioFailed{false}, audioStreamError{false};
@@ -139,8 +145,10 @@ uint16_t wavBlockAlign = 4;
 std::atomic<uint32_t> samplesPlayed{0};
 std::atomic<bool> playing{false}, paused{false}, playbackFinished{false};
 std::atomic<AudioOutput> audioOutput{AudioOutput::RCA};
-uint32_t lcdFramesRendered = 0, lcdPreviewDivider = 2, lastPlayerUiDraw = 0;
 uint32_t videoFrameIndex = 0, decodedFrames = 0, renderedFrames = 0, droppedFrames = 0, jpegErrors = 0;
+LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
+uint32_t lastUiUpdate = 0;      // borda de 1 s que dispara o redesenho do HUD
+static bool backlightOn = true; // estado atual do backlight (DCDC3 do AXP192)
 std::atomic<uint32_t> audioUnderruns{0};
 uint32_t lastTouch = 0, lastRadarDraw = 0, lastApiPoll = 0, lastApiGood = 0, lastStats = 0,
          jpegDecodeTotalMs = 0, jpegDecodeMaxMs = 0;
@@ -182,6 +190,15 @@ void drawBackButton() {
   M5.Display.drawRoundRect(280, 4, 36, 30, 4, TFT_CYAN);
   M5.Display.fillTriangle(287, 19, 297, 10, 297, 28, TFT_WHITE);
   M5.Display.fillRect(296, 16, 12, 6, TFT_WHITE);
+}
+void setBacklight(bool on) {
+  // O backlight do Core2 é alimentado pelo DCDC3 do AXP192; 2800 mV é o brilho
+  // padrão de fábrica. IMPORTANTE: nunca mexa no LDO2 — ele alimenta LCD e
+  // microSD juntos, e desligá-lo derrubaria o cartão.
+  if (on == backlightOn)
+    return;
+  backlightOn = on;
+  M5.Power.Axp192.setDCDC3(on ? 2800 : 0);
 }
 void dualText(const String &line1, const String &line2 = "") {
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
@@ -226,7 +243,6 @@ RadarConfig currentSettings() {
   r.rangeKm = settings.rangeKm;
   r.refreshSeconds = settings.refreshSeconds;
   r.volume = settings.volume;
-  r.experimental320 = settings.experimental320;
   r.vhsOsd = settings.vhsOsd;
   r.audioOutput = settings.audioOutput == AudioOutput::INTERNAL ? "interno"
                   : settings.audioOutput == AudioOutput::MUTED  ? "mudo"
@@ -239,7 +255,6 @@ void applySettings(const RadarConfig &r) {
   settings.rangeKm = r.rangeKm;
   settings.refreshSeconds = r.refreshSeconds;
   settings.volume = r.volume;
-  settings.experimental320 = r.experimental320;
   settings.vhsOsd = r.vhsOsd;
   settings.audioOutput = r.audioOutput == "interno" ? AudioOutput::INTERNAL
                          : r.audioOutput == "mudo"  ? AudioOutput::MUTED
@@ -580,11 +595,10 @@ void audioTask(void *) {
 }
 
 int jpegDraw(JPEGDRAW *draw) {
+  // Saída de vídeo SOMENTE na RCA (composta). Nenhum pixel de frame é espelhado
+  // no LCD: isso libera a banda do barramento SPI compartilhado com o microSD.
   rca.pushImage(draw->x + (CRT_W - videoWidth) / 2, draw->y + (CRT_H - videoHeight) / 2, draw->iWidth,
                 draw->iHeight, reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
-  if (previewThisFrame)
-    preview.pushImage(draw->x, draw->y, draw->iWidth, draw->iHeight,
-                      reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
   return 1;
 }
 
@@ -626,22 +640,14 @@ bool readAndShowOneFrame(bool render) {
     jpegErrors++;
     return false;
   }
-  if (width != videoWidth || height != videoHeight || !preview.getBuffer()) {
+  // A prévia no LCD foi removida. Mantém-se apenas a limpeza da RCA no primeiro
+  // frame (ou quando a resolução muda), para o CRT iniciar sem lixo.
+  const bool firstFrame = (videoFrameIndex == 0);
+  if (width != videoWidth || height != videoHeight || firstFrame) {
     videoWidth = width;
     videoHeight = height;
-    preview.deleteSprite();
-    preview.setPsram(true);
-    preview.setColorDepth(16);
-    if (!preview.createSprite(width, height)) {
-      jpeg.close();
-      videoReadError = true;
-      return false;
-    }
-    preview.setPivot(width / 2.0f, height / 2.0f);
     rca.fillScreen(TFT_BLACK);
-    M5.Display.fillRect(0, 0, 320, 160, TFT_BLACK);
   }
-  previewThisFrame = (videoFrameIndex % lcdPreviewDivider) == 0;
   jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
   const bool decoded = jpeg.decode(0, 0, 0);
   jpeg.close();
@@ -650,24 +656,83 @@ bool readAndShowOneFrame(bool render) {
     videoReadError = true;
     return false;
   }
-  if (previewThisFrame) {
-    const float scale = min(320.0f / videoWidth, 160.0f / videoHeight);
-    if (scale == 1.0f) {
-      // Native 240x160 media needs only one contiguous SPI transfer. Avoid the
-      // per-pixel rotation/scaling path when there is no transform to apply.
-      preview.pushSprite((320 - videoWidth) / 2, (160 - videoHeight) / 2);
-    } else {
-      preview.pushRotateZoom(&M5.Display, 160, 80, 0, scale, scale);
-    }
-    drawBackButton();
-    lcdFramesRendered++;
-  }
   decodedFrames++;
   renderedFrames++;
   const uint32_t elapsed = millis() - started;
   jpegDecodeTotalMs += elapsed;
   jpegDecodeMaxMs = max(jpegDecodeMaxMs, elapsed);
-  lcdPreviewDivider = settings.experimental320 ? (elapsed > 45 ? 2 : 1) : (elapsed > 45 ? 3 : 2);
+  return true;
+}
+
+// Alvo temporário do callback de decodificação do pôster. JPEGDEC exige um
+// ponteiro de função (não aceita lambda com captura), então o sprite-alvo é
+// guardado aqui somente durante o jpeg.decode() do pôster.
+static LGFX_Sprite *posterSprite = nullptr;
+
+int posterDraw(JPEGDRAW *draw) {
+  if (posterSprite)
+    posterSprite->pushImage(draw->x, draw->y, draw->iWidth, draw->iHeight,
+                            reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
+  return 1;
+}
+
+bool drawStaticPoster(const String &dir) {
+  // Pôster do programa (opcional): tenta "poster.jpg" na pasta do vídeo e, na
+  // ausência, um pôster global em /M5RETRO/config. O decodificador desenha em
+  // um sprite do tamanho nativo e depois escala/centraliza para 320x240.
+  String posterPath = dir + "/poster.jpg";
+  if (!SD.exists(posterPath))
+    posterPath = String(CONFIG) + "/poster.jpg";
+
+  bool drew = false;
+  File poster = SD.open(posterPath, FILE_READ);
+  if (poster) {
+    const size_t size = poster.size();
+    // Limita a leitura para não atrasar o PLAY: pôsteres ~320x240 cabem com
+    // folga em 128 KB. Arquivos maiores ou inválidos caem no fallback sólido.
+    if (size && size <= MAX_JPEG) {
+      uint8_t *buf = (uint8_t *)ps_malloc(size);
+      if (buf) {
+        if (poster.read(buf, size) == size && jpeg.openRAM(buf, size, posterDraw)) {
+          const int w = jpeg.getWidth(), h = jpeg.getHeight();
+          if (w >= 1 && h >= 1 && w <= 320 && h <= 240) {
+            LGFX_Sprite sprite;
+            sprite.setPsram(true);
+            sprite.setColorDepth(16);
+            if (sprite.createSprite(w, h)) {
+              posterSprite = &sprite;
+              jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+              const bool decoded = jpeg.decode(0, 0, 0);
+              posterSprite = nullptr;
+              if (decoded) {
+                // Mantém a proporção (letterbox) e centraliza em 320x240.
+                M5.Display.fillScreen(TFT_BLACK);
+                const float scale = min(320.0f / w, 240.0f / h);
+                sprite.setPivot(w / 2.0f, h / 2.0f);
+                sprite.pushRotateZoom(&M5.Display, 160, 120, 0, scale, scale);
+                drew = true;
+              }
+              sprite.deleteSprite();
+            }
+          }
+          jpeg.close();
+        }
+        free(buf);
+      }
+    }
+    poster.close();
+  }
+
+  if (!drew) {
+    // Fallback sem arquivo: fundo sólido + título, usando só primitivas M5GFX.
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString(currentTitle, 160, 100);
+  }
+  // O pôster nunca bloqueia o PLAY: retorna true até no fallback. (false só
+  // caberia se o LCD estivesse inacessível, o que não ocorre após M5.begin.)
   return true;
 }
 
@@ -720,11 +785,12 @@ bool startProgram(const String &dir) {
   videoReadError = false;
   paused = false;
   state = VIDEO_PLAYBACK;
+  setBacklight(true); // LCD visível por padrão, mostrando o pôster + HUD
   rca.fillScreen(TFT_BLACK);
-  M5.Display.fillScreen(TFT_BLACK);
   osdUntil = millis() + 3000;
   Serial.printf("[M5RETRO] Reproduzindo: %s video:%lu bytes wav:%lu bytes\n", dir.c_str(), mjpegFile.size(),
                 wavDataEnd - wavDataStart);
+  drawStaticPoster(dir);
   if (!readAndShowOneFrame()) {
     stopProgram();
     return false;
@@ -748,7 +814,7 @@ void stopProgram() {
   mjpegReader.reset();
   if (sdMutex)
     xSemaphoreGive(sdMutex);
-  preview.deleteSprite();
+  uiHudClear(); // apaga só o HUD; o pôster permanece intacto no LCD
   playbackFinished = false;
   state = VIDEO_LIBRARY;
 }
@@ -1059,30 +1125,64 @@ String playbackClock() {
   return String(text);
 }
 
-void drawPlaybackController() {
+void uiHudInit() {
+  // Sprite do HUD criado UMA vez (fora do hot path). Cabe folgadamente no PSRAM
+  // e é reaproveitado por toda a vida útil do programa.
+  uiHud.setPsram(true);
+  uiHud.setColorDepth(16);
+  uiHud.createSprite(HUD_W, HUD_H);
+}
+
+void uiHudDraw() {
+  if (!uiHud.getBuffer())
+    return; // sprite indisponível (PSRAM esgotada): não há HUD a desenhar
   const uint32_t bytesPerSecond = sampleRate * 4UL;
-  uint32_t total = bytesPerSecond ? (wavDataEnd - wavDataStart) / bytesPerSecond : 0;
+  const uint32_t total = bytesPerSecond ? (wavDataEnd - wavDataStart) / bytesPerSecond : 0;
   char totalText[12];
   snprintf(totalText, sizeof(totalText), "%02lu:%02lu:%02lu", total / 3600UL, (total / 60UL) % 60UL,
            total % 60UL);
-  M5.Display.fillRect(0, 160, 320, 24, TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.drawString(String(paused ? "PAUSA" : "PLAY") + "   " + playbackClock() + " / " + totalText, 10,
-                        162);
-  int progress = total ? constrain((int)((samplesPlayed / (float)sampleRate) * 208.0f / total), 0, 208) : 0;
-  M5.Display.drawRect(14, 177, 208, 4, TFT_CYAN);
-  M5.Display.fillRect(14, 177, progress, 4, TFT_YELLOW);
-  M5.Display.fillRoundRect(232, 160, 84, 23, 3, TFT_BLUE);
-  M5.Display.drawRoundRect(232, 160, 84, 23, 3, TFT_CYAN);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLUE);
-  const char *destination = audioOutput == AudioOutput::INTERNAL ? "M5"
-                            : audioOutput == AudioOutput::MUTED  ? "MUDO"
-                                                                 : "RCA";
-  M5.Display.drawString(String("AUDIO: ") + destination, 274, 171);
-  drawControllerLabels("ANTERIOR", paused ? "PLAY" : "PAUSA", "PROXIMO");
+  const bool isPaused = paused.load();
+
+  uiHud.fillRect(0, 0, HUD_W, HUD_H, TFT_BLACK);
+  uiHud.setTextDatum(top_left);
+  uiHud.setTextSize(1);
+  uiHud.setTextColor(TFT_WHITE, TFT_BLACK);
+  uiHud.drawString(String(isPaused ? "PAUSA " : "PLAY  ") + playbackClock() + " / " + totalText, 4, 1);
+
+  // Barra de progresso proporcional a samplesPlayed (1 px de preenchimento).
+  const int barX = 4, barY = 12, barW = HUD_W - 8;
+  uiHud.drawRect(barX, barY, barW, 3, TFT_CYAN);
+  const int progress =
+      total ? constrain(int((samplesPlayed.load() / float(sampleRate)) * barW / total), 0, barW) : 0;
+  if (progress)
+    uiHud.fillRect(barX + 1, barY + 1, progress, 1, TFT_YELLOW);
+
+  uiHud.pushSprite(0, HUD_Y); // uma única transferência SPI por redesenho
+}
+
+void uiHudClear() {
+  // Apaga apenas a faixa do HUD, sem tocar no pôster que ocupa o restante.
+  M5.Display.fillRect(0, HUD_Y, HUD_W, HUD_H, TFT_BLACK);
+}
+
+void uiHudTick(uint32_t now) {
+  // Borda de 1 s baseada em millis() (sem FreeRTOS timer). Redesenha quando a
+  // borda vence ou a pausa muda, para exibir "PAUSA" imediatamente.
+  static bool lastPausedUi = false;
+  const bool isPaused = paused.load();
+  if (now - lastUiUpdate >= 1000 || isPaused != lastPausedUi) {
+    lastPausedUi = isPaused;
+    lastUiUpdate = now;
+    uiHudDraw();
+  }
+}
+
+void drawPlaybackController() {
+  // A prévia no LCD foi removida para liberar o barramento SPI compartilhado.
+  // O Core2 mostra apenas pôster + HUD mínimo, desenhado pelo sprite de 1 Hz
+  // (uiHudDraw). Redesenhos por aqui são pontuais (início/toggle), nunca a cada
+  // 250 ms; o OSD completo continua saindo exclusivamente pela RCA.
+  uiHudDraw();
 }
 
 void drawPlaybackOsd() {
@@ -1118,10 +1218,8 @@ void drawPlaybackOsd() {
                        " ]  [ " + PTBR::PROXIMO + " ]",
                    6, 222);
   }
-  if (millis() - lastPlayerUiDraw >= 250) {
-    lastPlayerUiDraw = millis();
-    drawPlaybackController();
-  }
+  // O redesenho do LCD (pôster + HUD) não acontece mais aqui a cada 250 ms: a
+  // borda de 1 s é feita por uiHudTick() chamado em loop(), logo após este OSD.
 }
 
 void setAudioOutput(AudioOutput output) {
@@ -1290,24 +1388,22 @@ void drawRadar() {
   drawControllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
 }
 void drawSettings() {
-  const char *names[] = {"VIDEO",           "PREVIA LCD",         "VOLUME", "ALCANCE RADAR", "ATUALIZACAO",
-                         PTBR::SAIDA_AUDIO, PTBR::OSD_ESTILO_VHS, "WI-FI",  "API",           "CARTAO SD",
-                         "IDIOMA",          "CONFIGURAR REDE"};
+  const char *names[] = {"VIDEO", "VOLUME", "ALCANCE RADAR", "ATUALIZACAO", PTBR::SAIDA_AUDIO,
+                         PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "IDIOMA", "CONFIGURAR REDE"};
   String audio = settings.audioOutput == AudioOutput::RCA        ? PTBR::RCA
                  : settings.audioOutput == AudioOutput::INTERNAL ? PTBR::ALTO_FALANTE_INTERNO
                                                                  : PTBR::MUDO;
   String value = settingsSelection == 0   ? "PAL-M"
-                 : settingsSelection == 1 ? (settings.experimental320 ? "MAIS FLUIDA" : "ECONOMICA")
-                 : settingsSelection == 2 ? String(settings.volume) + "%"
-                 : settingsSelection == 3 ? String(settings.rangeKm) + " km"
-                 : settingsSelection == 4 ? String(settings.refreshSeconds) + " s"
-                 : settingsSelection == 5 ? audio
-                 : settingsSelection == 6 ? (settings.vhsOsd ? PTBR::ATIVADO : PTBR::DESATIVADO)
-                 : settingsSelection == 7
+                 : settingsSelection == 1 ? String(settings.volume) + "%"
+                 : settingsSelection == 2 ? String(settings.rangeKm) + " km"
+                 : settingsSelection == 3 ? String(settings.refreshSeconds) + " s"
+                 : settingsSelection == 4 ? audio
+                 : settingsSelection == 5 ? (settings.vhsOsd ? PTBR::ATIVADO : PTBR::DESATIVADO)
+                 : settingsSelection == 6
                      ? (WiFi.status() == WL_CONNECTED ? PTBR::CONECTADO : PTBR::DESCONECTADO)
-                 : settingsSelection == 8  ? apiStatus
-                 : settingsSelection == 9  ? PTBR::DISPONIVEL
-                 : settingsSelection == 10 ? "PORTUGUES BR"
+                 : settingsSelection == 7  ? apiStatus
+                 : settingsSelection == 8  ? PTBR::DISPONIVEL
+                 : settingsSelection == 9  ? "PORTUGUES BR"
                                            : "ABRIR";
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
@@ -1352,6 +1448,10 @@ void handleNavigation(NavAction a) {
   if (a == NavAction::NONE)
     return;
   osdUntil = millis() + 3000;
+  // Qualquer botão físico durante o playback religa o backlight, caso o comando
+  // "diag backlight" o tenha desligado para inspeção.
+  if (state == VIDEO_PLAYBACK)
+    setBacklight(true);
   if (a == NavAction::PREVIOUS)
     a = NavAction::LEFT;
   if (a == NavAction::NEXT)
@@ -1462,7 +1562,7 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (state == SETTINGS) {
-    constexpr int SETTINGS_COUNT = 12;
+    constexpr int SETTINGS_COUNT = 11;
     if (a == NavAction::BACK) {
       if (settingsEditing)
         settingsEditing = false;
@@ -1475,11 +1575,11 @@ void handleNavigation(NavAction a) {
       return;
     }
     if (a == NavAction::SELECT) {
-      if (!settingsEditing && settingsSelection == 11) {
+      if (!settingsEditing && settingsSelection == 10) {
         startSetupPortal();
         return;
       }
-      if (settingsSelection == 0 || (settingsSelection >= 7 && settingsSelection <= 10))
+      if (settingsSelection == 0 || (settingsSelection >= 6 && settingsSelection <= 9))
         return;
       settingsEditing = !settingsEditing;
       if (!settingsEditing) {
@@ -1493,27 +1593,25 @@ void handleNavigation(NavAction a) {
     else if (settingsEditing && (a == NavAction::LEFT || a == NavAction::RIGHT)) {
       int d = a == NavAction::LEFT ? -1 : 1;
       if (settingsSelection == 1)
-        settings.experimental320 = !settings.experimental320;
-      else if (settingsSelection == 2)
         settings.volume = constrain(settings.volume + d * 5, 0, 100);
-      else if (settingsSelection == 3) {
+      else if (settingsSelection == 2) {
         int v[] = {50, 100, 250, 500}, i = 0;
         while (i < 3 && v[i] != settings.rangeKm)
           i++;
         settings.rangeKm = v[(i + d + 4) % 4];
-      } else if (settingsSelection == 4) {
+      } else if (settingsSelection == 3) {
         int v[] = {5, 10, 30}, i = 0;
         while (i < 2 && v[i] != settings.refreshSeconds)
           i++;
         settings.refreshSeconds = v[(i + d + 3) % 3];
-      } else if (settingsSelection == 5) {
+      } else if (settingsSelection == 4) {
         AudioOutput next = settings.audioOutput == AudioOutput::RCA        ? AudioOutput::INTERNAL
                            : settings.audioOutput == AudioOutput::INTERNAL ? AudioOutput::MUTED
                                                                            : AudioOutput::RCA;
         setAudioOutput(next);
         if (state == ERROR_SCREEN)
           return;
-      } else if (settingsSelection == 6)
+      } else if (settingsSelection == 5)
         settings.vhsOsd = !settings.vhsOsd;
     }
     drawSettings();
@@ -1560,6 +1658,10 @@ void handleTouch() {
   const auto &p = M5.Touch.getDetail();
   if (!p.isPressed())
     return;
+  // Um toque físico durante o playback também religa o backlight (idem à
+  // navegação por botões), caso "diag backlight" o tenha desligado.
+  if (state == VIDEO_PLAYBACK)
+    setBacklight(true);
   if (!down) {
     down = true;
     downAt = now;
@@ -1727,7 +1829,11 @@ void serviceDiagnostics() {
       testPixelColors();
       continue;
     }
-    if (command == "diag audio toggle") {
+    if (command == "diag backlight") {
+      // Alterna o backlight (ligado <-> desligado) para inspeção. O próximo
+      // botão/toque físico durante o playback religa o backlight sozinho.
+      setBacklight(!backlightOn);
+    } else if (command == "diag audio toggle") {
       togglePlayerAudio();
     } else if (command == "diag radar") {
       stopProgram();
@@ -1804,6 +1910,7 @@ void setup() {
   M5.Display.setRotation(1);
   input.begin();
   input.setAutoRepeat(true);
+  uiHudInit(); // sprite do HUD criado uma única vez, fora do hot path
   jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
   if (!rca.init()) {
     M5.Display.println("FALHA PAL-M");
@@ -1935,6 +2042,7 @@ void loop() {
   if (state == VIDEO_PLAYBACK) {
     videoTick();
     drawPlaybackOsd();
+    uiHudTick(millis()); // HUD a 1 Hz; a leitura do SD nunca espera este desenho
     if (playbackFinished) {
       playbackFinished = false;
       stopProgram();
@@ -1958,13 +2066,12 @@ void loop() {
     lastStats = millis();
     uint32_t avg = decodedFrames ? jpegDecodeTotalMs / decodedFrames : 0;
     Serial.printf(
-        "[M5RETRO] FPS RCA:%lu FPS JPEG:%lu FPS LCD:%lu frames descartados:%lu JPEG medio:%lu JPEG "
+        "[M5RETRO] FPS RCA:%lu FPS JPEG:%lu frames descartados:%lu JPEG medio:%lu JPEG "
         "maximo:%lu underruns audio:%lu heap livre:%u heap minimo:%u PSRAM livre:%u RSSI:%d API:%s\n",
-        renderedFrames, decodedFrames, lcdFramesRendered, droppedFrames, avg, jpegDecodeMaxMs,
+        renderedFrames, decodedFrames, droppedFrames, avg, jpegDecodeMaxMs,
         audioUnderruns.load(), ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram(), WiFi.RSSI(),
         apiStatus.c_str());
     renderedFrames = decodedFrames = 0;
-    lcdFramesRendered = 0;
     jpegDecodeTotalMs = jpegDecodeMaxMs = 0;
   }
   delay(4);

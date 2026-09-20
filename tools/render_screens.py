@@ -169,8 +169,8 @@ def radar():
 def settings():
     s = Screen()
     header(s, "CONFIGURACOES")
-    s.text("> PREVIA LCD", 20, 68, CYAN, M)
-    s.text("ECONOMICA", 34, 110, WHITE, L)
+    s.text("> VOLUME", 20, 68, CYAN, M)
+    s.text("75%", 34, 110, WHITE, L)
     controller_labels(s, "ACIMA", "OK", "ABAIXO")
     back_button(s)
     s.save("docs/screens/settings.png")
