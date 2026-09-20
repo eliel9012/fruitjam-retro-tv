@@ -3,6 +3,7 @@
 #include <time.h>
 #include "PlaybackIO.h"
 #include "UiLogic.h"
+#include "Ascii.h"
 #include "SafeStorage.h"
 #include "NetworkManager.h"
 #include <M5Unified.h>
@@ -103,6 +104,9 @@ void startWeather();
 void stopWeather();
 void drawMusicBrowser();
 void drawMusicNowPlaying();
+bool startMusic(const String &path);
+void stopMusic();
+void musicTick();
 
 static constexpr uint8_t CVBS_PIN = 26;
 static constexpr uint8_t RCA_BCK = 19;
@@ -219,6 +223,19 @@ uint32_t portalSaveStarted = 0;
 bool bootReady = false;
 bool powerOffPending = false;
 uint32_t powerOffAt = 0;
+
+// --- Player de música (F1: navegação por pastas + WAV; F3 adiciona MP3) ---
+struct MusicEntry {
+  String name;    // nome de exibição (normalizado ASCII via ascii::normalize)
+  String path;    // caminho SD completo
+  bool isFolder;
+};
+String musicDir = MUSIC_ROOT;
+MusicEntry musicEntries[32];
+int musicEntryCount = 0;
+int musicSelection = 0;
+String musicQueue[64]; // faixas (.wav) do diretório corrente, em ordem
+int musicQueueCount = 0, musicQueueIndex = -1;
 
 void drawBackButton() {
   if (state == HOME || state == BOOT)
@@ -1346,34 +1363,222 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
   }
   drawBackButton();
 }
-// Placeholders da Fase F0 (estrutura): telas mínimas para navegar pelo menu.
-// F1 preenche o navegador com pastas/faixas; F2/F3/F4 adicionam tags/capa/MP3.
+// ============================================================================
+// Player de música (F1): navegação por pastas estilo iPod + reprodução de WAV.
+// F3 adiciona MP3 via libhelix; F2/F4 adicionam tags ID3 e capa do álbum.
+// ============================================================================
+
+static bool isMusicTrack(const String &name) {
+  String n = name;
+  n.toLowerCase();
+  return n.endsWith(".wav"); // F1: só WAV (PCM 16-bit 22050 Hz)
+}
+
+static String musicParentDir(const String &path) {
+  const int s = path.lastIndexOf('/');
+  if (s <= 0)
+    return String("/");
+  const String p = path.substring(0, s);
+  return p.length() ? p : String("/");
+}
+
+static void musicScanDir() {
+  musicEntryCount = 0;
+  musicSelection = 0;
+  musicQueueCount = 0;
+  // Entrada ".." para subir, quando não estamos na raiz de música.
+  if (musicDir != String(MUSIC_ROOT)) {
+    musicEntries[musicEntryCount].name = "..";
+    musicEntries[musicEntryCount].path = musicParentDir(musicDir);
+    musicEntries[musicEntryCount].isFolder = true;
+    ++musicEntryCount;
+  }
+  File dir = SD.open(musicDir);
+  if (!dir || !dir.isDirectory()) {
+    if (dir)
+      dir.close();
+    return;
+  }
+  for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+    const String rawName = String(entry.name());
+    if (rawName == "." || rawName == "..")
+      continue;
+    const bool folder = entry.isDirectory();
+    if (!folder && !isMusicTrack(rawName))
+      continue;
+    if (musicEntryCount < 32) {
+      MusicEntry &e = musicEntries[musicEntryCount];
+      e.isFolder = folder;
+      e.path = musicDir + "/" + rawName;
+      char buf[48];
+      ascii::normalize(buf, sizeof(buf), rawName.c_str()); // acentos -> ASCII
+      e.name = buf;
+      ++musicEntryCount;
+    }
+    if (!folder && musicQueueCount < 64)
+      musicQueue[musicQueueCount++] = musicDir + "/" + rawName;
+    entry.close();
+  }
+  dir.close();
+}
+
 void drawMusicBrowser() {
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(top_left);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
-    d->drawString(PTBR::APP, 10, 8);
+    d->drawString(PTBR::MUSICA, 12, 8);
     d->drawFastHLine(8, 36, 304, TFT_CYAN);
-    d->setTextColor(TFT_CYAN, TFT_NAVY);
-    d->drawString(PTBR::MUSICA, 12, 44);
+    // breadcrumb do diretório corrente.
+    String crumb = musicDir;
+    crumb.replace(String(MUSIC_ROOT), "/");
     d->setTextSize(1);
+    d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
+    d->drawString(crumb, 12, 42);
+    if (!musicEntryCount)
+      d->drawString(PTBR::SEM_MUSICAS, 30, 92);
+    const int first = (musicSelection / 4) * 4;
+    for (int row = 0; row < 4 && first + row < musicEntryCount; ++row) {
+      const int index = first + row, y = 56 + row * 32;
+      const bool selected = index == musicSelection;
+      d->fillRoundRect(12, y - 2, 296, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
+      d->setTextColor(selected ? TFT_NAVY : (musicEntries[index].isFolder ? TFT_CYAN : TFT_WHITE),
+                      selected ? TFT_CYAN : TFT_NAVY);
+      String label = String(selected ? "> " : "  ") + musicEntries[index].name;
+      if (musicEntries[index].isFolder)
+        label += "/";
+      d->drawString(label.substring(0, 40), 20, y + 6);
+    }
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(PTBR::SEM_MUSICAS, 12, 84);
+    d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount, 216, 16);
   }
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
 
 void drawMusicNowPlaying() {
+  char name[48] = "MUSICA";
+  if (musicQueueIndex >= 0 && musicQueueIndex < musicQueueCount) {
+    const String p = musicQueue[musicQueueIndex];
+    const int s = p.lastIndexOf('/');
+    ascii::normalize(name, sizeof(name), (s >= 0 ? p.substring(s + 1) : p).c_str());
+  }
+  const bool isPaused = paused.load();
+  const uint32_t totalSec = (sampleRate && wavDataEnd >= wavDataStart) ? (wavDataEnd - wavDataStart) / (sampleRate * 4UL) : 0;
+  const uint32_t curSec = sampleRate ? samplesPlayed.load() / sampleRate : 0;
+  const int pct = totalSec ? (int)((uint64_t)curSec * 292 / totalSec) : 0;
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
-    d->setTextDatum(middle_center);
+    d->setTextDatum(top_left);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
-    d->drawString(PTBR::MUSICA, 160, 110);
+    d->drawString(PTBR::MUSICA, 12, 8);
+    d->drawFastHLine(8, 36, 304, TFT_CYAN);
+    d->setTextSize(1);
+    d->setTextColor(TFT_YELLOW, TFT_NAVY);
+    d->drawString(name, 12, 56);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->drawString(String(isPaused ? "PAUSA " : "PLAY  ") + playbackClock(), 12, 84);
+    d->drawRect(12, 110, 294, 6, TFT_CYAN);
+    if (pct > 0)
+      d->fillRect(13, 111, pct, 4, TFT_YELLOW);
   }
   drawBackButton();
+}
+
+bool startMusic(const String &path) {
+  // Garante I2S1 livre: encerra qualquer vídeo/weather em andamento.
+  playing = false;
+  while (audioReady && !audioIdle && !audioFailed)
+    vTaskDelay(pdMS_TO_TICKS(1));
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (mjpegFile)
+    mjpegFile.close();
+  if (wavFile)
+    wavFile.close();
+  mjpegReader.reset();
+  wavFile = SD.open(path, FILE_READ);
+  const bool ok = wavFile && openWavAndReadHeader();
+  if (!ok && wavFile) {
+    wavFile.close();
+    Serial.printf("[M5RETRO] Musica: WAV invalido %s\n", path.c_str());
+  }
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+  if (!ok)
+    return false;
+  samplesPlayed = 0;
+  playbackFinished = false;
+  audioStreamError = false;
+  paused = false;
+  playing = true;
+  // Reconstrói a fila com as faixas do diretório da faixa tocando.
+  musicQueueCount = 0;
+  musicQueueIndex = -1;
+  const int slash = path.lastIndexOf('/');
+  const String dir = slash > 0 ? path.substring(0, slash) : String("/");
+  File d = SD.open(dir);
+  if (d && d.isDirectory()) {
+    for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+      const String n = String(e.name());
+      if (!e.isDirectory() && isMusicTrack(n)) {
+        const String p = dir + "/" + n;
+        if (musicQueueCount < 64) {
+          if (p == path)
+            musicQueueIndex = musicQueueCount;
+          musicQueue[musicQueueCount++] = p;
+        }
+      }
+      e.close();
+    }
+    d.close();
+  }
+  if (musicQueueIndex < 0 && musicQueueCount < 64) {
+    musicQueueIndex = musicQueueCount;
+    musicQueue[musicQueueCount++] = path;
+  }
+  drawMusicNowPlaying();
+  return true;
+}
+
+void stopMusic() {
+  playing = false;
+  while (audioReady && !audioIdle && !audioFailed)
+    vTaskDelay(pdMS_TO_TICKS(1));
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (wavFile)
+    wavFile.close();
+  mjpegReader.reset();
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+}
+
+void musicTick() {
+  if (!playbackFinished)
+    return;
+  playbackFinished = false;
+  if (audioStreamError) {
+    audioStreamError = false;
+    stopMusic();
+    state = MUSIC_BROWSER;
+    drawMusicBrowser();
+    return;
+  }
+  // Fim natural da faixa: avança para a próxima, ou volta ao navegador.
+  if (musicQueueCount && musicQueueIndex + 1 < musicQueueCount) {
+    ++musicQueueIndex;
+    if (!startMusic(musicQueue[musicQueueIndex])) {
+      stopMusic();
+      state = MUSIC_BROWSER;
+      drawMusicBrowser();
+    }
+  } else {
+    stopMusic();
+    state = MUSIC_BROWSER;
+    drawMusicBrowser();
+  }
 }
 
 void drawHome() {
@@ -2141,17 +2346,59 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (state == MUSIC_BROWSER) {
-    if (a == NavAction::BACK || a == NavAction::HOME) {
-      state = HOME;
-      drawHome();
+    if (a == NavAction::BACK) {
+      if (musicDir != String(MUSIC_ROOT)) {
+        musicDir = musicParentDir(musicDir);
+        musicScanDir();
+        drawMusicBrowser();
+      } else {
+        state = HOME;
+        drawHome();
+      }
+      return;
     }
-    // F0 (placeholder): LEFT/RIGHT/SELECT ainda não fazem nada nesta fase.
+    if ((a == NavAction::LEFT || a == NavAction::RIGHT) && musicEntryCount) {
+      musicSelection =
+          (musicSelection + (a == NavAction::LEFT ? musicEntryCount - 1 : 1)) % musicEntryCount;
+      drawMusicBrowser();
+      return;
+    }
+    if (a == NavAction::SELECT && musicEntryCount) {
+      MusicEntry &e = musicEntries[musicSelection];
+      if (e.isFolder) {
+        musicDir = e.path;
+        musicScanDir();
+        drawMusicBrowser();
+      } else if (startMusic(e.path)) {
+        state = MUSIC_NOW_PLAYING; // startMusic já desenhou o now playing
+      }
+      return;
+    }
     return;
   }
   if (state == MUSIC_NOW_PLAYING) {
-    if (a == NavAction::BACK || a == NavAction::HOME) {
+    if (a == NavAction::BACK) {
+      stopMusic();
       state = MUSIC_BROWSER;
       drawMusicBrowser();
+      return;
+    }
+    if (a == NavAction::SELECT || a == NavAction::PLAY_PAUSE) {
+      paused = !paused;
+      drawMusicNowPlaying();
+      return;
+    }
+    if (a == NavAction::LEFT || a == NavAction::PREVIOUS || a == NavAction::RIGHT || a == NavAction::NEXT) {
+      if (musicQueueCount) {
+        const int delta = (a == NavAction::LEFT || a == NavAction::PREVIOUS) ? -1 : 1;
+        musicQueueIndex = (musicQueueIndex + delta + musicQueueCount) % musicQueueCount;
+        if (!startMusic(musicQueue[musicQueueIndex])) {
+          stopMusic();
+          state = MUSIC_BROWSER;
+          drawMusicBrowser();
+        }
+      }
+      return;
     }
     return;
   }
@@ -2382,6 +2629,13 @@ void serviceDiagnostics() {
     } else if (command == "diag weather") {
       stopProgram();
       startWeather();
+    } else if (command == "diag music") {
+      weatherAudio = false; // para a música do weather (se ativa) antes de stopProgram
+      stopProgram();
+      musicDir = MUSIC_ROOT;
+      musicScanDir();
+      state = MUSIC_BROWSER;
+      drawMusicBrowser();
     } else if (command == "diag play") {
       stopProgram();
       librarySelection = 0;
@@ -2599,6 +2853,9 @@ void loop() {
   if (state == WEATHER) {
     pollWeather();
     weatherTick();
+  }
+  if (state == MUSIC_NOW_PLAYING) {
+    musicTick();
   }
   pollAircraft();
   if (state == AIRCRAFT_RADAR && radarDirty) {
