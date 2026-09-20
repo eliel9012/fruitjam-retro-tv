@@ -10,11 +10,13 @@ enum UiState {
   SYSTEM_INFO,
   SETUP_PORTAL,
   WEATHER,
+  MUSIC_BROWSER,
+  MUSIC_NOW_PLAYING,
   ERROR_SCREEN
 };
 inline UiState homeTarget(int selection) {
-  const UiState targets[] = {VIDEO_LIBRARY, AIRCRAFT_RADAR, SETTINGS, SYSTEM_INFO, WEATHER};
-  return selection >= 0 && selection < 5 ? targets[selection] : HOME;
+  const UiState targets[] = {VIDEO_LIBRARY, MUSIC_BROWSER, AIRCRAFT_RADAR, SETTINGS, SYSTEM_INFO, WEATHER};
+  return selection >= 0 && selection < 6 ? targets[selection] : HOME;
 }
 inline int touchButton(int x, int y) {
   if (x < 0 || x >= 320 || y < 184 || y >= 240)

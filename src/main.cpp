@@ -101,6 +101,8 @@ void weatherTick();
 void pollWeather();
 void startWeather();
 void stopWeather();
+void drawMusicBrowser();
+void drawMusicNowPlaying();
 
 static constexpr uint8_t CVBS_PIN = 26;
 static constexpr uint8_t RCA_BCK = 19;
@@ -131,6 +133,7 @@ const char *SETTINGS_FILE = "/M5RETRO/config/settings.json";
 const char *SECRETS_FILE = "/M5RETRO/config/secrets.json";
 const char *CA_FILE = "/M5RETRO/config/ca.pem";
 const char *CACHE_FILE = "/M5RETRO/cache/aircraft.json";
+const char *MUSIC_ROOT = "/M5RETRO/music";
 
 M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::PAL_M,
                 M5ModuleRCA::use_psram_t::psram_no_use, CVBS_PIN, 200);
@@ -262,9 +265,10 @@ bool makeDirectories() {
   const bool videosReady = rootReady && (SD.exists(VIDEOS) || SD.mkdir(VIDEOS));
   const bool configReady = rootReady && (SD.exists(CONFIG) || SD.mkdir(CONFIG));
   const bool cacheReady = rootReady && (SD.exists("/M5RETRO/cache") || SD.mkdir("/M5RETRO/cache"));
-  if (!rootReady || !videosReady || !configReady || !cacheReady) {
-    Serial.printf("[M5RETRO] ERRO: pastas SD indisponiveis root:%d videos:%d config:%d cache:%d\n", rootReady,
-                  videosReady, configReady, cacheReady);
+  const bool musicReady = rootReady && (SD.exists(MUSIC_ROOT) || SD.mkdir(MUSIC_ROOT));
+  if (!rootReady || !videosReady || !configReady || !cacheReady || !musicReady) {
+    Serial.printf("[M5RETRO] ERRO: pastas SD indisponiveis root:%d videos:%d config:%d cache:%d music:%d\n",
+                  rootReady, videosReady, configReady, cacheReady, musicReady);
     return false;
   }
   return true;
@@ -1342,9 +1346,39 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
   }
   drawBackButton();
 }
+// Placeholders da Fase F0 (estrutura): telas mínimas para navegar pelo menu.
+// F1 preenche o navegador com pastas/faixas; F2/F3/F4 adicionam tags/capa/MP3.
+void drawMusicBrowser() {
+  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+    d->fillScreen(TFT_NAVY);
+    d->setTextDatum(top_left);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->setTextSize(2);
+    d->drawString(PTBR::APP, 10, 8);
+    d->drawFastHLine(8, 36, 304, TFT_CYAN);
+    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->drawString(PTBR::MUSICA, 12, 44);
+    d->setTextSize(1);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->drawString(PTBR::SEM_MUSICAS, 12, 84);
+  }
+  drawControllerLabels("ACIMA", "OK", "ABAIXO");
+}
+
+void drawMusicNowPlaying() {
+  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+    d->fillScreen(TFT_NAVY);
+    d->setTextDatum(middle_center);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->setTextSize(2);
+    d->drawString(PTBR::MUSICA, 160, 110);
+  }
+  drawBackButton();
+}
+
 void drawHome() {
-  const char *items[] = {PTBR::VIDEOS, PTBR::TRAFEGO, PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA,
-                         PTBR::WEATHER};
+  const char *items[] = {PTBR::VIDEOS,    PTBR::MUSICA,   PTBR::TRAFEGO,
+                         PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA, PTBR::WEATHER};
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -1352,11 +1386,11 @@ void drawHome() {
   M5.Display.drawString(PTBR::APP, 12, 8);
   M5.Display.drawFastHLine(8, 36, 304, TFT_CYAN);
   M5.Display.setTextSize(2);
-  for (int i = 0; i < 5; i++) {
-    int y = 44 + i * 28;
+  for (int i = 0; i < 6; i++) {
+    int y = 40 + i * 22;
     bool selected = i == homeSelection;
     if (selected)
-      M5.Display.fillRoundRect(12, y - 3, 296, 28, 4, TFT_CYAN);
+      M5.Display.fillRoundRect(12, y - 2, 296, 20, 4, TFT_CYAN);
     M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? TFT_CYAN : TFT_NAVY);
     M5.Display.drawString(String(selected ? "> " : "  ") + items[i], 24, y);
   }
@@ -1367,8 +1401,8 @@ void drawHome() {
   rca.drawString(PTBR::APP, 12, 8);
   rca.drawFastHLine(8, 36, 304, TFT_CYAN);
   rca.setTextSize(1);
-  for (int i = 0; i < 5; i++) {
-    int y = 50 + i * 28;
+  for (int i = 0; i < 6; i++) {
+    int y = 46 + i * 22;
     rca.setTextColor(i == homeSelection ? TFT_CYAN : TFT_WHITE, TFT_NAVY);
     rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], 28, y);
   }
@@ -1957,13 +1991,15 @@ void handleNavigation(NavAction a) {
   }
   if (state == HOME) {
     if (a == NavAction::LEFT)
-      homeSelection = (homeSelection + 4) % 5;
+      homeSelection = (homeSelection + 5) % 6;
     else if (a == NavAction::RIGHT)
-      homeSelection = (homeSelection + 1) % 5;
+      homeSelection = (homeSelection + 1) % 6;
     else if (a == NavAction::SELECT) {
       state = homeTarget(homeSelection);
       if (state == VIDEO_LIBRARY)
         drawLibrary();
+      else if (state == MUSIC_BROWSER)
+        drawMusicBrowser();
       else if (state == AIRCRAFT_RADAR) {
         lastApiPoll = 0; // consulta imediata ao entrar no radar
         drawRadar();
@@ -2104,6 +2140,21 @@ void handleNavigation(NavAction a) {
       stopWeather(), drawHome();
     return;
   }
+  if (state == MUSIC_BROWSER) {
+    if (a == NavAction::BACK || a == NavAction::HOME) {
+      state = HOME;
+      drawHome();
+    }
+    // F0 (placeholder): LEFT/RIGHT/SELECT ainda não fazem nada nesta fase.
+    return;
+  }
+  if (state == MUSIC_NOW_PLAYING) {
+    if (a == NavAction::BACK || a == NavAction::HOME) {
+      state = MUSIC_BROWSER;
+      drawMusicBrowser();
+    }
+    return;
+  }
   if (state == SYSTEM_INFO) {
     if (a == NavAction::BACK) {
       state = HOME;
@@ -2170,8 +2221,8 @@ void handleTouch() {
       button = touchButton(p.x, p.y);
     else {
       button = -1;
-      if (state == HOME && p.y >= 44 && p.y < 181) {
-        homeSelection = (p.y - 44) / 28;
+      if (state == HOME && p.y >= 40 && p.y < 172) {
+        homeSelection = (p.y - 40) / 22;
         input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
       } else if (state == VIDEO_PLAYBACK)
         input.inject(NavAction::PLAY_PAUSE, InputSource::LCD_BUTTON);
