@@ -1350,40 +1350,87 @@ void drawLibrary() {
 void drawRadar() {
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
+
+    // Título (canto superior esquerdo).
     d->setTextDatum(top_left);
     d->setTextSize(1);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->drawString(PTBR::APP, 10, 7);
     d->drawString(PTBR::TRAFEGO, 10, 22);
+
+    // Scope: anel externo (alcance total), anel interno (metade) e mira.
+    const int cx = 105, cy = 105, R = 62;
+    d->drawCircle(cx, cy, R, TFT_CYAN);
+    d->drawCircle(cx, cy, R / 2, TFT_DARKCYAN);
+    d->drawFastHLine(cx - R, cy, 2 * R, TFT_DARKCYAN);
+    d->drawFastVLine(cx, cy - R, 2 * R, TFT_DARKCYAN);
+
+    // Pontos cardeais (fora do anel) + alcance na base do scope.
+    d->setTextDatum(middle_center);
     d->setTextColor(TFT_CYAN, TFT_NAVY);
-    d->drawCircle(105, 105, 62, TFT_CYAN);
-    d->drawFastHLine(43, 105, 124, TFT_DARKCYAN);
-    d->drawFastVLine(105, 43, 124, TFT_DARKCYAN);
+    d->drawString("N", cx, cy - R - 8);
+    d->drawString("S", cx, cy + R + 8);
+    d->drawString("W", cx - R - 8, cy);
+    d->drawString("E", cx + R + 8, cy);
+    d->setTextDatum(top_left);
+    d->drawString(String(settings.rangeKm) + " km", cx - R, cy + R + 4);
+
+    // Aeronaves (norte = cima, leste = direita). A selecionada ganha uma
+    // linha-guia a partir do centro, além do triângulo destacado.
+    d->setTextDatum(top_left);
     for (int i = 0; i < aircraftCount; i++) {
       double y = (aircraft[i].latitude - settings.lat) * 111.0;
       double x = (aircraft[i].longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
       if (x * x + y * y > double(settings.rangeKm) * settings.rangeKm)
         continue;
-      int px = 105 + (int)(x / settings.rangeKm * 62), py = 105 - (int)(y / settings.rangeKm * 62);
-      if (sq(px - 105) + sq(py - 105) < sq(62))
-        d->fillTriangle(px, py - 4, px - 3, py + 3, px + 3, py + 3,
-                        i == radarSelection ? TFT_CYAN : TFT_YELLOW);
+      int px = cx + (int)(x / settings.rangeKm * R), py = cy - (int)(y / settings.rangeKm * R);
+      if (sq(px - cx) + sq(py - cy) >= sq(R))
+        continue;
+      const bool sel = (i == radarSelection);
+      if (sel)
+        d->drawLine(cx, cy, px, py, TFT_CYAN);
+      d->fillTriangle(px, py - 4, px - 3, py + 3, px + 3, py + 3, sel ? TFT_CYAN : TFT_YELLOW);
     }
-    d->setTextColor(TFT_WHITE, TFT_NAVY);
+
+    // Painel lateral de dados (à direita do scope), sempre acima da barra de
+    // controle (y < 184).
+    const int PX = 178;
+    d->setTextDatum(top_left);
     if (radarSelection >= 0 && radarSelection < aircraftCount) {
-      Aircraft &p = aircraft[radarSelection];
-      d->drawString(p.callsign, 190, 62);
-      d->drawString("FL " + String((int)(p.altitude_ft / 100)), 190, 82);
-      d->drawString(String((int)p.speed_kt) + " KT", 190, 98);
+      const Aircraft &p = aircraft[radarSelection];
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
+      d->drawString(p.callsign.length() ? p.callsign : p.icao, PX, 28);
+      d->setTextColor(TFT_CYAN, TFT_NAVY);
+      d->drawString("ALT FL" + String((int)(p.altitude_ft / 100)), PX, 48);
+      d->drawString("VEL " + String((int)p.speed_kt) + " KT", PX, 66);
+      double y = (p.latitude - settings.lat) * 111.0;
+      double x = (p.longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
+      int distKm = (int)sqrt(x * x + y * y);
+      int proa = (int)(atan2(x, y) * RAD_TO_DEG);
+      if (proa < 0)
+        proa += 360;
+      d->drawString("DIST " + String(distKm) + " km  PROA " + String(proa), PX, 84);
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
       if (radarDetails) {
-        d->drawString(p.icao + " " + p.aircraft_type, 180, 145);
-        d->drawString(String(p.heading_deg, 0) + " GRAUS", 180, 160);
+        d->drawString(p.icao, PX, 112);
+        d->drawString(p.aircraft_type, PX, 128);
       }
-    } else
-      d->drawString(String(PTBR::AERONAVES_RASTREADAS) + ": " + aircraftCount, 190, 72);
-    d->drawString(apiStatus, 190, 122);
-    if (!aircraftCount)
-      d->drawString(PTBR::NENHUMA_AERONAVE, 28, 172);
+    } else {
+      d->setTextColor(TFT_CYAN, TFT_NAVY);
+      d->drawString(PTBR::AERONAVES_RASTREADAS, PX, 40);
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
+      d->drawString(String(aircraftCount), PX, 62);
+    }
+    d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
+    d->drawString(String(settings.rangeKm) + " km de alcance", PX, 150);
+    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->drawString(apiStatus.substring(0, 22), PX, 166);
+    if (!aircraftCount) {
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
+      d->setTextDatum(middle_center);
+      d->drawString(PTBR::NENHUMA_AERONAVE, cx, cy);
+      d->setTextDatum(top_left);
+    }
   }
   drawControllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
 }
