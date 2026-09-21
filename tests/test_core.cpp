@@ -193,8 +193,8 @@ void testNavigation() {
   assert(!isBackButton(279, 10) && !isBackButton(300, 34));
   assert(isPlayerAudioButton(232, 160) && isPlayerAudioButton(315, 183));
   assert(!isPlayerAudioButton(231, 170) && !isPlayerAudioButton(316, 170) && !isPlayerAudioButton(250, 184));
-  assert(homeTarget(0) == VIDEO_LIBRARY && homeTarget(1) == AIRCRAFT_RADAR && homeTarget(2) == SETTINGS &&
-         homeTarget(3) == SYSTEM_INFO);
+  assert(homeTarget(0) == VIDEO_LIBRARY && homeTarget(1) == MUSIC_BROWSER && homeTarget(2) == AIRCRAFT_RADAR &&
+         homeTarget(3) == SETTINGS && homeTarget(4) == SYSTEM_INFO && homeTarget(5) == WEATHER);
   assert(touchButton(12, 240) == -1 && touchButton(12, 183) == -1 && touchButton(12, 184) == 0 &&
          touchButton(160, 210) == 1 && touchButton(300, 210) == 2);
   InputManager input;

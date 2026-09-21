@@ -25,9 +25,17 @@ def main():
     env = config['env:m5stack-core2']
     libraries = []
     for line in env['lib_deps'].splitlines():
-        if line.strip():
-            name, version = line.strip().split('@')
-            libraries.append({'name': name.split('/')[-1], 'version': version})
+        line = line.strip()
+        if not line:
+            continue
+        if '@' in line:
+            name, version = line.split('@', 1)
+            name = name.split('/')[-1]
+        else:
+            # URL git sem pin de versão (ex.: arduino-libhelix)
+            name = line.rstrip('/').split('/')[-1].removesuffix('.git')
+            version = 'git'
+        libraries.append({'name': name, 'version': version})
     project['code']['libraries'] = libraries
     project['code']['buildSettings']['platformioPlatform'] = env['platform']
     project['code']['buildSettings']['extraBuildFlags'] = env['build_flags'].split()
