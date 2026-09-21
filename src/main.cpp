@@ -5,6 +5,7 @@
 #include "UiLogic.h"
 #include "Ascii.h"
 #include "Id3.h"
+#include "libhelix-mp3/mp3dec.h"
 #include "SafeStorage.h"
 #include "NetworkManager.h"
 #include <M5Unified.h>
@@ -108,6 +109,9 @@ void drawMusicNowPlaying();
 bool startMusic(const String &path);
 void stopMusic();
 void musicTick();
+static bool mp3Begin(const String &path);
+static void mp3End();
+static size_t mp3ReadPcm(int16_t *dst, size_t samples);
 
 static constexpr uint8_t CVBS_PIN = 26;
 static constexpr uint8_t RCA_BCK = 19;
@@ -240,6 +244,17 @@ int musicQueueCount = 0, musicQueueIndex = -1;
 id3::TrackMeta musicMeta; // tags da faixa tocando (F2)
 LGFX_Sprite *coverSprite = nullptr; // capa do álbum decodificada (PSRAM RGB565)
 static LGFX_Sprite *coverTarget = nullptr; // alvo do callback JPEGDEC durante o decode
+
+// MP3 (libhelix) — F3: decodificação em software no core 0, saída 22050 Hz estéreo.
+HMP3Decoder mp3Dec = nullptr;
+File mp3File;
+bool mp3Mode = false;
+static int16_t mp3FramePcm[2304]; // saída de um frame MPEG1 estéreo (1152x2)
+static size_t mp3PcmCount = 0;
+static int mp3Rate = 44100, mp3Chans = 2;
+static double mp3Phase = 0.0;
+static uint8_t mp3In[4096];
+static size_t mp3InLen = 0;
 
 void drawBackButton() {
   if (state == HOME || state == BOOT)
@@ -590,45 +605,59 @@ void audioTask(void *) {
       audioUnderruns++;
       continue;
     }
-    const uint32_t position = wavFile.position();
-    if (position >= wavDataEnd) {
-      if (weatherAudio.load()) {
-        // Música de fundo do Weather Channel: rebobina e continua em loop.
-        if (!wavFile.seek(wavDataStart))
-          weatherAudio = false;
-        xSemaphoreGive(sdMutex);
+    size_t bytes;
+    if (mp3Mode) {
+      // MP3: decodifica para PCM 22050 Hz estéreo (resampler linear).
+      const size_t samps = mp3ReadPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / 2);
+      bytes = samps * sizeof(int16_t);
+      xSemaphoreGive(sdMutex);
+      if (!bytes) {
+        playbackFinished = true;
+        playing = false;
         vTaskDelay(pdMS_TO_TICKS(2));
         continue;
       }
-      xSemaphoreGive(sdMutex);
-      playbackFinished = true;
-      playing = false;
-      Serial.println("[M5RETRO] Fim do audio: programa concluido");
-      vTaskDelay(pdMS_TO_TICKS(2));
-      continue;
-    }
-    const size_t remaining = wavDataEnd - position;
-    size_t bytes = wavFile.read(buf, min(AUDIO_CHUNK, remaining));
-    xSemaphoreGive(sdMutex);
-    if (!bytes || bytes % wavBlockAlign) {
-      if (weatherAudio.load()) {
-        // Música do clima: falha transitória de leitura do SD. Rebobina e tenta de novo.
-        audioUnderruns++;
-        if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    } else {
+      const uint32_t position = wavFile.position();
+      if (position >= wavDataEnd) {
+        if (weatherAudio.load()) {
+          // Música de fundo do Weather Channel: rebobina e continua em loop.
           if (!wavFile.seek(wavDataStart))
             weatherAudio = false;
           xSemaphoreGive(sdMutex);
+          vTaskDelay(pdMS_TO_TICKS(2));
+          continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        xSemaphoreGive(sdMutex);
+        playbackFinished = true;
+        playing = false;
+        Serial.println("[M5RETRO] Fim do audio: programa concluido");
+        vTaskDelay(pdMS_TO_TICKS(2));
         continue;
       }
-      audioStreamError = true;
-      audioUnderruns++;
-      playbackFinished = true;
-      playing = false;
-      Serial.println("[M5RETRO] ERRO: leitura WAV terminou antes do esperado");
-      vTaskDelay(pdMS_TO_TICKS(2));
-      continue;
+      const size_t remaining = wavDataEnd - position;
+      bytes = wavFile.read(buf, min(AUDIO_CHUNK, remaining));
+      xSemaphoreGive(sdMutex);
+      if (!bytes || bytes % wavBlockAlign) {
+        if (weatherAudio.load()) {
+          // Música do clima: falha transitória de leitura do SD. Rebobina e tenta de novo.
+          audioUnderruns++;
+          if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (!wavFile.seek(wavDataStart))
+              weatherAudio = false;
+            xSemaphoreGive(sdMutex);
+          }
+          vTaskDelay(pdMS_TO_TICKS(5));
+          continue;
+        }
+        audioStreamError = true;
+        audioUnderruns++;
+        playbackFinished = true;
+        playing = false;
+        Serial.println("[M5RETRO] ERRO: leitura WAV terminou antes do esperado");
+        vTaskDelay(pdMS_TO_TICKS(2));
+        continue;
+      }
     }
     playback::scalePcm(reinterpret_cast<int16_t *>(buf), bytes / sizeof(int16_t), playbackVolume.load());
     size_t delivered = bytes;
@@ -1375,7 +1404,7 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
 static bool isMusicTrack(const String &name) {
   String n = name;
   n.toLowerCase();
-  return n.endsWith(".wav"); // F1: só WAV (PCM 16-bit 22050 Hz)
+  return n.endsWith(".wav") || n.endsWith(".mp3");
 }
 
 static String musicParentDir(const String &path) {
@@ -1611,6 +1640,89 @@ void drawMusicNowPlaying() {
   drawBackButton();
 }
 
+static bool mp3Begin(const String &path) {
+  mp3End();
+  mp3File = SD.open(path, FILE_READ);
+  if (!mp3File)
+    return false;
+  mp3Dec = MP3InitDecoder();
+  if (!mp3Dec) {
+    mp3File.close();
+    return false;
+  }
+  mp3Mode = true;
+  mp3PcmCount = 0;
+  mp3InLen = 0;
+  mp3Phase = 0.0;
+  mp3Rate = 44100;
+  mp3Chans = 2;
+  return true;
+}
+
+static void mp3End() {
+  if (mp3Dec) {
+    MP3FreeDecoder(mp3Dec);
+    mp3Dec = nullptr;
+  }
+  if (mp3File)
+    mp3File.close();
+  mp3Mode = false;
+}
+
+// Decodifica MP3 -> PCM 22050 Hz estéreo (resampler linear + mono->estéreo).
+// Retorna o número de shorts estéreo produzidos em dst (<= samples).
+static size_t mp3ReadPcm(int16_t *dst, size_t samples) {
+  size_t produced = 0;
+  while (produced + 1 < samples) {
+    // Garante um frame decodificado no buffer de saída.
+    if (mp3PcmCount == 0) {
+      if (mp3InLen < 2048) {
+        const size_t got = mp3File.read(mp3In + mp3InLen, sizeof(mp3In) - mp3InLen);
+        if (!got && mp3InLen == 0)
+          break; // EOF
+        mp3InLen += got;
+      }
+      unsigned char *in = mp3In;
+      int bytesLeft = (int)mp3InLen;
+      const int samps = MP3Decode(mp3Dec, &in, &bytesLeft, mp3FramePcm, 0);
+      const size_t consumed = (size_t)(in - mp3In);
+      if (consumed > 0) {
+        memmove(mp3In, in, mp3InLen - consumed);
+        mp3InLen -= consumed;
+      }
+      if (samps > 0) {
+        mp3PcmCount = (size_t)samps;
+        mp3Phase = 0.0;
+        MP3FrameInfo info;
+        MP3GetLastFrameInfo(mp3Dec, &info);
+        mp3Rate = info.samprate;
+        mp3Chans = info.nChans;
+      } else if (consumed == 0 && !mp3File.available()) {
+        break; // EOF real
+      } else {
+        continue; // erro/necessita de mais dados
+      }
+    }
+    const int ch = mp3Chans;
+    const double ratio = (double)mp3Rate / 22050.0;
+    const int framesIn = (int)(mp3PcmCount / ch);
+    const int idx = (int)mp3Phase;
+    if (idx >= framesIn - 1) {
+      mp3PcmCount = 0; // frame consumido
+      continue;
+    }
+    const float frac = (float)(mp3Phase - idx);
+    for (int c = 0; c < 2; ++c) {
+      const int sc = (ch == 1) ? 0 : c;
+      const int16_t a = mp3FramePcm[idx * ch + sc];
+      const int16_t b = mp3FramePcm[(idx + 1) * ch + sc];
+      dst[produced++] = (int16_t)(a + (b - a) * frac);
+    }
+    mp3Phase += ratio;
+  }
+  return produced;
+}
+
 bool startMusic(const String &path) {
   // Garante I2S1 livre: encerra qualquer vídeo/weather em andamento.
   playing = false;
@@ -1622,19 +1734,39 @@ bool startMusic(const String &path) {
     mjpegFile.close();
   if (wavFile)
     wavFile.close();
+  mp3End();
   mjpegReader.reset();
-  wavFile = SD.open(path, FILE_READ);
-  const bool ok = wavFile && openWavAndReadHeader();
-  if (!ok && wavFile) {
-    wavFile.close();
-    Serial.printf("[M5RETRO] Musica: WAV invalido %s\n", path.c_str());
+  String ext = path;
+  ext.toLowerCase();
+  const bool isMp3 = ext.endsWith(".mp3");
+  bool ok = false;
+  musicMeta.reset();
+  if (isMp3) {
+    ok = mp3Begin(path);
+    if (ok) {
+      sampleRate = 22050;
+      wavChannels = 2;
+      wavBlockAlign = 4;
+      wavDataStart = 0;
+      // Duração total estimada (assume ~128 kbps) para a barra de progresso.
+      const uint32_t estSec = (uint32_t)(mp3File.size() * 8ULL / 128000ULL);
+      wavDataEnd = estSec * 22050UL * 4UL;
+      id3::readTags(mp3File, musicMeta);
+    }
+  } else {
+    wavFile = SD.open(path, FILE_READ);
+    ok = wavFile && openWavAndReadHeader();
+    if (ok)
+      id3::readTags(wavFile, musicMeta); // melhor esforço (WAV raramente tem ID3)
+    else if (wavFile) {
+      wavFile.close();
+      Serial.printf("[M5RETRO] Musica: WAV invalido %s\n", path.c_str());
+    }
   }
   if (sdMutex)
     xSemaphoreGive(sdMutex);
   if (!ok)
     return false;
-  musicMeta.reset();
-  id3::readTags(wavFile, musicMeta); // melhor esforço (WAV raramente tem ID3; MP3 na F3)
   samplesPlayed = 0;
   playbackFinished = false;
   audioStreamError = false;
@@ -1678,6 +1810,7 @@ void stopMusic() {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
   if (wavFile)
     wavFile.close();
+  mp3End(); // fecha mp3File + libera o decodificador libhelix
   mjpegReader.reset();
   if (sdMutex)
     xSemaphoreGive(sdMutex);
