@@ -579,7 +579,9 @@ void audioTask(void *) {
     }
     // Pause must silence the physical output as well as stop file reads. Clear
     // the RCA DMA queue so a tap does not leave already-buffered PCM playing.
-    if ((!playing && !weatherAudio.load()) || paused || !wavFile) {
+    // `!wavFile && !mp3Mode` (e não apenas `!wavFile`) porque, no MP3, o arquivo
+    // aberto é `mp3File` (wavFile fica nulo) — senão o MP3 nunca tocaria.
+    if ((!playing && !weatherAudio.load()) || paused || (!wavFile && !mp3Mode)) {
       if (!outputPaused && active == AudioOutput::RCA) {
         i2s_zero_dma_buffer(I2S_NUM_1);
         i2s_stop(I2S_NUM_1);
