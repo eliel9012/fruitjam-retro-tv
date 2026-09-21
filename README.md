@@ -31,6 +31,10 @@ pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em p
 |---|---|---|
 | ![Portal](docs/screens/portal.png) | ![Error](docs/screens/error.png) | ![Weather](docs/screens/weather.png) |
 
+| Música | Now Playing (capa + ID3) |
+|---|---|
+| ![Music](docs/screens/music.png) | ![Music Playing](docs/screens/music_playing.png) |
+
 ## Compilar
 
 Python 3.9 ou superior e acesso à internet são necessários na primeira compilação.
@@ -82,6 +86,25 @@ O conversor não substitui pastas existentes. Ele valida tamanho e quantidade de
 silêncio quando o vídeo não tem áudio e completa áudio curto até a duração do vídeo.
 Cada JPEG deve ter no máximo 128 KiB. `meta.json` é opcional quando os arquivos se chamam
 `video.mjpeg` e `audio.wav` e a taxa é 15 FPS.
+
+## Música (MP3/WAV)
+
+O menu inicial tem o item **MUSICA**, um player estilo iPod que navega por pastas do SD:
+
+```text
+/M5RETRO/music/
+  Artista/
+    Album/
+      cover.jpg  (ou folder.jpg)   <- capa do álbum, exibida na tela "now playing"
+      faixa.mp3                    <- MP3 (128/192/320 kbps, 44100 Hz) via libhelix
+      faixa.wav                    <- WAV PCM 16-bit 22050 Hz estéreo
+```
+
+Formato suportado: `.mp3` (decodificado por software e reamostrado para 22050 Hz) e `.wav`
+(PCM 16-bit estéreo 22050 Hz). As tags ID3v1/v2 (título/artista/álbum/ano) aparecem na tela, e os
+acentos são normalizados para ASCII por `include/Ascii.h`. A capa vem de `cover.jpg`/`folder.jpg`
+na pasta do álbum ou do frame `APIC` embutido no MP3. Arquivos de teste prontos estão em
+`test-music/` (com acentos e capa) — copie para `/M5RETRO/music/`.
 
 ## Controles
 
@@ -160,7 +183,8 @@ de teste físico. `PINOUT.md` descreve as conexões utilizadas pelo código.
 ## Diagnóstico USB
 
 Serial a 115200 baud: `diag status`, `diag colors`, `diag play`, `diag pause`, `diag resume`,
-`diag stop`, `diag back`, `diag home`, `diag radar` e `diag audio toggle`. O último comando usa
+`diag stop`, `diag back`, `diag home`, `diag radar`, `diag weather`, `diag music` e
+`diag audio toggle`. O último comando usa
 a mesma rotina do botão do player. O status informa saída de áudio, erros, amostras PCM,
 quadros descartados, heap e resultado HTTP, sem imprimir credenciais.
 

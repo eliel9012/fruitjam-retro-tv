@@ -95,17 +95,24 @@ def header(s, title):
     s.text(title, 12, 8, WHITE, M)
     s.hline(8, 36, 304, CYAN)
 
+def airplane(s, x, y, color):
+    # aviaozinho top-down apontando para "cima" (norte), como drawAirplane
+    s.d.line([x, y - 3, x, y + 3], fill=color)               # fuselagem
+    s.d.polygon([(x, y - 3), (x - 2, y + 1), (x + 2, y + 1)], fill=color)  # nariz
+    s.d.line([x - 4, y, x + 4, y], fill=color)               # asas
+    s.d.line([x - 2, y + 2, x + 2, y + 2], fill=color)       # cauda
+
 # ============================================================================
 def home():
     s = Screen()
-    items = ["VIDEOS", "TRAFEGO AEREO", "CONFIGURACOES", "SISTEMA"]
+    items = ["VIDEOS", "MUSICA", "TRAFEGO AEREO", "CONFIGURACOES", "SISTEMA", "TEMPO"]
     s.text("M5 RETRO TV", 12, 8, WHITE, M)
     s.hline(8, 36, 304, CYAN)
     for i, it in enumerate(items):
-        y = 48 + i * 32
+        y = 40 + i * 22
         sel = (i == 0)
         if sel:
-            s.roundrect(12, y - 3, 296, 28, 4, CYAN)
+            s.roundrect(12, y - 2, 296, 20, 4, CYAN)
         s.text(("> " if sel else "  ") + it, 24, y, NAVY if sel else WHITE, M)
     controller_labels(s, "ACIMA", "OK", "ABAIXO")
     s.save("docs/screens/home.png")
@@ -152,10 +159,10 @@ def radar():
     s.circle(105, 105, 62, CYAN)
     s.hline(43, 105, 124, DARKCYAN)
     s.vline(105, 43, 124, DARKCYAN)
-    s.triangle(105, 70, 3, 6, CYAN)   # selecionado
-    s.triangle(90, 120, 3, 6, YELLOW)
-    s.triangle(130, 95, 3, 6, YELLOW)
-    s.triangle(118, 140, 3, 6, YELLOW)
+    airplane(s, 105, 70, CYAN)   # selecionado
+    airplane(s, 90, 120, YELLOW)
+    airplane(s, 130, 95, YELLOW)
+    airplane(s, 118, 140, YELLOW)
     s.text("PT-ABC", 190, 62, WHITE, S)
     s.text("FL 350", 190, 82, WHITE, S)
     s.text("412 KT", 190, 98, WHITE, S)
@@ -199,6 +206,45 @@ def error():
     s.text("CARTAO SD NAO ENCONTRADO", 160, 130, CYAN, S, "mc")
     s.save("docs/screens/error.png")
 
+def music():
+    s = Screen()
+    header(s, "MUSICA")
+    s.text("/", 12, 42, DARKCYAN, S)
+    entries = [("Artista Teste", True), ("Album", True), ("faixa-avulsa.mp3", False), ("outra.wav", False)]
+    for row, (name, is_folder) in enumerate(entries[:4]):
+        y = 56 + row * 32
+        sel = (row == 0)
+        if sel:
+            s.roundrect(12, y - 2, 296, 28, 4, CYAN)
+        label = ("> " if sel else "  ") + name + ("/" if is_folder else "")
+        s.text(label[:40], 20, y + 6, NAVY if sel else (CYAN if is_folder else WHITE), S)
+    s.text("1 / 4", 216, 16, WHITE, S)
+    controller_labels(s, "ACIMA", "OK", "ABAIXO")
+    back_button(s)
+    s.save("docs/screens/music.png")
+
+def music_playing():
+    s = Screen()
+    header(s, "MUSICA")
+    # Capa do album (quadrado com borda ciano + nota musical desenhada)
+    s.roundrect(16, 52, 88, 88, 2, CYAN)
+    s.rect(18, 54, 84, 84, BLUE)
+    s.d.polygon([(64, 74), (54, 92), (74, 92)], fill=CYAN)
+    s.d.ellipse([56, 86, 70, 100], fill=CYAN)
+    s.d.line([70, 74, 70, 96], fill=CYAN)
+    s.d.line([70, 74, 78, 78], fill=CYAN)
+    # Tags
+    s.text("Musica de Teste", 120, 52, YELLOW, S)
+    s.text("ARTISTA COMICO", 120, 82, WHITE, S)
+    s.text("ALBUM DE EXEMPLO", 120, 102, WHITE, S)
+    s.text("2026", 120, 122, WHITE, S)
+    # Progresso
+    s.rect(16, 170, 288, 6, CYAN)
+    s.rect(17, 171, 80, 4, YELLOW)
+    s.text("PLAY 00:03 / 00:08", 16, 184, CYAN, S)
+    back_button(s)
+    s.save("docs/screens/music_playing.png")
+
 def weather():
     s = Screen()
     s.fill_screen(NAVY)
@@ -215,7 +261,7 @@ def weather():
 
 def main():
     os.makedirs("docs/screens", exist_ok=True)
-    for fn in (home, library, playback, radar, settings, info, portal, error, weather):
+    for fn in (home, library, playback, radar, settings, info, portal, error, weather, music, music_playing):
         fn()
         print("ok:", fn.__name__)
 
