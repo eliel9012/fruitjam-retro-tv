@@ -487,6 +487,24 @@ template <class Stream> bool readV2(Stream &f, TrackMeta &out) {
 // ---------------------------------------------------------------------------
 // API principal
 // ---------------------------------------------------------------------------
+// Offset (em bytes) onde o áudio começa: logo após o ID3v2, se houver, senão 0.
+// Necessário para posicionar o decodificador MP3 no primeiro frame (a tag "ID3"
+// não é um frame válido e faria o decoder falhar indefinidamente).
+template <class Stream> uint32_t audioStart(Stream &f) {
+  if (f.size() < 10)
+    return 0;
+  uint8_t hdr[10];
+  if (!f.seek(0) || f.read(hdr, 10) != 10 || memcmp(hdr, "ID3", 3))
+    return 0;
+  const uint8_t major = hdr[3];
+  if (major != 3 && major != 4)
+    return 0;
+  uint32_t total = 10 + syncsafe32(hdr + 6);
+  if (major == 4 && (hdr[5] & 0x10)) // footer de 10 bytes no v2.4
+    total += 10;
+  return total <= f.size() ? total : 0;
+}
+
 // Lê tags de um arquivo já aberto. Tenta ID3v2 no início; se título/artista/
 // álbum ficarem incompletos, complementa com ID3v1 nos últimos 128 bytes.
 // Salva e restaura a posição do stream. Retorna true se algum tag foi lido.

@@ -188,7 +188,7 @@ std::atomic<int> weatherActive{0};
 std::atomic<uint32_t> weatherVersion{0};
 std::atomic<bool> weatherReady{false};
 std::atomic<bool> weatherBusy{false};
-char weatherStatus[32] = "CARREGANDO...";
+std::atomic<const char *> weatherStatus{"CARREGANDO..."};
 uint32_t lastWeatherAttempt = 0, lastWeatherGood = 0;
 uint32_t lastWeatherDraw = 0, lastTickerMs = 0;
 uint16_t lastWeatherBg = 0;
@@ -368,16 +368,25 @@ SecretsConfig currentSecrets() {
   return s;
 }
 void serviceWiFi() {
-  if (!networkConfigPresent || playing)
+  if (!networkConfigPresent)
     return;
-  const NetworkState before = network.state();
-  network.update();
+  // NTP é único e barato: solicita mesmo durante o playback. Senão, se o usuário
+  // nunca parar de tocar, o relógio não sincroniza e o radar fica preso em
+  // "SINCRONIZANDO HORA".
   if (network.connected()) {
     static bool clockRequested = false;
     if (!clockRequested) {
       configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
       clockRequested = true;
     }
+  }
+  // Retry/roaming e texto de status ficam suspensos durante o playback, para não
+  // disputar a banda com o streaming de vídeo.
+  if (playing)
+    return;
+  const NetworkState before = network.state();
+  network.update();
+  if (network.connected()) {
     if (before != NetworkState::CONNECTED)
       apiStatus = "CONECTADA";
   } else if (network.state() == NetworkState::CONNECTING)
@@ -861,10 +870,11 @@ bool startProgram(const String &dir) {
       Serial.println("[M5RETRO] meta.json invalido");
       return false;
     }
-    currentTitle = (const char *)(d["title"] | currentTitle.c_str());
+    const String defaultTitle = currentTitle, defaultVideo = video, defaultAudio = audio;
+    currentTitle = (const char *)(d["title"] | defaultTitle.c_str());
     fps = d["fps"] | 15.0f;
-    video = (const char *)(d["video"] | video.c_str());
-    audio = (const char *)(d["audio"] | audio.c_str());
+    video = (const char *)(d["video"] | defaultVideo.c_str());
+    audio = (const char *)(d["audio"] | defaultAudio.c_str());
   }
   if (!isfinite(fps) || fps < 1.0f || fps > 30.0f) {
     Serial.printf("[M5RETRO] FPS invalido no meta.json: %.2f\n", fps);
@@ -919,6 +929,7 @@ void stopProgram() {
     mjpegFile.close();
   if (wavFile)
     wavFile.close();
+  mp3End(); // fecha mp3File + libera o decodificador (evita estado de MP3 vazado)
   mjpegReader.reset();
   if (sdMutex)
     xSemaphoreGive(sdMutex);
@@ -1159,7 +1170,6 @@ bool isProgramFolder(const String &path) {
   const String cardPath = normalizeSdPath(path);
   const bool valid = SD.exists(cardPath + "/meta.json") ||
                      (SD.exists(cardPath + "/video.mjpeg") && SD.exists(cardPath + "/audio.wav"));
-  Serial.printf("[M5RETRO] Pasta SD: %s %s\n", cardPath.c_str(), valid ? "PROGRAMA" : "IGNORADA");
   return valid;
 }
 
@@ -1189,41 +1199,45 @@ String libraryRoot() {
   return String(VIDEOS);
 }
 
-int libraryProgramCount() {
-  int count = 0;
-  const String rootPath = libraryRoot();
-  File root = SD.open(rootPath);
-  if (!root)
-    return 0;
-  for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
-    if (entry.isDirectory() && isProgramFolder(libraryChildPath(rootPath, String(entry.name()))))
-      ++count;
-    entry.close();
+// Cache da lista de programas: evita re-varrer o SD inteiro a cada redesenho da
+// biblioteca (antes drawLibrary chamava libraryProgramCount + uma varredura por
+// linha visível, a cada tecla de navegação).
+static constexpr int MAX_LIBRARY_ITEMS = 64;
+String libraryPaths[MAX_LIBRARY_ITEMS];
+int libraryCount = 0;
+bool libraryScanned = false;
+
+void scanLibrary() {
+  libraryCount = 0;
+  const String root = libraryRoot();
+  File d = SD.open(root);
+  if (!d) {
+    libraryScanned = true;
+    return;
   }
-  root.close();
-  Serial.printf("[M5RETRO] Biblioteca: %d programa(s) em %s\n", count, rootPath.c_str());
-  return count;
+  for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+    if (e.isDirectory()) {
+      const String p = libraryChildPath(root, String(e.name()));
+      if (isProgramFolder(p) && libraryCount < MAX_LIBRARY_ITEMS)
+        libraryPaths[libraryCount++] = p;
+    }
+    e.close();
+  }
+  d.close();
+  libraryScanned = true;
+  Serial.printf("[M5RETRO] Biblioteca: %d programa(s) em %s\n", libraryCount, root.c_str());
+}
+
+int libraryProgramCount() {
+  if (!libraryScanned)
+    scanLibrary();
+  return libraryCount;
 }
 
 String libraryProgramAt(int wantedIndex) {
-  int index = 0;
-  const String rootPath = libraryRoot();
-  File root = SD.open(rootPath);
-  if (!root)
-    return "";
-  for (File entry = root.openNextFile(); entry; entry = root.openNextFile()) {
-    if (entry.isDirectory() && isProgramFolder(libraryChildPath(rootPath, String(entry.name())))) {
-      if (index++ == wantedIndex) {
-        String path = libraryChildPath(rootPath, String(entry.name()));
-        entry.close();
-        root.close();
-        return path;
-      }
-    }
-    entry.close();
-  }
-  root.close();
-  return "";
+  if (!libraryScanned)
+    scanLibrary();
+  return (wantedIndex >= 0 && wantedIndex < libraryCount) ? libraryPaths[wantedIndex] : String("");
 }
 
 String playbackClock() {
@@ -1697,10 +1711,18 @@ static size_t mp3ReadPcm(int16_t *dst, size_t samples) {
         MP3GetLastFrameInfo(mp3Dec, &info);
         mp3Rate = info.samprate;
         mp3Chans = info.nChans;
-      } else if (consumed == 0 && !mp3File.available()) {
-        break; // EOF real
+      } else if (consumed == 0) {
+        // Decoder não avançou (frame corrompido/desincronizado). Descarta 1 byte
+        // e tenta-resincronizar, sem travar em busy-loop até o EOF.
+        if (mp3InLen > 0) {
+          memmove(mp3In, mp3In + 1, mp3InLen - 1);
+          --mp3InLen;
+        } else if (!mp3File.available()) {
+          break; // EOF real
+        }
+        continue;
       } else {
-        continue; // erro/necessita de mais dados
+        continue; // consumiu bytes mas não produziu PCM: tenta o próximo frame
       }
     }
     const int ch = mp3Chans;
@@ -1752,6 +1774,7 @@ bool startMusic(const String &path) {
       const uint32_t estSec = (uint32_t)(mp3File.size() * 8ULL / 128000ULL);
       wavDataEnd = estSec * 22050UL * 4UL;
       id3::readTags(mp3File, musicMeta);
+      mp3File.seek(id3::audioStart(mp3File)); // pula a tag ID3v2 antes do decoder
     }
   } else {
     wavFile = SD.open(path, FILE_READ);
@@ -1771,8 +1794,9 @@ bool startMusic(const String &path) {
   playbackFinished = false;
   audioStreamError = false;
   paused = false;
-  playing = true;
-  // Reconstrói a fila com as faixas do diretório da faixa tocando.
+  // Reconstrói a fila com as faixas do diretório da faixa tocando. Feito ANTES
+  // de iniciar o áudio: o audioTask ainda está ocioso (sem ler o SD), então a
+  // varredura e a capa não disputam o barramento com o decoder.
   musicQueueCount = 0;
   musicQueueIndex = -1;
   const int slash = path.lastIndexOf('/');
@@ -1798,6 +1822,7 @@ bool startMusic(const String &path) {
     musicQueue[musicQueueCount++] = path;
   }
   loadAlbumCover(path); // capa do álbum (folder.jpg/cover.jpg ou APIC)
+  playing = true;       // inicia o áudio SÓ depois das leituras do SD (fila + capa)
   drawMusicNowPlaying();
   return true;
 }
@@ -2171,10 +2196,10 @@ void weatherNetworkTask(void *arg) {
     weatherReady.store(true);
     weatherVersion.fetch_add(1);
     lastWeatherGood = millis();
-    snprintf(weatherStatus, sizeof(weatherStatus), "ATUALIZADO");
+    weatherStatus.store("ATUALIZADO");
     Serial.printf("[M5RETRO] Tempo: %dC umidade:%d%% %s\n", local.tempC, local.humidity, local.cond);
   } else {
-    snprintf(weatherStatus, sizeof(weatherStatus), "ERRO NA CONSULTA");
+    weatherStatus.store("ERRO NA CONSULTA");
     Serial.println("[M5RETRO] Tempo: falha na consulta");
   }
   weatherBusy.store(false);
@@ -2186,7 +2211,7 @@ void pollWeather() {
     return;
   if (!network.connected()) {
     if (!weatherReady.load())
-      snprintf(weatherStatus, sizeof(weatherStatus), "SEM WI-FI");
+      weatherStatus.store("SEM WI-FI");
     return;
   }
   const uint32_t now = millis();
@@ -2201,7 +2226,7 @@ void pollWeather() {
   if (xTaskCreatePinnedToCore(weatherNetworkTask, "WEATHER_HTTP", 8192, (void *)(intptr_t)next, 0,
                               nullptr, 1) != pdPASS) {
     weatherBusy.store(false);
-    snprintf(weatherStatus, sizeof(weatherStatus), "SEM MEMORIA");
+    weatherStatus.store("SEM MEMORIA");
   }
 }
 
@@ -2277,7 +2302,7 @@ void drawWeatherFrame() {
     rca.setFont(&fonts::Font2);
     rca.setTextSize(1);
     rca.setTextColor(TFT_WHITE, bg);
-    rca.drawString(weatherStatus, CRT_W / 2, 120);
+    rca.drawString(weatherStatus.load(), CRT_W / 2, 120);
   }
   rca.drawFastHLine(8, TICKER_Y - 2, CRT_W - 16, TFT_CYAN);
 }
@@ -2318,7 +2343,7 @@ void startWeather() {
   const bool ok = wavFile && openWavAndReadHeader();
   if (!ok && wavFile) {
     wavFile.close();
-    snprintf(weatherStatus, sizeof(weatherStatus), "SEM MUSICA (TELA ATIVA)");
+    weatherStatus.store("SEM MUSICA (TELA ATIVA)");
   }
   if (sdMutex)
     xSemaphoreGive(sdMutex);
@@ -2463,9 +2488,10 @@ void handleNavigation(NavAction a) {
       homeSelection = (homeSelection + 1) % 6;
     else if (a == NavAction::SELECT) {
       state = homeTarget(homeSelection);
-      if (state == VIDEO_LIBRARY)
+      if (state == VIDEO_LIBRARY) {
+        libraryScanned = false; // revarre ao entrar na biblioteca
         drawLibrary();
-      else if (state == MUSIC_BROWSER)
+      } else if (state == MUSIC_BROWSER)
         drawMusicBrowser();
       else if (state == AIRCRAFT_RADAR) {
         lastApiPoll = 0; // consulta imediata ao entrar no radar
@@ -2509,12 +2535,11 @@ void handleNavigation(NavAction a) {
       paused = !paused;
       osdUntil = millis() + 3000;
       drawPlaybackOsd();
-    } else if (a == NavAction::LEFT || a == NavAction::PREVIOUS || a == NavAction::RIGHT ||
-               a == NavAction::NEXT) {
+    } else if (a == NavAction::LEFT || a == NavAction::RIGHT) {
       stopProgram();
       int count = libraryProgramCount();
       if (count) {
-        int delta = (a == NavAction::LEFT || a == NavAction::PREVIOUS) ? count - 1 : 1;
+        int delta = (a == NavAction::LEFT) ? count - 1 : 1;
         int wanted = (librarySelection + delta) % count;
         librarySelection = wanted;
         if (!startProgram(libraryProgramAt(librarySelection)))
@@ -2543,7 +2568,6 @@ void handleNavigation(NavAction a) {
     else if (a == NavAction::SELECT)
       radarDetails = !radarDetails;
     drawRadar();
-    drawControllerLabels(PTBR::AERONAVE, PTBR::DETALHES, PTBR::AERONAVE);
     return;
   }
   if (state == SETTINGS) {
@@ -2650,9 +2674,9 @@ void handleNavigation(NavAction a) {
       drawMusicNowPlaying();
       return;
     }
-    if (a == NavAction::LEFT || a == NavAction::PREVIOUS || a == NavAction::RIGHT || a == NavAction::NEXT) {
+    if (a == NavAction::LEFT || a == NavAction::RIGHT) {
       if (musicQueueCount) {
-        const int delta = (a == NavAction::LEFT || a == NavAction::PREVIOUS) ? -1 : 1;
+        const int delta = (a == NavAction::LEFT) ? -1 : 1;
         musicQueueIndex = (musicQueueIndex + delta + musicQueueCount) % musicQueueCount;
         if (!startMusic(musicQueue[musicQueueIndex])) {
           stopMusic();

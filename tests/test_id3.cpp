@@ -298,6 +298,51 @@ static void testNoTag() {
   assert(m.title[0] == 0 && m.artist[0] == 0 && m.album[0] == 0 && !m.hasCover);
 }
 
+static void testAudioStart() {
+  // Sem tag: offset 0.
+  {
+    MemoryStream f;
+    f.bytes.assign(64, 0xAB);
+    assert(id3::audioStart(f) == 0);
+  }
+  // ID3v2.3: áudio começa logo após o cabeçalho + frames (10 + tamanho).
+  {
+    std::vector<uint8_t> frames;
+    append(frames, makeFrame("TIT2", textPayload(0, "x"), false));
+    std::vector<uint8_t> file;
+    magicId3(file);
+    file.push_back(3);
+    file.push_back(0);
+    file.push_back(0); // flags (sem footer)
+    u32syncsafe(file, uint32_t(frames.size()));
+    append(file, frames);
+    file.push_back(0xFF); // "áudio" fictício (sync word de MP3)
+    file.push_back(0xFB);
+    MemoryStream f;
+    f.bytes = file;
+    assert(id3::audioStart(f) == 10 + frames.size());
+  }
+  // ID3v2.4 com footer (flag 0x10): +10 bytes do footer.
+  {
+    std::vector<uint8_t> frames;
+    append(frames, makeFrame("TIT2", textPayload(0, "x"), true));
+    std::vector<uint8_t> file;
+    magicId3(file);
+    file.push_back(4);
+    file.push_back(0);
+    file.push_back(0x10); // footer presente
+    u32syncsafe(file, uint32_t(frames.size()));
+    append(file, frames);
+    for (int i = 0; i < 10; ++i)
+      file.push_back(0); // footer
+    file.push_back(0xFF);
+    file.push_back(0xFB);
+    MemoryStream f;
+    f.bytes = file;
+    assert(id3::audioStart(f) == 10 + frames.size() + 10);
+  }
+}
+
 static void testMalformed() {
   // Cabeçalho ID3v2 válido, mas tamanho syncsafe maior que o arquivo.
   std::vector<uint8_t> file;
@@ -320,7 +365,8 @@ int main() {
   testNormalization();
   testFallbackV1();
   testNoTag();
+  testAudioStart();
   testMalformed();
-  std::cout << "PASS: ID3v1, ID3v1.1, ID3v2.3 (texto+APIC), ID3v2.4, normalização, fallback, sem tag\n";
+  std::cout << "PASS: ID3v1, ID3v1.1, ID3v2.3 (texto+APIC), ID3v2.4, normalização, fallback, sem tag, audioStart\n";
   return 0;
 }
