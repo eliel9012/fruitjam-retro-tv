@@ -184,11 +184,31 @@ def settings():
 
 def info():
     s = Screen()
-    s.text("SISTEMA", 160, 94, WHITE, M, "mc")
-    s.text("MEMORIA: 72880  PSRAM: 4012", 160, 130, CYAN, S, "mc")
+    header(s, "SISTEMA")
+    y0 = 52
+    s.text("MEMORIA LIVRE", 20, y0, CYAN, S)
+    s.text("PSRAM LIVRE", 20, y0 + 26, CYAN, S)
+    s.text("VERSAO", 20, y0 + 52, CYAN, S)
+    s.text("72880 bytes", 140, y0, WHITE, S)
+    s.text("4012512 bytes", 140, y0 + 26, WHITE, S)
+    s.text("core2", 140, y0 + 52, WHITE, S)
     controller_labels(s, "ANTERIOR", "DETALHES", "PROXIMO")
     back_button(s)
     s.save("docs/screens/info.png")
+
+def info_network():
+    s = Screen()
+    header(s, "SISTEMA")
+    y0 = 52
+    s.text("REDE", 20, y0, CYAN, S)
+    s.text("SINAL", 20, y0 + 26, CYAN, S)
+    s.text("ENDERECO IP", 20, y0 + 52, CYAN, S)
+    s.text("CONECTADO", 168, y0, WHITE, S)
+    s.text("-38 dBm", 168, y0 + 26, WHITE, S)
+    s.text("192.168.15.23", 168, y0 + 52, WHITE, S)
+    controller_labels(s, "ANTERIOR", "DETALHES", "PROXIMO")
+    back_button(s)
+    s.save("docs/screens/info_network.png")
 
 def portal():
     s = Screen()
@@ -233,15 +253,17 @@ def music_playing():
     s.d.ellipse([56, 86, 70, 100], fill=CYAN)
     s.d.line([70, 74, 70, 96], fill=CYAN)
     s.d.line([70, 74, 78, 78], fill=CYAN)
-    # Tags
+    # Tags (truncadas como no firmware)
     s.text("Musica de Teste", 120, 52, YELLOW, S)
     s.text("ARTISTA COMICO", 120, 82, WHITE, S)
     s.text("ALBUM DE EXEMPLO", 120, 102, WHITE, S)
     s.text("2026", 120, 122, WHITE, S)
-    # Progresso
+    # Nº da faixa + bitrate (canto sup. direito)
+    s.text("2/4 160K", 200, 42, DARKCYAN, S)
+    # Progresso (barra + relogio com total)
     s.rect(16, 170, 288, 6, CYAN)
     s.rect(17, 171, 80, 4, YELLOW)
-    s.text("PLAY 00:03 / 00:08", 16, 184, CYAN, S)
+    s.text("PLAY 00:03 / 00:08  SHUFFLE", 16, 184, CYAN, S)
     back_button(s)
     s.save("docs/screens/music_playing.png")
 
@@ -261,7 +283,8 @@ def weather():
 
 def main():
     os.makedirs("docs/screens", exist_ok=True)
-    for fn in (home, library, playback, radar, settings, info, portal, error, weather, music, music_playing):
+    for fn in (home, library, playback, radar, settings, info, info_network, portal, error, weather, music,
+               music_playing):
         fn()
         print("ok:", fn.__name__)
 

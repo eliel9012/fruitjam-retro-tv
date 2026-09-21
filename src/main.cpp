@@ -244,6 +244,8 @@ int musicQueueCount = 0, musicQueueIndex = -1;
 id3::TrackMeta musicMeta; // tags da faixa tocando (F2)
 LGFX_Sprite *coverSprite = nullptr; // capa do álbum decodificada (PSRAM RGB565)
 static LGFX_Sprite *coverTarget = nullptr; // alvo do callback JPEGDEC durante o decode
+int musicBitrateKbps = 0;       // bitrate real do 1º frame (MP3); 0 = WAV/desconhecido
+bool musicShuffle = false, musicRepeat = false; // modos de reprodução
 
 // MP3 (libhelix) — F3: decodificação em software no core 0, saída 22050 Hz estéreo.
 HMP3Decoder mp3Dec = nullptr;
@@ -274,15 +276,19 @@ void setBacklight(bool on) {
   M5.Power.Axp192.setDCDC3(on ? 2800 : 0);
 }
 void dualText(const String &line1, const String &line2 = "") {
+  // Trunca as duas linhas para caber nas fontes bitmap (size 2 ~15 chars, size 1
+  // ~40 chars na fonte Courier, 320px), evitando texto vazando do LCD/RCA.
+  const String l1 = line1.length() > 17 ? line1.substring(0, 17) : line1;
+  const String l2 = line2.length() > 44 ? line2.substring(0, 41) + "..." : line2;
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(middle_center);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
-    d->drawString(line1, 160, 94);
+    d->drawString(l1, 160, 94);
     d->setTextColor(TFT_CYAN, TFT_NAVY);
     d->setTextSize(1);
-    d->drawString(line2, 160, 130);
+    d->drawString(l2, 160, 130);
   }
   drawBackButton();
 }
@@ -1423,6 +1429,19 @@ static bool isMusicTrack(const String &name) {
   return n.endsWith(".wav") || n.endsWith(".mp3");
 }
 
+// Trunca `src` para caber em ~`maxChars` na fonte bitmap (size 1, fix-width).
+// Retorna uma String já truncada, com "..." quando cortada.
+static String truncateText(const char *src, int maxChars) {
+  if (!src)
+    return String("");
+  size_t len = strlen(src);
+  if ((int)len <= maxChars)
+    return String(src);
+  String out = String(src).substring(0, maxChars > 3 ? maxChars - 3 : maxChars);
+  out += "...";
+  return out;
+}
+
 static String musicParentDir(const String &path) {
   const int s = path.lastIndexOf('/');
   if (s <= 0)
@@ -1619,9 +1638,16 @@ void drawMusicNowPlaying() {
     ascii::normalize(title, sizeof(title), (s >= 0 ? p.substring(s + 1) : p).c_str());
   }
   const bool isPaused = paused.load();
-  const uint32_t totalSec = (sampleRate && wavDataEnd >= wavDataStart) ? (wavDataEnd - wavDataStart) / (sampleRate * 4UL) : 0;
+  // Duração: usa o bitrate real do MP3 quando já conhecido (1º frame); senão a
+  // estimativa inicial de 128 kbps gravada em wavDataEnd.
+  uint32_t totalSec = (sampleRate && wavDataEnd >= wavDataStart) ? (wavDataEnd - wavDataStart) / (sampleRate * 4UL) : 0;
+  if (mp3Mode && musicBitrateKbps > 0) {
+    totalSec = (uint32_t)(mp3File.size() * 8ULL / (uint64_t)musicBitrateKbps / 1000ULL);
+  }
   const uint32_t curSec = sampleRate ? samplesPlayed.load() / sampleRate : 0;
   const int pct = totalSec ? (int)((uint64_t)curSec * 286 / totalSec) : 0;
+  // Nº da faixa corrente na fila (estilo iPod), para exibição.
+  String trackNo = (musicQueueIndex >= 0 && musicQueueCount) ? String(musicQueueIndex + 1) + "/" + String(musicQueueCount) : String("");
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(top_left);
@@ -1638,20 +1664,35 @@ void drawMusicNowPlaying() {
       coverSprite->pushRotateZoom(d, 16 + 44, 52 + 44, 0, sc, sc);
     }
     d->drawRect(16, 52, 88, 88, coverSprite ? TFT_CYAN : TFT_DARKCYAN);
-    // Título + tags.
+    // Título + tags (truncados para não estourar à direita).
     d->setTextColor(TFT_YELLOW, TFT_NAVY);
-    d->drawString(title, 120, 52);
+    d->drawString(truncateText(title, 24), 120, 52);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(musicMeta.artist[0] ? musicMeta.artist : "---", 120, 82);
-    d->drawString(musicMeta.album[0] ? musicMeta.album : "---", 120, 102);
+    d->drawString(truncateText(musicMeta.artist[0] ? musicMeta.artist : "---", 24), 120, 82);
+    d->drawString(truncateText(musicMeta.album[0] ? musicMeta.album : "---", 24), 120, 102);
     if (musicMeta.year[0])
       d->drawString(musicMeta.year, 120, 122);
-    // Progresso.
+    // Nº da faixa + bitrate (canto sup. direito, à esquerda do botão voltar).
+    if (trackNo.length()) {
+      String meta = trackNo;
+      if (mp3Mode && musicBitrateKbps > 0)
+        meta += " " + String(musicBitrateKbps) + "K";
+      d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
+      d->drawString(meta, 200, 42);
+    }
+    // Progresso (com tempo total correto).
     d->drawRect(16, 170, 288, 6, TFT_CYAN);
     if (pct > 0)
       d->fillRect(17, 171, pct, 4, TFT_YELLOW);
     d->setTextColor(TFT_CYAN, TFT_NAVY);
-    d->drawString(String(isPaused ? "PAUSA " : "PLAY  ") + playbackClock(), 16, 184);
+    char clockLine[48];
+    snprintf(clockLine, sizeof(clockLine), "%s %02lu:%02lu / %02lu:%02lu", isPaused ? "PAUSA" : "PLAY",
+             curSec / 60UL, curSec % 60UL, totalSec / 60UL, totalSec % 60UL);
+    if (musicShuffle)
+      strncat(clockLine, "  SHUFFLE", sizeof(clockLine) - strlen(clockLine) - 1);
+    else if (musicRepeat)
+      strncat(clockLine, "  REPETIR", sizeof(clockLine) - strlen(clockLine) - 1);
+    d->drawString(clockLine, 16, 184);
   }
   drawBackButton();
 }
@@ -1715,6 +1756,8 @@ static size_t mp3ReadPcm(int16_t *dst, size_t samples) {
         mp3Phase = 0.0;
         mp3Rate = info.samprate;
         mp3Chans = info.nChans;
+        if (!musicBitrateKbps && info.bitrate > 0)
+          musicBitrateKbps = info.bitrate; // bitrate real do 1º frame (kbps)
       } else if (consumed == 0) {
         // Decoder não avançou (frame corrompido/desincronizado). Descarta 1 byte
         // e tenta-resincronizar, sem travar em busy-loop até o EOF.
@@ -1767,6 +1810,7 @@ bool startMusic(const String &path) {
   const bool isMp3 = ext.endsWith(".mp3");
   bool ok = false;
   musicMeta.reset();
+  musicBitrateKbps = 0; // recalculado no 1º frame decodificado
   if (isMp3) {
     ok = mp3Begin(path);
     if (ok) {
@@ -1774,7 +1818,8 @@ bool startMusic(const String &path) {
       wavChannels = 2;
       wavBlockAlign = 4;
       wavDataStart = 0;
-      // Duração total estimada (assume ~128 kbps) para a barra de progresso.
+      // Duração estimada pelo bitrate (128 kbps como padrão até o 1º frame
+      // revelar o bitrate real via musicBitrateKbps).
       const uint32_t estSec = (uint32_t)(mp3File.size() * 8ULL / 128000ULL);
       wavDataEnd = estSec * 22050UL * 4UL;
       id3::readTags(mp3File, musicMeta);
@@ -1857,19 +1902,36 @@ void musicTick() {
     drawMusicBrowser();
     return;
   }
-  // Fim natural da faixa: avança para a próxima, ou volta ao navegador.
-  if (musicQueueCount && musicQueueIndex + 1 < musicQueueCount) {
-    ++musicQueueIndex;
-    if (!startMusic(musicQueue[musicQueueIndex])) {
-      stopMusic();
-      state = MUSIC_BROWSER;
-      drawMusicBrowser();
+  // Fim natural da faixa: avança para a próxima (com repeat/shuffle), ou volta.
+  if (musicQueueCount) {
+    if (musicRepeat && musicQueueIndex >= 0) {
+      // REPETIR: toca a mesma faixa de novo.
+      if (!startMusic(musicQueue[musicQueueIndex])) {
+        stopMusic();
+        state = MUSIC_BROWSER;
+        drawMusicBrowser();
+      }
+      return;
     }
-  } else {
-    stopMusic();
-    state = MUSIC_BROWSER;
-    drawMusicBrowser();
+    int next = -1;
+    if (musicShuffle) {
+      next = random(musicQueueCount); // embaralhado (pode repetir, aceitável)
+    } else if (musicQueueIndex + 1 < musicQueueCount) {
+      next = musicQueueIndex + 1;
+    }
+    if (next >= 0) {
+      musicQueueIndex = next;
+      if (!startMusic(musicQueue[musicQueueIndex])) {
+        stopMusic();
+        state = MUSIC_BROWSER;
+        drawMusicBrowser();
+      }
+      return;
+    }
   }
+  stopMusic();
+  state = MUSIC_BROWSER;
+  drawMusicBrowser();
 }
 
 void drawHome() {
@@ -2054,21 +2116,6 @@ void drawRadar() {
 // Weather Channel — "Local Forecast" dos anos 80 (item do menu principal)
 // ============================================================================
 
-static void asciiCopy(char *dst, size_t cap, const char *src) {
-  size_t j = 0;
-  if (src)
-    for (size_t i = 0; src[i] && j + 1 < cap; ++i) {
-      unsigned char c = (unsigned char)src[i];
-      if (c >= 0x20 && c < 0x7F)
-        dst[j++] = c;
-    }
-  dst[j] = 0;
-}
-static void asciiUpper(char *s) {
-  for (; *s; ++s)
-    if (*s >= 'a' && *s <= 'z')
-      *s -= 'a' - 'A';
-}
 // Dia da semana (0=DOM..6=SAB) a partir de "AAAA-MM-DD" (congruência de Zeller).
 static int weekdayFromIso(const char *iso) {
   int y = 0, m = 0, d = 0;
@@ -2097,10 +2144,8 @@ static bool weatherParse(JsonDocument &doc, WeatherData &out) {
   out.tempC = c["temp_C"] | -100;
   out.humidity = c["humidity"] | 0;
   out.windKmph = c["windspeedKmph"] | 0;
-  asciiCopy(out.cond, sizeof(out.cond), c["weatherDesc"][0]["value"] | "");
-  asciiCopy(out.windDir, sizeof(out.windDir), c["winddir16Point"] | "");
-  asciiUpper(out.cond);
-  asciiUpper(out.windDir);
+  ascii::normalizeUpper(out.cond, sizeof(out.cond), c["weatherDesc"][0]["value"] | "");
+  ascii::normalizeUpper(out.windDir, sizeof(out.windDir), c["winddir16Point"] | "");
   JsonArray days = doc["weather"];
   if (days.isNull() || days.size() < 3)
     return false;
@@ -2397,7 +2442,7 @@ void stopWeather() {
 
 void drawSettings() {
   const char *names[] = {"VIDEO", "VOLUME", "ALCANCE RADAR", "ATUALIZACAO", PTBR::SAIDA_AUDIO,
-                         PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "IDIOMA", "CONFIGURAR REDE"};
+                         PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "CONFIGURAR REDE"};
   String audio = settings.audioOutput == AudioOutput::RCA        ? PTBR::RCA
                  : settings.audioOutput == AudioOutput::INTERNAL ? PTBR::ALTO_FALANTE_INTERNO
                                                                  : PTBR::MUDO;
@@ -2411,8 +2456,7 @@ void drawSettings() {
                      ? (WiFi.status() == WL_CONNECTED ? PTBR::CONECTADO : PTBR::DESCONECTADO)
                  : settingsSelection == 7  ? apiStatus
                  : settingsSelection == 8  ? PTBR::DISPONIVEL
-                 : settingsSelection == 9  ? "PORTUGUES BR"
-                                           : "ABRIR";
+                                            : "ABRIR";
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextSize(2);
@@ -2440,15 +2484,44 @@ void drawSettings() {
                        settingsEditing ? "+" : "ABAIXO");
 }
 void drawInfo() {
-  String status = WiFi.status() == WL_CONNECTED ? PTBR::CONECTADO : PTBR::DESCONECTADO;
-  String detalhe;
-  if (infoPage) {
-    detalhe = String("WI-FI: ") + status + "  " + PTBR::SINAL + ": " + WiFi.RSSI() + " dBm";
-    if (WiFi.status() == WL_CONNECTED)
-      detalhe += "  " + String(PTBR::ENDERECO_IP) + ": " + WiFi.localIP().toString();
-  } else
-    detalhe = String("MEMORIA: ") + ESP.getFreeHeap() + "  PSRAM: " + ESP.getFreePsram();
-  dualText(PTBR::INFO_SISTEMA, detalhe);
+  // Página 0: hardware; página 1: rede. Desenha tudo com datum top_left e
+  // linhas separadas, truncadas, para nunca vazar do LCD (320x240, fonte ASCII).
+  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+    d->fillScreen(TFT_NAVY);
+    d->setTextDatum(top_left);
+    d->setTextSize(2);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->drawString(PTBR::INFO_SISTEMA, 12, 8);
+    d->drawFastHLine(8, 36, 304, TFT_CYAN);
+    d->setTextSize(1);
+    const int y0 = 52;
+    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    if (!infoPage) {
+      d->drawString("MEMORIA LIVRE", 20, y0);
+      d->drawString("PSRAM LIVRE", 20, y0 + 26);
+      d->drawString("VERSAO", 20, y0 + 52);
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
+      d->drawString(String(ESP.getFreeHeap()) + " bytes", 140, y0);
+      d->drawString(String(ESP.getFreePsram()) + " bytes", 140, y0 + 26);
+      d->drawString("core2", 140, y0 + 52);
+    } else {
+      d->drawString(PTBR::STATUS_REDE, 20, y0);
+      d->drawString(PTBR::SINAL, 20, y0 + 26);
+      const String st = (WiFi.status() == WL_CONNECTED) ? PTBR::CONECTADO : PTBR::DESCONECTADO;
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
+      d->drawString(st, 168, y0);
+      if (WiFi.status() == WL_CONNECTED) {
+        d->drawString(String(WiFi.RSSI()) + " dBm", 168, y0 + 26);
+        d->setTextColor(TFT_CYAN, TFT_NAVY);
+        d->drawString(PTBR::ENDERECO_IP, 20, y0 + 52);
+        d->setTextColor(TFT_WHITE, TFT_NAVY);
+        d->drawString(WiFi.localIP().toString(), 168, y0 + 52);
+      } else {
+        d->drawString("-", 168, y0 + 26);
+      }
+    }
+  }
+  drawBackButton();
   drawControllerLabels(PTBR::ANTERIOR, PTBR::DETALHES, PTBR::PROXIMO);
 }
 
@@ -2575,7 +2648,7 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (state == SETTINGS) {
-    constexpr int SETTINGS_COUNT = 11;
+    constexpr int SETTINGS_COUNT = 10;
     if (a == NavAction::BACK) {
       if (settingsEditing)
         settingsEditing = false;
@@ -2588,11 +2661,11 @@ void handleNavigation(NavAction a) {
       return;
     }
     if (a == NavAction::SELECT) {
-      if (!settingsEditing && settingsSelection == 10) {
+      if (!settingsEditing && settingsSelection == 9) {
         startSetupPortal();
         return;
       }
-      if (settingsSelection == 0 || (settingsSelection >= 6 && settingsSelection <= 9))
+      if (settingsSelection == 0 || (settingsSelection >= 6 && settingsSelection <= 8))
         return;
       settingsEditing = !settingsEditing;
       if (!settingsEditing) {
@@ -2674,12 +2747,15 @@ void handleNavigation(NavAction a) {
       return;
     }
     if (a == NavAction::SELECT || a == NavAction::PLAY_PAUSE) {
+      // Um toque curto = PLAY/PAUSA; um comando de "alternar modo" é feito via
+      // toque longo no centro (HOME/BACK), então aqui só PAUSA/RETOMA faz sentido.
       paused = !paused;
       drawMusicNowPlaying();
       return;
     }
     if (a == NavAction::LEFT || a == NavAction::RIGHT) {
       if (musicQueueCount) {
+        // Mantém a posição e toca a anterior/próxima.
         const int delta = (a == NavAction::LEFT) ? -1 : 1;
         musicQueueIndex = (musicQueueIndex + delta + musicQueueCount) % musicQueueCount;
         if (!startMusic(musicQueue[musicQueueIndex])) {
@@ -2761,6 +2837,19 @@ void handleTouch() {
       if (state == HOME && p.y >= 40 && p.y < 172) {
         homeSelection = (p.y - 40) / 22;
         input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
+      } else if (state == MUSIC_NOW_PLAYING && p.y >= 166 && p.y < 192 && p.x >= 16 && p.x < 304) {
+        // Toque na região do progresso: alterna NORMAL -> SHUFFLE -> REPETIR -> NORMAL.
+        if (musicRepeat) {
+          musicShuffle = false;
+          musicRepeat = false;
+        } else if (musicShuffle) {
+          musicShuffle = false;
+          musicRepeat = true;
+        } else {
+          musicShuffle = true;
+          musicRepeat = false;
+        }
+        drawMusicNowPlaying();
       } else if (state == VIDEO_PLAYBACK)
         input.inject(NavAction::PLAY_PAUSE, InputSource::LCD_BUTTON);
     }

@@ -32,5 +32,5 @@ inline bool isPlayerAudioButton(int x, int y) {
 }
 
 inline bool isBackButton(int x, int y) {
-  return x >= 280 && x < 316 && y >= 4 && y < 34;
+  return x >= 274 && x < 320 && y >= 0 && y < 40;
 }

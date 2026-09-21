@@ -189,8 +189,8 @@ void testStorage() {
   assert(fs.files[path] == "recovered");
 }
 void testNavigation() {
-  assert(isBackButton(280, 4) && isBackButton(315, 33));
-  assert(!isBackButton(279, 10) && !isBackButton(300, 34));
+  assert(isBackButton(274, 0) && isBackButton(300, 35));
+  assert(!isBackButton(273, 10) && !isBackButton(300, 40));
   assert(isPlayerAudioButton(232, 160) && isPlayerAudioButton(315, 183));
   assert(!isPlayerAudioButton(231, 170) && !isPlayerAudioButton(316, 170) && !isPlayerAudioButton(250, 184));
   assert(homeTarget(0) == VIDEO_LIBRARY && homeTarget(1) == MUSIC_BROWSER && homeTarget(2) == AIRCRAFT_RADAR &&
