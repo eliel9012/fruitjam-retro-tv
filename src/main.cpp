@@ -1700,17 +1700,19 @@ static size_t mp3ReadPcm(int16_t *dst, size_t samples) {
       }
       unsigned char *in = mp3In;
       int bytesLeft = (int)mp3InLen;
-      const int samps = MP3Decode(mp3Dec, &in, &bytesLeft, mp3FramePcm, 0);
+      // MP3Decode retorna código de erro (0 = sucesso, <0 = erro). A CONTAGEM de
+      // amostras de saída vem de MP3GetLastFrameInfo().outputSamps — não do retorno.
+      const int err = MP3Decode(mp3Dec, &in, &bytesLeft, mp3FramePcm, 0);
       const size_t consumed = (size_t)(in - mp3In);
       if (consumed > 0) {
         memmove(mp3In, in, mp3InLen - consumed);
         mp3InLen -= consumed;
       }
-      if (samps > 0) {
-        mp3PcmCount = (size_t)samps;
-        mp3Phase = 0.0;
+      if (err == 0) {
         MP3FrameInfo info;
         MP3GetLastFrameInfo(mp3Dec, &info);
+        mp3PcmCount = (size_t)info.outputSamps;
+        mp3Phase = 0.0;
         mp3Rate = info.samprate;
         mp3Chans = info.nChans;
       } else if (consumed == 0) {
@@ -1724,7 +1726,7 @@ static size_t mp3ReadPcm(int16_t *dst, size_t samples) {
         }
         continue;
       } else {
-        continue; // consumiu bytes mas não produziu PCM: tenta o próximo frame
+        continue; // consumiu bytes mas falhou (ex.: frame curto): tenta o próximo
       }
     }
     const int ch = mp3Chans;
