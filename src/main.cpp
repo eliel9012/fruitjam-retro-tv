@@ -92,6 +92,7 @@ void uiHudClear();
 void uiHudTick(uint32_t now);
 void setAudioOutput(AudioOutput output);
 void servicePowerButton();
+void requestPowerOff();
 String playbackClock();
 String libraryRoot();
 String normalizeSdPath(const String &path);
@@ -1368,20 +1369,29 @@ void setAudioOutput(AudioOutput output) {
   osdUntil = millis() + 3000;
 }
 
+// Encerra podcast/video/audio, desconecta do Wi-Fi e prepara o Core2 para ser
+// desligado pelo AXP192. Usado tanto pelo botão físico Power quanto pelo item
+// "DESLIGAR" do menu inicial.
+void requestPowerOff() {
+  if (powerOffPending)
+    return;
+  powerOffPending = true;
+  powerOffAt = millis() + 120;
+  playing = false;
+  paused = true;
+  if (portal.active())
+    portal.stop();
+  WiFi.disconnect(false, false);
+  Serial.println("[M5RETRO] Desligamento solicitado");
+  dualText("DESLIGANDO...", "APERTE POWER PARA LIGAR");
+}
+
 void servicePowerButton() {
   // M5.BtnPWR is M5Unified's debounced event for the Core2 side Power key.
   // M5.update() runs before this function, so one physical press becomes one
   // shutdown request. The AXP192 then restores power on the next Power press.
   if (!powerOffPending && M5.BtnPWR.wasClicked()) {
-    powerOffPending = true;
-    powerOffAt = millis() + 120;
-    playing = false;
-    paused = true;
-    if (portal.active())
-      portal.stop();
-    WiFi.disconnect(false, false);
-    Serial.println("[M5RETRO] Botao Power: desligamento solicitado");
-    dualText("DESLIGANDO...", "APERTE POWER PARA LIGAR");
+    requestPowerOff();
     return;
   }
   if (powerOffPending && (int32_t)(millis() - powerOffAt) >= 0) {
@@ -1935,8 +1945,10 @@ void musicTick() {
 }
 
 void drawHome() {
-  const char *items[] = {PTBR::VIDEOS,    PTBR::MUSICA,   PTBR::TRAFEGO,
-                         PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA, PTBR::WEATHER};
+  // 7 itens: VIDEOS, MUSICA, TRAFEGO, CONFIGURACOES, SISTEMA, TEMPO, DESLIGAR.
+  const char *items[] = {PTBR::VIDEOS, PTBR::MUSICA, PTBR::TRAFEGO,      PTBR::CONFIGURACOES,
+                         PTBR::INFO_SISTEMA, PTBR::WEATHER, PTBR::DESLIGAR};
+  constexpr int HOME_COUNT = 7;
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -1944,11 +1956,11 @@ void drawHome() {
   M5.Display.drawString(PTBR::APP, 12, 8);
   M5.Display.drawFastHLine(8, 36, 304, TFT_CYAN);
   M5.Display.setTextSize(2);
-  for (int i = 0; i < 6; i++) {
-    int y = 40 + i * 22;
+  for (int i = 0; i < HOME_COUNT; i++) {
+    int y = 40 + i * 20;
     bool selected = i == homeSelection;
     if (selected)
-      M5.Display.fillRoundRect(12, y - 2, 296, 20, 4, TFT_CYAN);
+      M5.Display.fillRoundRect(12, y - 2, 296, 18, 4, TFT_CYAN);
     M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? TFT_CYAN : TFT_NAVY);
     M5.Display.drawString(String(selected ? "> " : "  ") + items[i], 24, y);
   }
@@ -1959,8 +1971,8 @@ void drawHome() {
   rca.drawString(PTBR::APP, 12, 8);
   rca.drawFastHLine(8, 36, 304, TFT_CYAN);
   rca.setTextSize(1);
-  for (int i = 0; i < 6; i++) {
-    int y = 46 + i * 22;
+  for (int i = 0; i < HOME_COUNT; i++) {
+    int y = 44 + i * 20;
     rca.setTextColor(i == homeSelection ? TFT_CYAN : TFT_WHITE, TFT_NAVY);
     rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], 28, y);
   }
@@ -2560,10 +2572,14 @@ void handleNavigation(NavAction a) {
   }
   if (state == HOME) {
     if (a == NavAction::LEFT)
-      homeSelection = (homeSelection + 5) % 6;
+      homeSelection = (homeSelection + 6) % 7;
     else if (a == NavAction::RIGHT)
-      homeSelection = (homeSelection + 1) % 6;
+      homeSelection = (homeSelection + 1) % 7;
     else if (a == NavAction::SELECT) {
+      if (homeSelection == 6) { // DESLIGAR: apaga o Core2 via AXP192.
+        requestPowerOff();
+        return;
+      }
       state = homeTarget(homeSelection);
       if (state == VIDEO_LIBRARY) {
         libraryScanned = false; // revarre ao entrar na biblioteca
@@ -2834,8 +2850,10 @@ void handleTouch() {
       button = touchButton(p.x, p.y);
     else {
       button = -1;
-      if (state == HOME && p.y >= 40 && p.y < 172) {
-        homeSelection = (p.y - 40) / 22;
+      if (state == HOME && p.y >= 40 && p.y < 180) {
+        homeSelection = (p.y - 40) / 20;
+        if (homeSelection >= 7)
+          homeSelection = 6;
         input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
       } else if (state == MUSIC_NOW_PLAYING && p.y >= 166 && p.y < 192 && p.x >= 16 && p.x < 304) {
         // Toque na região do progresso: alterna NORMAL -> SHUFFLE -> REPETIR -> NORMAL.
