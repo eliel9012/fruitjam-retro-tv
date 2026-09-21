@@ -77,6 +77,20 @@ permanecia em pausa, sem nunca chegar ao laço de decodificação (`mp3ReadPcm`)
 **Correção:** a condição passou a ser `!wavFile && !mp3Mode`, de modo que o MP3
 (com `mp3Mode = true` e `wavFile = null`) sai da pausa e chega ao decoder.
 
+### 2.5 Retorno de `MP3Decode` tratado como contagem de amostras
+
+**Sintoma:** mesmo com o guard de pausa corrigido, o MP3 terminava "na hora"
+(sem emitir som), pois o buffer PCM nunca era preenchido.
+
+**Causa:** `MP3Decode()` retorna **código de erro** (`0` = sucesso, `< 0` = erro),
+não o número de amostras. O código fazia `const int samps = MP3Decode(...)` e
+`if (samps > 0) mp3PcmCount = samps;` — como em sucesso o retorno é `0`, a
+condição nunca era verdadeira e o frame decodificado era descartado.
+
+**Correção:** usar `err == 0` para detectar sucesso e obter a quantidade real de
+amostras via `MP3GetLastFrameInfo().outputSamps` (confirmado por teste host do
+libhelix: retorno 0 + `outputSamps=2304` por frame MPEG1 estéreo).
+
 ---
 
 ## 3. Bugs ALTOS corrigidos
@@ -163,9 +177,10 @@ nesta etapa:
 
 ## Resumo
 
-A revisão eliminou quatro bugs críticos (travamento por ID3v2, vazamento de estado
-de MP3, corrida no SD e o guard de pausa que impedia o MP3 de tocar), três bugs
-altos (raça no `weatherStatus`, re-varredura do SD na biblioteca e NTP condicionado
-a `!playing`) e quatro problemas médios (dead code de navegação, chamada
-duplicada, atribuição frágil e log spam), deixando a suíte de testes intacta e o
-projeto em estado estável.
+A revisão eliminou cinco bugs críticos (travamento por ID3v2, vazamento de estado
+de MP3, corrida no SD, o guard de pausa que impedia o MP3 de tocar e o retorno de
+`MP3Decode` tratado como contagem de amostras), três bugs altos (raça no
+`weatherStatus`, re-varredura do SD na biblioteca e NTP condicionado a `!playing`)
+e quatro problemas médios (dead code de navegação, chamada duplicada, atribuição
+frágil e log spam), deixando a suíte de testes intacta e o projeto em estado
+estável.
