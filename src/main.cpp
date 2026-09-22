@@ -222,7 +222,7 @@ std::atomic<bool> weatherReady{false};
 std::atomic<bool> weatherBusy{false};
 std::atomic<const char *> weatherStatus{"CARREGANDO..."};
 uint32_t lastWeatherAttempt = 0, lastWeatherGood = 0;
-uint32_t lastWeatherDraw = 0, lastTickerMs = 0;
+uint32_t lastTickerMs = 0;
 uint16_t lastWeatherBg = 0;
 LGFX_Sprite weatherTicker(&rca);
 String tickerPayload, tickerFull;
@@ -922,6 +922,8 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
 
   String video = "video.mjpeg";
   float metaFps = 15.0f;
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
   File meta = SD.open(dir + "/meta.json", FILE_READ);
   if (meta) {
     JsonDocument d;
@@ -933,6 +935,8 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   }
 
   File f = SD.open(dir + "/" + video, FILE_READ);
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
   if (!f) {
     Serial.printf("[BENCH] nao abriu %s/%s\n", dir.c_str(), video.c_str());
     return;
@@ -963,7 +967,16 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
 
     size_t used = 0;
     const int64_t r0 = esp_timer_get_time();
+    // Mesma disciplina do caminho normal: o cartão é compartilhado com a tarefa
+    // de áudio, então nunca se lê fora do mutex. Toma e devolve por quadro, em
+    // vez de segurar durante todo o benchmark, para não matar o áudio de fome.
+    if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(150)) != pdTRUE) {
+      ++errors;
+      continue;
+    }
     const auto result = reader.next(f, jpegBuffer, MAX_JPEG, used);
+    if (sdMutex)
+      xSemaphoreGive(sdMutex);
     const uint32_t rUs = uint32_t(esp_timer_get_time() - r0);
     if (result != playback::FrameResult::Ready)
       break; // fim do arquivo ou fluxo invalido
@@ -1005,7 +1018,11 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
 
   const uint64_t wallUs = uint64_t(esp_timer_get_time() - wallStart);
   benchActive = false;
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
   f.close();
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
 
   if (!frames) {
     Serial.printf("[BENCH] nenhum quadro decodificado (erros:%lu)\n", errors);
@@ -2488,8 +2505,16 @@ static bool weatherFetch(WeatherData &out) {
       // A resposta tem ~800 bytes, então lê tudo para um buffer contíguo (o
       // leitor Stream do ArduinoJson 7.4.2 descarta escalares no ESP32) e
       // rejeita corpo truncado em vez de publicar dados pela metade.
+      // O buffer fica na PSRAM, não na pilha: esta função roda na tarefa
+      // WEATHER_HTTP, que tem 8 KB de pilha e ainda precisa acomodar os quadros
+      // do HTTPClient e do mbedTLS. 4 KB de array local comiam metade dela.
       constexpr int cap = 4096;
-      char buf[cap];
+      char *buf = (char *)ps_malloc(cap);
+      if (!buf) {
+        Serial.println("[M5RETRO] Tempo: sem memoria para a resposta");
+        http.end();
+        return false;
+      }
       size_t len = 0;
       uint32_t quiet = 0;
       Stream &st = http.getStream();
@@ -2521,6 +2546,7 @@ static bool weatherFetch(WeatherData &out) {
       } else {
         Serial.println("[M5RETRO] Tempo: corpo vazio");
       }
+      free(buf);
     } else {
       Serial.printf("[M5RETRO] Tempo: HTTP %d\n", code);
     }

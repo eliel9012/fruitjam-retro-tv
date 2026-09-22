@@ -364,8 +364,16 @@ static bool fetchWeather(WeatherData &out) {
       // ~800 bytes: lê tudo para um buffer contíguo (o leitor Stream do
       // ArduinoJson 7.4.2 descarta escalares no ESP32) e rejeita corpo
       // truncado em vez de publicar dados pela metade.
+      // O buffer fica na PSRAM, não na pilha: esta função roda na tarefa
+      // WEATHER_HTTP, que tem 8 KB de pilha e ainda precisa acomodar os quadros
+      // do HTTPClient e do mbedTLS. 4 KB de array local comiam metade dela.
       constexpr int cap = 4096;
-      char buf[cap];
+      char *buf = (char *)ps_malloc(cap);
+      if (!buf) {
+        Serial.println("[WEATHER] sem memoria para a resposta");
+        http.end();
+        return false;
+      }
       size_t len = 0;
       uint32_t quiet = 0;
       Stream &st = http.getStream();
@@ -398,6 +406,7 @@ static bool fetchWeather(WeatherData &out) {
       } else {
         Serial.println("[WEATHER] corpo vazio");
       }
+      free(buf);
     } else {
       Serial.printf("[WEATHER] HTTP %d\n", code);
     }
