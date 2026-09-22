@@ -24,6 +24,7 @@
 #include <string>
 
 #include "SafeArea.h"
+#include "WeatherIcons.h"
 
 using namespace crt;
 
@@ -159,34 +160,78 @@ static void screenRadar() {
   controllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
 }
 
-// Mesmo fundo pulsante do firmware (weatherBackground).
-static uint16_t weatherBackground(uint32_t ms) {
-  const float t = (ms % 12000) / 12000.0f * 2.0f * 3.14159265f;
-  const int r = (int)(2.0f + 2.0f * sinf(t));
-  const int g = (int)(1.5f + 1.2f * sinf(t + 2.09f));
-  const int b = (int)(3.0f + 1.0f * sinf(t + 4.19f));
-  return (uint16_t)(((r * 31 / 4) << 11) | ((g * 63 / 3) << 5) | (b * 31 / 4));
+// Mesmo gradiente do firmware (weatherPaintBackground): azul estável, sem o
+// ciclo de matiz que existia antes e deixava a tela verde/rosa no tubo.
+static constexpr uint16_t WX_TOP = 0x0010, WX_BOTTOM = 0x18BF;
+
+static void weatherPaintBackground(int oy) {
+  const int r0 = (WX_TOP >> 11) & 0x1F, g0 = (WX_TOP >> 5) & 0x3F, b0 = WX_TOP & 0x1F;
+  const int r1 = (WX_BOTTOM >> 11) & 0x1F, g1 = (WX_BOTTOM >> 5) & 0x3F, b1 = WX_BOTTOM & 0x1F;
+  for (int y = 0; y < H; ++y) {
+    const int r = r0 + (r1 - r0) * y / (H - 1);
+    const int g = g0 + (g1 - g0) * y / (H - 1);
+    const int b = b0 + (b1 - b0) * y / (H - 1);
+    rca.drawFastHLine(0, oy + y, W, (uint16_t)((r << 11) | (g << 5) | b));
+  }
 }
 
-static void screenWeather(uint32_t ms, int tickerOffset) {
-  const uint16_t bg = weatherBackground(ms);
-  rca.fillScreen(bg);
+static void weatherHeader(const char *title) {
   rca.setFont(&fonts::Font4);
   rca.setTextDatum(top_center);
   rca.setTextSize(1);
-  rca.setTextColor(TFT_YELLOW, bg);
-  rca.drawString("FRANCA - SP", W / 2, SAFE_T);
+  rca.setTextColor(TFT_YELLOW);
+  rca.drawString(title, W / 2, SAFE_T);
   rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
+}
 
-  rca.setTextColor(TFT_WHITE, bg);
-  rca.drawString("PARCIAL NUBLADO", W / 2, SAFE_T + 40);
-  rca.setTextSize(2);
-  rca.setTextColor(TFT_YELLOW, bg);
-  rca.drawString("26 C", W / 2, SAFE_T + 76);
+// Página 1 da previsão: três dias em colunas, com ícone por dia.
+static void screenForecast() {
+  static const char *dias[3] = {"SEG", "TER", "QUA"};
+  static const int codigo[3] = {3, 61, 95};
+  static const int tmax[3] = {26, 27, 25}, tmin[3] = {15, 14, 12};
+  weatherPaintBackground(0);
+  weatherHeader("PREVISAO 3 DIAS");
+  const int colW = SAFE_W / 3;
+  char buf[24];
+  for (int i = 0; i < 3; ++i) {
+    const int cx = SAFE_L + colW * i + colW / 2;
+    rca.setFont(&fonts::Font2);
+    rca.setTextSize(1);
+    rca.setTextDatum(top_center);
+    rca.setTextColor(TFT_CYAN);
+    rca.drawString(dias[i], cx, SAFE_T + 42);
+    wx::drawWeatherIcon(&rca, cx, SAFE_T + 96, 56, wx::iconFromWmo(codigo[i]));
+    rca.setTextColor(TFT_YELLOW);
+    snprintf(buf, sizeof(buf), "%d", tmax[i]);
+    rca.drawString(buf, cx, SAFE_T + 128);
+    rca.setTextColor(TFT_WHITE);
+    snprintf(buf, sizeof(buf), "%d", tmin[i]);
+    rca.drawString(buf, cx, SAFE_T + 148);
+  }
+  rca.setFont(&fonts::Font2);
+  rca.setTextColor(TFT_CYAN);
+  rca.drawString("MAXIMA / MINIMA EM GRAUS C", W / 2, SAFE_T + 172);
+}
+
+static void screenWeather(uint32_t ms, int tickerOffset) {
+  (void)ms;
+  weatherPaintBackground(0);
+  weatherHeader("FRANCA - SP");
+  wx::drawWeatherIcon(&rca, SAFE_L + 46, SAFE_T + 96, 76, wx::iconFromWmo(2));
+  const int col = SAFE_L + 176;
   rca.setFont(&fonts::Font2);
   rca.setTextSize(1);
-  rca.setTextColor(TFT_WHITE, bg);
-  rca.drawString("UMIDADE  62%", W / 2, SAFE_T + 138);
+  rca.setTextDatum(top_center);
+  rca.setTextColor(TFT_WHITE);
+  rca.drawString("PARCIAL NUBLADO", col, SAFE_T + 46);
+  rca.setFont(&fonts::Font4);
+  rca.setTextSize(2);
+  rca.setTextColor(TFT_YELLOW);
+  rca.drawString("26 C", col, SAFE_T + 70);
+  rca.setFont(&fonts::Font2);
+  rca.setTextSize(1);
+  rca.setTextColor(TFT_WHITE);
+  rca.drawString("UMIDADE  62%", W / 2, SAFE_T + 140);
   rca.drawString("VENTO  12 KM/H  SO", W / 2, SAFE_T + 158);
   rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
 
@@ -250,9 +295,10 @@ static void screenMusicPlaying() {
 }
 
 // ---------------------------------------------------------------------------
-static const char *SCREEN_NAMES[] = {"INICIO",    "BIBLIOTECA",  "PLAYER", "RADAR",
-                                     "PREVISAO",  "CONFIGURACOES", "SISTEMA", "MUSICA"};
-constexpr int SCREEN_COUNT = 8;
+static const char *SCREEN_NAMES[] = {"INICIO",   "BIBLIOTECA",    "PLAYER",  "RADAR",
+                                     "PREVISAO", "CONFIGURACOES", "SISTEMA", "MUSICA",
+                                     "PREVISAO3DIAS"};
+constexpr int SCREEN_COUNT = 9;
 
 static void drawCurrent(uint32_t ms, int tickerOffset) {
   switch (screenIndex) {
@@ -263,7 +309,8 @@ static void drawCurrent(uint32_t ms, int tickerOffset) {
   case 4: screenWeather(ms, tickerOffset); break;
   case 5: screenSettings(); break;
   case 6: screenInfo(); break;
-  default: screenMusicPlaying(); break;
+  case 7: screenMusicPlaying(); break;
+  default: screenForecast(); break;
   }
   drawGuide();
 }

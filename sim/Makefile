@@ -38,9 +38,37 @@ OBJ := $(BUILD)/main.o \
 
 VPATH := src:$(sort $(dir $(M5GFX_CPP)) $(dir $(M5GFX_C)))
 
-.PHONY: all run clean check
+# Probes: cada arquivo em sim/probes/*.cpp vira um binário próprio em
+# build/probe_<nome>, linkado contra o mesmo M5GFX+SDL. Serve para desenvolver
+# um componente isolado (ícones, efeitos, OSD) sem mexer no simulador principal
+# nem no Makefile.
+PROBE_SRC := $(wildcard probes/*.cpp)
+PROBE_BIN := $(patsubst probes/%.cpp,$(BUILD)/probe_%,$(PROBE_SRC))
+M5GFX_OBJ := $(filter-out $(BUILD)/main.o,$(OBJ))
+
+.PHONY: all run clean check probes cxx11
 
 all: check $(BIN)
+
+probes: check $(PROBE_BIN)
+
+SHARED_HDRS := $(wildcard ../include/*.h)
+
+$(BUILD)/probe_%: probes/%.cpp $(M5GFX_OBJ) $(SHARED_HDRS) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< $(M5GFX_OBJ) $(LDFLAGS) -o $@
+
+# O firmware compila em -std=gnu++11 (arduino-esp32 2.x) e o simulador em
+# C++17. Sem esta checagem, um constexpr com laço passa aqui e só quebra na
+# compilação do firmware — foi exatamente o que aconteceu com a VcrFont.
+CXX11_HDRS := VcrFont.h VcrOsd.h WeatherIcons.h ScreenFx.h SafeArea.h
+
+cxx11: check
+	@for h in $(CXX11_HDRS); do \
+	  printf '#include <SDL2/SDL.h>\n#include "%s"\nint main(){return 0;}\n' "$$h" \
+	    | $(CXX) -std=c++11 -x c++ - $(CXXFLAGS) -fsyntax-only -o /dev/null \
+	    || { echo "FALHOU em C++11: $$h"; exit 1; }; \
+	  echo "ok C++11: $$h"; \
+	done
 
 check:
 	@test -d "$(M5GFX)" || { \

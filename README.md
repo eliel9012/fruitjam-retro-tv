@@ -232,5 +232,23 @@ ganhar num tubo — só trabalho a mais. Em 640×480 o framebuffer passaria de
 lenta demais para o prazo por linha de varredura. O benchmark serve para saber
 se o Core2 alcança esse teto com a sua mídia, não para ultrapassá-lo.
 
+### OSD do player e tela de previsão
+
+O OSD do player imita o de um videocassete Sony/Semp dos anos 90: texto flutua
+sobre a imagem sem tarja de fundo, com contorno preto por glifo, símbolo de
+transporte desenhado como forma (nunca a palavra "PLAY") e contador de fita em
+dígitos grandes. A tipografia é a `include/VcrFont.h`, uma fonte bitmap 12x16 de
+traço constante de 2 px: as fontes do M5GFX têm traço de 1 px e somem no borrão
+horizontal do NTSC. A fonte é ASCII (sem acentos, como os geradores de caractere
+da época); todo texto passa por `ascii::normalizeUpper` antes de ser desenhado.
+
+A tela de previsão alterna duas páginas a cada 10 s — condições atuais e previsão
+de três dias — com as transições do Weather Star 4000: cortina vertical quando
+chegam dados novos e deslizamento horizontal na troca de página
+(`include/ScreenFx.h`). Os esmaecimentos usam dithering ordenado de Bayer, não
+mistura por alfa: o framebuffer composto não tem canal alfa e não há folga de
+SRAM para dois quadros inteiros. Os ícones de condição (`include/WeatherIcons.h`)
+são escolhidos pelo código WMO da Open-Meteo, não pelo texto.
+
 O teste de cores confere o caminho RGB565 nativo usado pelos blocos JPEG. A conferência visual
 da imagem e a medição das saídas RCA exigem observação/conexão física.

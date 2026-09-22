@@ -13,6 +13,9 @@
 #include <M5ModuleRCA.h>
 
 #include "SafeArea.h"
+#include "VcrOsd.h"
+#include "WeatherIcons.h"
+#include "ScreenFx.h"
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -188,6 +191,9 @@ uint32_t videoFrameIndex = 0, decodedFrames = 0, renderedFrames = 0, droppedFram
 // Instrumentação do "diag bench". Fora do benchmark benchActive é falso e o
 // jpegDraw não paga nada além de um teste de bool por bloco de MCU.
 bool benchActive = false;
+// Tamanho do último JPEG decodificado, que continua inteiro no jpegBuffer. Com o
+// vídeo pausado é daí que o OSD restaura a imagem que fica atrás dele.
+size_t lastJpegUsed = 0;
 uint64_t benchBlitUs = 0;
 uint32_t benchBlitCalls = 0;
 LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
@@ -199,9 +205,13 @@ std::atomic<bool> weatherAudio{false}; // música do Weather Channel em loop (I2
 struct WeatherDay {
   char name[8]; // "DOM".."SAB"
   int maxC = 0, minC = 0;
+  // Código WMO do dia, guardado além do texto: o ícone é escolhido pelo código
+  // (ver include/WeatherIcons.h), não por comparação de string.
+  int wmoCode = -1;
 };
 struct WeatherData {
   int tempC = -100, humidity = 0, windKmph = 0;
+  int wmoCode = -1;
   char cond[24] = {0}, windDir[8] = {0};
   WeatherDay days[3];
 };
@@ -778,6 +788,7 @@ bool readAndShowOneFrame(bool render) {
   }
   if (!render)
     return true;
+  lastJpegUsed = used;
   const uint32_t started = millis();
   if (!jpeg.openRAM(jpegBuffer, used, jpegDraw)) {
     jpegErrors++;
@@ -1493,42 +1504,95 @@ void drawPlaybackController() {
   uiHudDraw();
 }
 
+// Apaga, dentro da faixa do OSD, só o que fica FORA do retângulo do vídeo (o
+// letterbox preto). A parte sobre a imagem é restaurada pelo próximo quadro,
+// ou por redrawCurrentFrame() com o vídeo pausado — assim o OSD some sem
+// piscar uma tarja preta sobre o filme.
+static void clearOsdLetterbox() {
+  const int top = vcr::layout::kTopY;
+  const int vx = (CRT_W - videoWidth) / 2, vy = (CRT_H - videoHeight) / 2;
+  const int vr = vx + videoWidth, vb = vy + videoHeight;
+  if (vb <= top || vy >= CRT_H) {
+    rca.fillRect(0, top, CRT_W, CRT_H - top, TFT_BLACK);
+    return;
+  }
+  const int y0 = max(top, vy);
+  if (y0 > top)
+    rca.fillRect(0, top, CRT_W, y0 - top, TFT_BLACK);
+  if (vb < CRT_H)
+    rca.fillRect(0, vb, CRT_W, CRT_H - vb, TFT_BLACK);
+  const int h = min(vb, CRT_H) - y0;
+  if (vx > 0)
+    rca.fillRect(0, y0, vx, h, TFT_BLACK);
+  if (vr < CRT_W)
+    rca.fillRect(vr, y0, CRT_W - vr, h, TFT_BLACK);
+}
+
+// Redecodifica o quadro atual a partir do jpegBuffer (sem tocar no cartão).
+// Custa um decode (~10-20 ms em 240x160) e só roda com o vídeo pausado, a
+// cada meio segundo, para o PAUSE piscar sobre a imagem parada.
+static bool redrawCurrentFrame() {
+  if (!jpegBuffer || !lastJpegUsed)
+    return false;
+  if (!jpeg.openRAM(jpegBuffer, lastJpegUsed, jpegDraw))
+    return false;
+  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  const bool ok = jpeg.decode(0, 0, 0);
+  jpeg.close();
+  return ok;
+}
+
 void drawPlaybackOsd() {
-  static bool visible = false, lastPaused = false;
-  static uint32_t lastPaint = 0, lastFrame = 0, lastDeadline = 0;
+  // OSD de videocassete (include/VcrOsd.h): texto flutuando sobre o vídeo, sem
+  // tarja, com contorno preto. Como não há fundo, cada repintura precisa partir
+  // de uma imagem limpa: com o filme rodando, logo depois de um quadro novo;
+  // pausado, depois de redecodificar o quadro parado.
+  static bool visible = false, lastPaused = false, lastBlink = true;
+  static uint32_t lastFrame = 0, lastDeadline = 0;
   const uint32_t now = millis();
   const bool isPaused = paused.load();
   const bool show = isPaused || !timeReached(now, osdUntil);
+  // O VCR piscava o símbolo de PAUSE; 2 Hz como nos aparelhos da época.
+  const bool blink = !isPaused || ((now / 500U) & 1U) == 0;
+
   if (visible && !show) {
-    // Limpa a faixa inteira do OSD. Esse caminho só roda com o vídeo rodando
-    // (pausado, show continua verdadeiro), então o próximo quadro repinta a
-    // parte da imagem que fica atrás da faixa.
-    rca.fillRect(0, OSD_Y, CRT_W, CRT_H - OSD_Y, TFT_BLACK);
+    clearOsdLetterbox(); // o próximo quadro repinta o que ficou sobre a imagem
     visible = false;
+    return;
   }
-  // Repaint over new video frames, or at 4 Hz for the clock/controls, not on every loop.
-  if (show && (!visible || lastFrame != videoFrameIndex || lastPaused != isPaused ||
-               lastDeadline != osdUntil || now - lastPaint >= 250)) {
-    visible = true;
-    lastPaint = now;
-    lastFrame = videoFrameIndex;
-    lastPaused = isPaused;
-    lastDeadline = osdUntil;
-    rca.fillRect(0, OSD_Y, CRT_W, OSD_H, TFT_NAVY);
-    rca.setTextDatum(top_left);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    if (settings.vhsOsd)
-      rca.drawString(String(paused ? "PAUSE" : "PLAY  SP") + "   " + playbackClock(), SAFE_L, OSD_Y + 3);
-    else
-      rca.drawString(String(PTBR::APP) + "  " + currentTitle, SAFE_L, OSD_Y + 3);
-    rca.setTextColor(TFT_CYAN, TFT_NAVY);
-    rca.drawString(String("[ ") + PTBR::ANTERIOR + " ]  [ " + (paused ? PTBR::REPRODUZIR : PTBR::PAUSAR) +
-                       " ]  [ " + PTBR::PROXIMO + " ]",
-                   SAFE_L, OSD_Y + 21);
+  if (!show)
+    return;
+
+  const bool newFrame = lastFrame != videoFrameIndex;
+  const bool changed = !visible || lastPaused != isPaused || lastDeadline != osdUntil || lastBlink != blink;
+  if (!newFrame && !changed)
+    return;
+  if (!newFrame) {
+    // Sem quadro novo embaixo (pausado, ou mudança de estado entre quadros):
+    // restaura a imagem para não empilhar tinta velha do OSD.
+    redrawCurrentFrame();
   }
-  // O redesenho do LCD (pôster + HUD) não acontece mais aqui a cada 250 ms: a
-  // borda de 1 s é feita por uiHudTick() chamado em loop(), logo após este OSD.
+  clearOsdLetterbox();
+
+  visible = true;
+  lastFrame = videoFrameIndex;
+  lastPaused = isPaused;
+  lastDeadline = osdUntil;
+  lastBlink = blink;
+
+  vcr::State st;
+  st.transport = isPaused ? vcr::Transport::Pause : vcr::Transport::Play;
+  st.blinkOn = blink;
+  st.seconds = sampleRate ? samplesPlayed.load() / sampleRate : 0;
+  // "OSD estilo VHS" ligado: painel completo (símbolo, SP, contador). Desligado:
+  // só o símbolo e o título, mais discreto sobre o filme.
+  st.showCounter = settings.vhsOsd;
+  st.speed = settings.vhsOsd ? vcr::Speed::SP : vcr::Speed::None;
+  st.title = currentTitle.c_str(); // o OSD normaliza acentos por conta própria
+  st.buttonLeft = PTBR::ANTERIOR;
+  st.buttonCenter = isPaused ? "PLAY" : "PAUSA"; // vocabulário do painel do VCR
+  st.buttonRight = PTBR::PROXIMO;
+  vcr::draw(&rca, st);
 }
 
 void setAudioOutput(AudioOutput output) {
@@ -2387,7 +2451,8 @@ static bool weatherParse(JsonDocument &doc, WeatherData &out) {
   out.tempC = (int)lroundf(cur["temperature_2m"] | 0.0f);
   out.humidity = (int)lroundf(cur["relative_humidity_2m"] | 0.0f);
   out.windKmph = (int)lroundf(cur["wind_speed_10m"] | 0.0f);
-  snprintf(out.cond, sizeof(out.cond), "%s", wmoConditionPt(cur["weather_code"] | -1));
+  out.wmoCode = cur["weather_code"] | -1;
+  snprintf(out.cond, sizeof(out.cond), "%s", wmoConditionPt(out.wmoCode));
   snprintf(out.windDir, sizeof(out.windDir), "%s",
            windDirPt(cur["wind_direction_10m"] | 0.0f));
 
@@ -2395,7 +2460,7 @@ static bool weatherParse(JsonDocument &doc, WeatherData &out) {
   if (daily.isNull())
     return false;
   JsonArray date = daily["time"], tmax = daily["temperature_2m_max"],
-            tmin = daily["temperature_2m_min"];
+            tmin = daily["temperature_2m_min"], dcode = daily["weather_code"];
   if (date.isNull() || tmax.isNull() || tmin.isNull() || date.size() < 3 ||
       tmax.size() < 3 || tmin.size() < 3)
     return false;
@@ -2404,6 +2469,7 @@ static bool weatherParse(JsonDocument &doc, WeatherData &out) {
              weekdayPt(weekdayFromIso(date[i] | "")));
     out.days[i].maxC = (int)lroundf(tmax[i] | 0.0f);
     out.days[i].minC = (int)lroundf(tmin[i] | 0.0f);
+    out.days[i].wmoCode = dcode.isNull() ? -1 : (dcode[i] | -1);
   }
   return true;
 }
@@ -2510,15 +2576,31 @@ void pollWeather() {
   }
 }
 
-// Fundo oscilante estilo "Local Forecast": tons escuros variando suavemente entre
-// azul, petróleo e roxo ao longo de um ciclo de ~12 s (quantizado em RGB565).
-static uint16_t weatherBackground() {
-  const float t = (millis() % 12000) / 12000.0f * 2.0f * PI;
-  int r = (int)(2.0f + 2.0f * sin(t));
-  int g = (int)(1.5f + 1.2f * sin(t + 2.09f));
-  int b = (int)(3.0f + 1.0f * sin(t + 4.19f));
-  uint16_t r5 = r * 31 / 4, g6 = g * 63 / 3, b5 = b * 31 / 4;
-  return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+// Fundo do Local Forecast: azul profundo estável com um gradiente vertical
+// discreto, como o Weather Star 4000.
+//
+// O que havia aqui antes era um ciclo COMPLETO de matiz de 12 s — as três
+// senoides defasadas levavam o fundo por verde, laranja e rosa. Era isso, e não
+// artefato de PAL-M, que deixava a tela ciano-berrante no tubo. O Weather
+// Channel dos anos 80 era azul e ficava azul; o movimento vinha do ticker e das
+// transições entre páginas, nunca do fundo.
+static constexpr uint16_t WX_TOP = 0x0010;    // azul quase preto (topo)
+static constexpr uint16_t WX_BOTTOM = 0x18BF; // azul de cobalto (base)
+
+static uint16_t weatherBackground() { return WX_BOTTOM; }
+
+// Pinta o gradiente por linhas. Em RGB565 as 32 faixas de azul e 64 de verde
+// dão passos imperceptíveis a 240 linhas; em RGB332 isso bandearia, mas o
+// painel composto roda em 16 bits.
+static void weatherPaintBackground(lgfx::LovyanGFX *dst, int oy) {
+  const int r0 = (WX_TOP >> 11) & 0x1F, g0 = (WX_TOP >> 5) & 0x3F, b0 = WX_TOP & 0x1F;
+  const int r1 = (WX_BOTTOM >> 11) & 0x1F, g1 = (WX_BOTTOM >> 5) & 0x3F, b1 = WX_BOTTOM & 0x1F;
+  for (int y = 0; y < CRT_H; ++y) {
+    const int r = r0 + (r1 - r0) * y / (CRT_H - 1);
+    const int g = g0 + (g1 - g0) * y / (CRT_H - 1);
+    const int b = b0 + (b1 - b0) * y / (CRT_H - 1);
+    dst->drawFastHLine(0, oy + y, CRT_W, (uint16_t)((r << 11) | (g << 5) | b));
+  }
 }
 
 static void weatherTickerBuild() {
@@ -2551,59 +2633,131 @@ static void weatherTickerTick() {
   weatherTicker.pushSprite(0, TICKER_Y);
 }
 
-void drawWeatherFrame() {
-  const uint16_t bg = weatherBackground();
-  lastWeatherBg = bg;
-  rca.fillScreen(bg);
-  rca.setFont(&fonts::Font4);
-  rca.setTextDatum(top_center);
-  rca.setTextSize(1);
-  rca.setTextColor(TFT_YELLOW, bg);
-  // Todo o conteúdo fica entre SAFE_T e TICKER_Y; só o fundo sangra até a borda
-  // do raster. Antes o cabeçalho ficava em y=8 e o ticker em y=224, ambos dentro
-  // do overscan da TV — era esse o corte visto no tubo.
-  rca.drawString("FRANCA - SP", CRT_W / 2, SAFE_T);
-  rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
+// ----------------------------------------------------------------------------
+// Local Forecast em duas páginas, alternadas com transição — a cadência do
+// Weather Star 4000. Os pintores recebem (ox, oy) porque o slide desenha as
+// duas páginas deslocadas no mesmo quadro; com deslocamento zero é o desenho
+// normal. Ver include/ScreenFx.h.
+// ----------------------------------------------------------------------------
+static constexpr uint32_t WEATHER_PAGE_MS = 10000; // tempo de cada página
+static int weatherPage = 0;
+static uint32_t lastWeatherPageMs = 0;
+static crt::fx::Transition weatherFx;
 
-  if (weatherReady.load()) {
-    const WeatherData &w = weatherShadows[weatherActive.load()];
-    rca.setTextColor(TFT_WHITE, bg);
-    rca.drawString(w.cond, CRT_W / 2, SAFE_T + 40);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d C", w.tempC);
-    rca.setTextSize(2);
-    rca.setTextColor(TFT_YELLOW, bg);
-    rca.drawString(buf, CRT_W / 2, SAFE_T + 76);
-    rca.setFont(&fonts::Font2);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, bg);
-    snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
-    rca.drawString(buf, CRT_W / 2, SAFE_T + 138);
-    snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
-    rca.drawString(buf, CRT_W / 2, SAFE_T + 158);
-  } else {
-    rca.setFont(&fonts::Font2);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, bg);
-    rca.drawString(weatherStatus.load(), CRT_W / 2, SAFE_T + 86);
-  }
-  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
+// Cabeçalho comum: cidade + régua, a barra de título do WS4000.
+static void weatherHeader(lgfx::LovyanGFX *dst, int ox, int oy, const char *title) {
+  dst->setFont(&fonts::Font4);
+  dst->setTextDatum(top_center);
+  dst->setTextSize(1);
+  dst->setTextColor(TFT_YELLOW);
+  dst->drawString(title, ox + CRT_W / 2, oy + SAFE_T);
+  dst->drawFastHLine(ox + SAFE_L, oy + SAFE_T + 30, SAFE_W, TFT_CYAN);
 }
 
+// Página 0 — condições atuais: ícone grande à esquerda, dados à direita.
+static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
+  weatherPaintBackground(dst, oy);
+  weatherHeader(dst, ox, oy, "FRANCA - SP");
+  if (!weatherReady.load()) {
+    dst->setFont(&fonts::Font2);
+    dst->setTextSize(1);
+    dst->setTextColor(TFT_WHITE);
+    dst->setTextDatum(top_center);
+    dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    return;
+  }
+  const WeatherData &w = weatherShadows[weatherActive.load()];
+  wx::drawWeatherIcon(dst, ox + SAFE_L + 46, oy + SAFE_T + 96, 76, wx::iconFromWmo(w.wmoCode));
+
+  char buf[32];
+  const int col = ox + SAFE_L + 176; // coluna de texto, à direita do ícone
+  dst->setFont(&fonts::Font2);
+  dst->setTextSize(1);
+  dst->setTextDatum(top_center);
+  dst->setTextColor(TFT_WHITE);
+  dst->drawString(w.cond, col, oy + SAFE_T + 46);
+  snprintf(buf, sizeof(buf), "%d C", w.tempC);
+  dst->setFont(&fonts::Font4);
+  dst->setTextSize(2);
+  dst->setTextColor(TFT_YELLOW);
+  dst->drawString(buf, col, oy + SAFE_T + 70);
+  dst->setFont(&fonts::Font2);
+  dst->setTextSize(1);
+  dst->setTextColor(TFT_WHITE);
+  snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
+  dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 140);
+  snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
+  dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 158);
+}
+
+// Página 1 — previsão de três dias em colunas, com ícone por dia.
+static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
+  weatherPaintBackground(dst, oy);
+  weatherHeader(dst, ox, oy, "PREVISAO 3 DIAS");
+  if (!weatherReady.load())
+    return;
+  const WeatherData &w = weatherShadows[weatherActive.load()];
+  const int colW = SAFE_W / 3;
+  char buf[24];
+  for (int i = 0; i < 3; ++i) {
+    const int cx = ox + SAFE_L + colW * i + colW / 2;
+    dst->setFont(&fonts::Font2);
+    dst->setTextSize(1);
+    dst->setTextDatum(top_center);
+    dst->setTextColor(TFT_CYAN);
+    dst->drawString(w.days[i].name, cx, oy + SAFE_T + 42);
+    wx::drawWeatherIcon(dst, cx, oy + SAFE_T + 96, 56, wx::iconFromWmo(w.days[i].wmoCode));
+    dst->setTextColor(TFT_YELLOW);
+    snprintf(buf, sizeof(buf), "%d", w.days[i].maxC);
+    dst->drawString(buf, cx, oy + SAFE_T + 128);
+    dst->setTextColor(TFT_WHITE);
+    snprintf(buf, sizeof(buf), "%d", w.days[i].minC);
+    dst->drawString(buf, cx, oy + SAFE_T + 148);
+  }
+  dst->setFont(&fonts::Font2);
+  dst->setTextColor(TFT_CYAN);
+  dst->setTextDatum(top_center);
+  dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 172);
+}
+
+static crt::fx::Screen weatherScreen(int page) {
+  return crt::fx::screen(page ? paintForecast : paintCurrent);
+}
+
+void drawWeatherFrame() {
+  lastWeatherBg = weatherBackground();
+  if (weatherPage)
+    paintForecast(&rca, 0, 0, nullptr);
+  else
+    paintCurrent(&rca, 0, 0, nullptr);
+  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
+}
 void weatherTick() {
   const uint32_t now = millis();
   static uint32_t lastVersion = UINT32_MAX;
   const uint32_t version = weatherVersion.load();
-  if (version != lastVersion) {
+
+  // Uma transição em curso manda no quadro: nada mais desenha até ela acabar.
+  if (weatherFx.busy()) {
+    weatherFx.tick(now);
+  } else if (version != lastVersion) {
+    // Dados novos entram com cortina de cima para baixo, como o WS4000 fazia ao
+    // trocar de cartela. Não precisa de buffer nenhum.
     lastVersion = version;
     weatherTickerBuild();
-    drawWeatherFrame();
-  } else if (now - lastWeatherDraw >= 300) {
-    lastWeatherDraw = now;
-    const uint16_t bg = weatherBackground();
-    if (bg != lastWeatherBg)
-      drawWeatherFrame();
+    weatherFx.attach(&rca);
+    weatherFx.wipe(now, weatherScreen(weatherPage), crt::fx::DIR_DOWN);
+    lastWeatherPageMs = now;
+  } else if (weatherReady.load() && now - lastWeatherPageMs >= WEATHER_PAGE_MS) {
+    // Rodízio das páginas: slide horizontal, a transição típica entre
+    // "condições atuais" e "previsão estendida". Também sem buffer.
+    const int next = weatherPage ? 0 : 1;
+    weatherFx.attach(&rca);
+    weatherFx.slide(now, weatherScreen(weatherPage), weatherScreen(next), crt::fx::DIR_LEFT);
+    weatherPage = next;
+    lastWeatherPageMs = now;
   }
+
   if (now - lastTickerMs >= 33) {
     lastTickerMs = now;
     tickerOffset += 2;
