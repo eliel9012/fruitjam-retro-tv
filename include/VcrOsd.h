@@ -117,7 +117,10 @@ static_assert(kRightX < crt::SAFE_R, "OSD escapa pela direita da area segura");
 // Cores em RGB565, escritas na mao para o header nao depender das macros TFT_*.
 constexpr uint16_t kInk = 0xFFFF;    // branco puro: cor principal
 constexpr uint16_t kShadow = 0x0000; // preto: contorno
-constexpr uint16_t kAccent = 0x07FF; // ciano: unico acento permitido
+// Acento seguro para NTSC: ciano puro (0x07FF) tem croma maximo e produz dot
+// crawl na saida composta. Vermelho levantado derruba a amplitude de croma sem
+// perder a luminancia nem a leitura de "azul claro".
+constexpr uint16_t kAccent = 0x96BC;
 
 // ---------------------------------------------------------------------------
 //  Primitivas com contorno

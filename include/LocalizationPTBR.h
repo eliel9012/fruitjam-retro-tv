@@ -18,6 +18,7 @@ constexpr const char *INFO_SISTEMA = "SISTEMA";
 constexpr const char *WEATHER = "TEMPO";
 constexpr const char *MUSICA = "MUSICA";
 constexpr const char *DESLIGAR = "DESLIGAR";
+constexpr const char *TRANSFERENCIA = "TRANSFERIR ARQUIVOS";
 constexpr const char *SEM_MUSICAS = "SEM MUSICAS NO CARTAO";
 constexpr const char *ANTERIOR = "ANTERIOR";
 constexpr const char *PROXIMO = "PROXIMO";

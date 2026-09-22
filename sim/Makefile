@@ -60,7 +60,7 @@ $(BUILD)/probe_%: probes/%.cpp $(M5GFX_OBJ) $(SHARED_HDRS) | $(BUILD)
 # O firmware compila em -std=gnu++11 (arduino-esp32 2.x) e o simulador em
 # C++17. Sem esta checagem, um constexpr com laço passa aqui e só quebra na
 # compilação do firmware — foi exatamente o que aconteceu com a VcrFont.
-CXX11_HDRS := VcrFont.h VcrOsd.h WeatherIcons.h ScreenFx.h SafeArea.h
+CXX11_HDRS := VcrFont.h VcrOsd.h WeatherIcons.h ScreenFx.h SafeArea.h TransferScreen.h
 
 cxx11: check
 	@for h in $(CXX11_HDRS); do \

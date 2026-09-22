@@ -14,4 +14,8 @@ c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
   -Itests/stubs -Iinclude tests/test_id3.cpp \
   -o work/test_id3
 ./work/test_id3
+c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -Itests/stubs -Iinclude tests/test_transfer.cpp \
+  -o work/test_transfer
+./work/test_transfer
 python3 tools/sync_schematik.py --check

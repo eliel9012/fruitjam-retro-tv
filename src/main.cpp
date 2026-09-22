@@ -16,6 +16,8 @@
 #include "VcrOsd.h"
 #include "WeatherIcons.h"
 #include "ScreenFx.h"
+#include "FileTransfer.h"
+#include "TransferScreen.h"
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -110,6 +112,10 @@ void weatherTick();
 void pollWeather();
 void startWeather();
 void stopWeather();
+void startTransfer();
+void stopTransfer();
+void transferTick();
+void drawTransferFrame();
 void drawMusicBrowser();
 void drawMusicNowPlaying();
 bool startMusic(const String &path);
@@ -140,6 +146,27 @@ static constexpr int SAFE_W = crt::SAFE_W;
 static constexpr int HEAD_Y = crt::HEAD_Y, HEAD_RULE_Y = crt::HEAD_RULE_Y;
 static constexpr int BODY_Y = crt::BODY_Y;
 static constexpr int BAR_H = crt::BAR_H, BAR_Y = crt::BAR_Y;
+// Acento seguro para NTSC.
+//
+// O ciano puro (0x07FF) tem croma máximo e, numa saída composta, produz dot
+// crawl: o padrão que rasteja devagar pela tela. Foi medido no aparelho e o
+// sintoma era seletivo de um jeito que só isso explica — glitchavam a régua, o
+// rodapé, o letreiro e, no menu inicial, EXATAMENTE o item selecionado, que é o
+// único em ciano. O texto branco, de croma zero, nunca glitchou.
+//
+// Levantar o vermelho aproxima a cor do branco e derruba a amplitude de croma,
+// preservando a luminância e a leitura de "azul claro". Regra de ouro de
+// gráficos para tubo: contraste por luminância, não por saturação.
+static constexpr uint16_t RCA_ACCENT = 0x96BC;
+
+// Transferência de arquivos por Wi-Fi (include/FileTransfer.h + TransferScreen.h).
+xfer::FileTransfer fileTransfer;
+static uint32_t lastTransferDraw = 0;
+// Relógio do menu inicial. Redesenhado a cada segundo, só na sua faixa — a tela
+// inteira não é repintada, senão a TV piscaria uma vez por segundo.
+static uint32_t lastClockDraw = 0;
+static constexpr int CLOCK_Y = crt::HEAD_RULE_Y + 4; // 50..66, acima dos itens
+static xfer::Stage lastTransferStage = xfer::Stage::Error; // força o 1º desenho
 // Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
 // 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
 static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
@@ -231,7 +258,7 @@ std::atomic<const char *> weatherStatus{"CARREGANDO..."};
 uint32_t lastWeatherAttempt = 0, lastWeatherGood = 0;
 uint32_t lastTickerMs = 0;
 uint16_t lastWeatherBg = 0;
-LGFX_Sprite weatherTicker(&rca);
+// (o letreiro não usa mais sprite: ver weatherDrawTicker)
 String tickerPayload, tickerFull;
 int tickerOffset = 0, tickerWrapAt = 0;
 std::atomic<uint32_t> audioUnderruns{0};
@@ -301,7 +328,7 @@ void drawBackButton() {
   if (state == HOME || state == BOOT)
     return;
   M5.Display.fillRoundRect(280, 4, 36, 30, 4, TFT_BLUE);
-  M5.Display.drawRoundRect(280, 4, 36, 30, 4, TFT_CYAN);
+  M5.Display.drawRoundRect(280, 4, 36, 30, 4, RCA_ACCENT);
   M5.Display.fillTriangle(287, 19, 297, 10, 297, 28, TFT_WHITE);
   M5.Display.fillRect(296, 16, 12, 6, TFT_WHITE);
 }
@@ -325,7 +352,7 @@ void dualText(const String &line1, const String &line2 = "") {
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
     d->drawString(l1, 160, 94);
-    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
     d->setTextSize(1);
     d->drawString(l2, 160, 130);
   }
@@ -469,7 +496,7 @@ void drawSetupPortal() {
     M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
     M5.Display.setTextSize(2);
     M5.Display.drawString("M5 RETRO TV", 12, 8);
-    M5.Display.drawFastHLine(8, 36, 304, TFT_CYAN);
+    M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
     M5.Display.drawString("CONFIGURACAO", 12, 48);
     M5.Display.setTextSize(1);
     M5.Display.drawString("WI-FI: " + portal.apSsid(), 20, 88);
@@ -1185,7 +1212,8 @@ void stopProgram() {
   // pausar um programa deixava o audioTask no ramo de pausa e a música nunca
   // tocava, sem erro nenhum na tela.
   paused = false;
-  lastJpegUsed = 0; // o conteúdo do jpegBuffer deixa de valer
+  videoBehind = false; // senão o loop ficaria em 1 ms depois de sair da reprodução
+  lastJpegUsed = 0;    // o conteúdo do jpegBuffer deixa de valer
   state = VIDEO_LIBRARY;
 }
 void videoTick() {
@@ -1528,7 +1556,7 @@ void uiHudDraw() {
 
   // Barra de progresso proporcional a samplesPlayed (1 px de preenchimento).
   const int barX = 4, barY = 12, barW = HUD_W - 8;
-  uiHud.drawRect(barX, barY, barW, 3, TFT_CYAN);
+  uiHud.drawRect(barX, barY, barW, 3, RCA_ACCENT);
   const int progress =
       total ? constrain(int((samplesPlayed.load() / float(sampleRate)) * barW / total), 0, barW) : 0;
   if (progress)
@@ -1711,7 +1739,7 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
     const int x = i == 0 ? 6 : i == 1 ? 110 : 214;
     const int w = i == 1 ? 100 : 100;
     const bool hot = input.highlightActive() && input.highlightedButton() == i;
-    uint32_t fill = hot ? TFT_CYAN : TFT_BLUE;
+    uint32_t fill = hot ? RCA_ACCENT : TFT_BLUE;
     uint32_t ink = hot ? TFT_NAVY : TFT_WHITE;
     M5.Display.fillRoundRect(x, 190, w, 43, 4, fill);
     M5.Display.drawRoundRect(x, 190, w, 43, 4, TFT_WHITE);
@@ -1725,7 +1753,7 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
     rca.fillRect(0, BAR_Y, CRT_W, BAR_H, TFT_NAVY);
     rca.setTextDatum(middle_center);
     rca.setTextSize(1);
-    rca.setTextColor(TFT_CYAN, TFT_NAVY);
+    rca.setTextColor(RCA_ACCENT, TFT_NAVY);
     rca.drawString(String("[ ") + left + " ]  [ " + center + " ]  [ " + right + " ]", CRT_W / 2,
                    BAR_Y + BAR_H / 2);
   }
@@ -1810,7 +1838,7 @@ void drawMusicBrowser() {
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
     d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
-    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
     // breadcrumb do diretório corrente.
     String crumb = musicDir;
     crumb.replace(String(MUSIC_ROOT), "/");
@@ -1823,9 +1851,9 @@ void drawMusicBrowser() {
     for (int row = 0; row < 4 && first + row < musicEntryCount; ++row) {
       const int index = first + row, y = BODY_Y + 14 + row * 32;
       const bool selected = index == musicSelection;
-      d->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
-      d->setTextColor(selected ? TFT_NAVY : (musicEntries[index].isFolder ? TFT_CYAN : TFT_WHITE),
-                      selected ? TFT_CYAN : TFT_NAVY);
+      d->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? RCA_ACCENT : TFT_NAVY);
+      d->setTextColor(selected ? TFT_NAVY : (musicEntries[index].isFolder ? RCA_ACCENT : TFT_WHITE),
+                      selected ? RCA_ACCENT : TFT_NAVY);
       String label = String(selected ? "> " : "  ") + musicEntries[index].name;
       if (musicEntries[index].isFolder)
         label += "/";
@@ -1968,7 +1996,7 @@ void drawMusicNowPlaying() {
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
     d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
-    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
     d->setTextSize(1);
     // Capa do álbum (esquerda) com borda estilo VHS.
     const int coverY = BODY_Y + 8;
@@ -1978,7 +2006,7 @@ void drawMusicNowPlaying() {
       coverSprite->setPivot(cw / 2.0f, ch / 2.0f);
       coverSprite->pushRotateZoom(d, SAFE_L + 44, coverY + 44, 0, sc, sc);
     }
-    d->drawRect(SAFE_L, coverY, 88, 88, coverSprite ? TFT_CYAN : TFT_DARKCYAN);
+    d->drawRect(SAFE_L, coverY, 88, 88, coverSprite ? RCA_ACCENT : TFT_DARKCYAN);
     // Título + tags (truncados para não estourar à direita).
     const int metaX = SAFE_L + 96;
     d->setTextColor(TFT_YELLOW, TFT_NAVY);
@@ -1997,10 +2025,10 @@ void drawMusicNowPlaying() {
       d->drawString(meta, SAFE_R - 96, HEAD_RULE_Y + 6);
     }
     // Progresso (com tempo total correto).
-    d->drawRect(SAFE_L, 160, SAFE_W, 6, TFT_CYAN);
+    d->drawRect(SAFE_L, 160, SAFE_W, 6, RCA_ACCENT);
     if (pct > 0)
       d->fillRect(SAFE_L + 1, 161, pct, 4, TFT_YELLOW);
-    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
     char clockLine[48];
     snprintf(clockLine, sizeof(clockLine), "%s %02lu:%02lu / %02lu:%02lu", isPaused ? "PAUSA" : "PLAY",
              curSec / 60UL, curSec % 60UL, totalSec / 60UL, totalSec % 60UL);
@@ -2250,24 +2278,133 @@ void musicTick() {
   drawMusicBrowser();
 }
 
+// ----------------------------------------------------------------------------
+// Transferência de arquivos por Wi-Fi
+//
+// Esta tela SUSPENDE o resto do aparelho de propósito: reprodução, música do
+// Weather e consultas de rede saem de cena. O cartão é disputado com a tarefa de
+// áudio e a saída composta tem prazo rígido por linha de varredura — receber
+// dezenas de MB com tudo isso rodando junto engasgaria os dois.
+// ----------------------------------------------------------------------------
+static xfer::State transferState() {
+  static String endereco, rede;
+  endereco = "http://" + fileTransfer.ip();
+  rede = WiFi.SSID();
+  xfer::State st;
+  st.address = endereco.c_str();
+  st.ssid = rede.c_str();
+  st.user = fileTransfer.user();
+  st.password = fileTransfer.password();
+  st.fileName = fileTransfer.fileName();
+  st.bytesReceived = (uint32_t)fileTransfer.received();
+  st.bytesTotal = (uint32_t)fileTransfer.total();
+  switch (fileTransfer.status()) {
+  case xfer::TransferStatus::RECEBENDO: st.stage = xfer::Stage::Receiving; break;
+  case xfer::TransferStatus::CONCLUIDO: st.stage = xfer::Stage::Done; break;
+  case xfer::TransferStatus::FALHA:     st.stage = xfer::Stage::Error; break;
+  default:                              st.stage = xfer::Stage::Waiting; break;
+  }
+  if (fileTransfer.status() == xfer::TransferStatus::FALHA)
+    st.statusText = fileTransfer.lastError();
+  return st;
+}
+
+void drawTransferFrame() {
+  const xfer::State st = transferState();
+  xfer::draw(&rca, st);
+  xfer::draw(&M5.Display, st);
+  lastTransferStage = st.stage;
+  drawBackButton();
+}
+
+void startTransfer() {
+  stopProgram();  // encerra vídeo E a música em loop do Weather
+  stopWeather();
+  if (!network.connected()) {
+    setError(PTBR::SEM_WIFI);
+    return;
+  }
+  if (!fileTransfer.begin(sdMutex)) {
+    setError(fileTransfer.lastError());
+    return;
+  }
+  state = FILE_TRANSFER;
+  lastTransferStage = xfer::Stage::Error; // garante o primeiro desenho
+  lastTransferDraw = 0;
+  drawTransferFrame();
+  Serial.printf("[M5RETRO] Transferencia em http://%s usuario:%s senha:%s\n",
+                fileTransfer.ip().c_str(), fileTransfer.user(), fileTransfer.password());
+}
+
+void stopTransfer() {
+  fileTransfer.stop();
+  state = HOME;
+  drawHome();
+}
+
+void transferTick() {
+  fileTransfer.handle(); // não-bloqueante
+  const uint32_t now = millis();
+  const xfer::Stage agora = transferState().stage;
+  // Redesenho parcial a 4 Hz enquanto recebe; troca de estágio redesenha tudo.
+  if (agora != lastTransferStage) {
+    drawTransferFrame();
+  } else if (agora == xfer::Stage::Receiving && now - lastTransferDraw >= 250) {
+    lastTransferDraw = now;
+    const xfer::State st = transferState();
+    xfer::drawProgress(&rca, st);
+    xfer::drawProgress(&M5.Display, st);
+  }
+}
+
+// Data e hora com segundos, do relógio sincronizado por NTP. Antes do primeiro
+// sincronismo o epoch fica em 1970, e aí mostrar "01/01/1970" seria pior que
+// não mostrar nada — nesse caso sai um aviso.
+static void drawHomeClock(bool limpar) {
+  char texto[32];
+  const time_t agora = time(nullptr);
+  if (agora >= 1704067200) { // 2024-01-01: houve sincronismo NTP
+    struct tm t;
+    localtime_r(&agora, &t);
+    snprintf(texto, sizeof(texto), "%02d/%02d/%04d  %02d:%02d:%02d", t.tm_mday, t.tm_mon + 1,
+             t.tm_year + 1900, t.tm_hour, t.tm_min, t.tm_sec);
+  } else {
+    snprintf(texto, sizeof(texto), "%s", "RELOGIO NAO SINCRONIZADO");
+  }
+  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+    if (limpar)
+      d->fillRect(SAFE_L, CLOCK_Y, SAFE_W, 18, TFT_NAVY);
+    d->setFont(&fonts::Font2);
+    d->setTextSize(1);
+    d->setTextDatum(top_right);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->drawString(texto, SAFE_R - 1, CLOCK_Y);
+    d->setTextDatum(top_left);
+    d->setFont(&fonts::Font0);
+  }
+  lastClockDraw = millis();
+}
+
 void drawHome() {
-  // 7 itens: VIDEOS, MUSICA, TRAFEGO, CONFIGURACOES, SISTEMA, TEMPO, DESLIGAR.
-  const char *items[] = {PTBR::VIDEOS, PTBR::MUSICA, PTBR::TRAFEGO,      PTBR::CONFIGURACOES,
-                         PTBR::INFO_SISTEMA, PTBR::WEATHER, PTBR::DESLIGAR};
-  constexpr int HOME_COUNT = 7;
+  // 8 itens: VIDEOS, MUSICA, TRAFEGO, CONFIGURACOES, SISTEMA, TEMPO,
+  // TRANSFERIR ARQUIVOS, DESLIGAR.
+  const char *items[] = {PTBR::VIDEOS,       PTBR::MUSICA,  PTBR::TRAFEGO,
+                         PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA, PTBR::WEATHER,
+                         PTBR::TRANSFERENCIA, PTBR::DESLIGAR};
+  constexpr int HOME_COUNT = 8;
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
   M5.Display.setTextSize(2);
   M5.Display.drawString(PTBR::APP, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, TFT_CYAN);
+  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
   M5.Display.setTextSize(2);
   for (int i = 0; i < HOME_COUNT; i++) {
     int y = 40 + i * 20;
     bool selected = i == homeSelection;
     if (selected)
-      M5.Display.fillRoundRect(12, y - 2, 296, 18, 4, TFT_CYAN);
-    M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? TFT_CYAN : TFT_NAVY);
+      M5.Display.fillRoundRect(12, y - 2, 296, 18, 4, RCA_ACCENT);
+    M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
     M5.Display.drawString(String(selected ? "> " : "  ") + items[i], 24, y);
   }
   rca.fillScreen(TFT_NAVY);
@@ -2275,13 +2412,16 @@ void drawHome() {
   rca.setTextSize(2);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString(PTBR::APP, SAFE_L, HEAD_Y);
-  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
   rca.setTextSize(1);
   for (int i = 0; i < HOME_COUNT; i++) {
-    int y = BODY_Y + i * 20;
-    rca.setTextColor(i == homeSelection ? TFT_CYAN : TFT_WHITE, TFT_NAVY);
+    // Passo de 16 px: com 8 itens e o relógio ocupando uma linha, 20 px faria o
+    // último item invadir a barra de legendas em 202.
+    int y = CLOCK_Y + 20 + i * 16;
+    rca.setTextColor(i == homeSelection ? RCA_ACCENT : TFT_WHITE, TFT_NAVY);
     rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], SAFE_L + 4, y);
   }
+  drawHomeClock(false); // a tela acabou de ser preenchida; não precisa limpar
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
 void drawLibrary() {
@@ -2294,7 +2434,7 @@ void drawLibrary() {
     display->setTextSize(2);
     display->setTextColor(TFT_WHITE, TFT_NAVY);
     display->drawString(PTBR::VIDEOS, SAFE_L, HEAD_Y);
-    display->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+    display->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
     display->setTextSize(1);
     if (!count)
       display->drawString("SEM VIDEOS NO CARTAO", SAFE_L + 6, BODY_Y + 48);
@@ -2307,8 +2447,8 @@ void drawLibrary() {
       char title[48];
       ascii::normalize(title, sizeof(title), path.substring(path.lastIndexOf('/') + 1).c_str());
       const bool selected = index == librarySelection;
-      display->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
-      display->setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? TFT_CYAN : TFT_NAVY);
+      display->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? RCA_ACCENT : TFT_NAVY);
+      display->setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
       display->drawString(String(selected ? "> " : "  ") + title, SAFE_L + 8, y + 6);
     }
     display->setTextColor(TFT_WHITE, TFT_NAVY);
@@ -2362,14 +2502,14 @@ void drawRadar() {
     // Centro/raio escolhidos para que os rótulos N/S/L/O e a legenda de
     // alcance caibam inteiros na área segura, sem encostar no painel lateral.
     const int cx = 96, cy = 118, R = 58;
-    d->drawCircle(cx, cy, R, TFT_CYAN);
+    d->drawCircle(cx, cy, R, RCA_ACCENT);
     d->drawCircle(cx, cy, R / 2, TFT_DARKCYAN);
     d->drawFastHLine(cx - R, cy, 2 * R, TFT_DARKCYAN);
     d->drawFastVLine(cx, cy - R, 2 * R, TFT_DARKCYAN);
 
     // Pontos cardeais (fora do anel) + alcance na base do scope.
     d->setTextDatum(middle_center);
-    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
     d->drawString("N", cx, cy - R - 8);
     d->drawString("S", cx, cy + R + 8);
     d->drawString("W", cx - R - 8, cy);
@@ -2390,8 +2530,8 @@ void drawRadar() {
         continue;
       const bool sel = (i == radarSelection);
       if (sel)
-        d->drawLine(cx, cy, px, py, TFT_CYAN);
-      drawAirplane(d, px, py, aircraft[i].heading_deg, sel ? TFT_CYAN : TFT_YELLOW);
+        d->drawLine(cx, cy, px, py, RCA_ACCENT);
+      drawAirplane(d, px, py, aircraft[i].heading_deg, sel ? RCA_ACCENT : TFT_YELLOW);
     }
 
     // Painel lateral de dados (à direita do scope), sempre acima da barra de
@@ -2402,7 +2542,7 @@ void drawRadar() {
       const Aircraft &p = aircraft[radarSelection];
       d->setTextColor(TFT_WHITE, TFT_NAVY);
       d->drawString(p.callsign.length() ? p.callsign : p.icao, PX, SAFE_T + 18);
-      d->setTextColor(TFT_CYAN, TFT_NAVY);
+      d->setTextColor(RCA_ACCENT, TFT_NAVY);
       d->drawString("ALT FL" + String((int)(p.altitude_ft / 100)), PX, SAFE_T + 40);
       d->drawString("VEL " + String((int)p.speed_kt) + " KT", PX, SAFE_T + 58);
       double y = (p.latitude - settings.lat) * 111.0;
@@ -2418,14 +2558,14 @@ void drawRadar() {
         d->drawString(p.aircraft_type, PX, SAFE_T + 120);
       }
     } else {
-      d->setTextColor(TFT_CYAN, TFT_NAVY);
+      d->setTextColor(RCA_ACCENT, TFT_NAVY);
       d->drawString(PTBR::AERONAVES_RASTREADAS, PX, SAFE_T + 32);
       d->setTextColor(TFT_WHITE, TFT_NAVY);
       d->drawString(String(aircraftCount), PX, SAFE_T + 54);
     }
     d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
     d->drawString(String(settings.rangeKm) + " km de alcance", PX, SAFE_T + 142);
-    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
     d->drawString(apiStatus.substring(0, 20), PX, SAFE_T + 158);
     if (!aircraftCount) {
       d->setTextColor(TFT_WHITE, TFT_NAVY);
@@ -2718,23 +2858,44 @@ static void weatherTickerBuild() {
   // tela. Com só duas cópias, depois do wrap sobrava exatamente uma volta e
   // abria um vão preto na borda direita a cada ciclo.
   const String unit = tickerPayload + "      ";
-  tickerWrapAt = weatherTicker.textWidth(unit.c_str());
+  rca.setFont(&fonts::Font2);
+  rca.setTextSize(1);
+  tickerWrapAt = rca.textWidth(unit.c_str());
   tickerFull = unit;
-  while (tickerWrapAt > 0 && weatherTicker.textWidth(tickerFull.c_str()) < tickerWrapAt + CRT_W)
+  while (tickerWrapAt > 0 && rca.textWidth(tickerFull.c_str()) < tickerWrapAt + CRT_W)
     tickerFull += unit;
   tickerOffset = 0;
 }
 
+// Desenha o letreiro DIRETO no destino, com recorte na faixa.
+//
+// Antes isto era um LGFX_Sprite empurrado a 30 Hz. O problema não era o sprite:
+// era a faixa ter DOIS donos. Os pintores preenchem a tela inteira, incluindo
+// 206..239, e o sprite só repintava a faixa até 33 ms depois — nessa janela a
+// faixa mostrava fundo em vez do letreiro. Medido com "diag scan": a faixa
+// estava com fundo puro, zero pixels de ciano, enquanto a TV mostrava letreiro.
+// Era esse conflito, e não rasgo de varredura, o glitch pior de todos na parte
+// de baixo: é o único elemento com dois escritores assíncronos.
+//
+// Agora há um dono só. Os pintores chamam isto no fim, então toda repintura já
+// sai coerente, e o tique de 33 ms só atualiza a mesma faixa. De quebra some o
+// sprite de 320x16, devolvendo memória à SRAM interna, que é o recurso apertado.
+static void weatherDrawTicker(lgfx::LovyanGFX *dst, int ox, int oy) {
+  const int y = oy + TICKER_Y;
+  dst->setClipRect(ox, y, CRT_W, TICKER_H);
+  dst->fillRect(ox, y, CRT_W, TICKER_H, TFT_BLACK);
+  dst->setFont(&fonts::Font2);
+  dst->setTextSize(1);
+  dst->setTextDatum(top_left);
+  dst->setTextColor(RCA_ACCENT, TFT_BLACK);
+  dst->drawString(tickerFull.c_str(), ox - tickerOffset, y);
+  dst->clearClipRect();
+}
+
 static void weatherTickerTick() {
-  if (!weatherTicker.getBuffer())
-    return;
   if (tickerWrapAt > 0 && tickerOffset >= tickerWrapAt)
     tickerOffset -= tickerWrapAt;
-  weatherTicker.fillSprite(TFT_BLACK);
-  weatherTicker.setTextDatum(top_left);
-  weatherTicker.setTextColor(TFT_CYAN, TFT_BLACK);
-  weatherTicker.drawString(tickerFull.c_str(), -tickerOffset, 0);
-  weatherTicker.pushSprite(0, TICKER_Y);
+  weatherDrawTicker(&rca, 0, 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -2758,10 +2919,10 @@ static void weatherHeader(lgfx::LovyanGFX *dst, int ox, int oy, const char *titl
   dst->setTextSize(1);
   dst->setTextColor(TFT_YELLOW);
   dst->drawString(title, ox + CRT_W / 2, oy + SAFE_T);
-  dst->drawFastHLine(ox + SAFE_L, oy + SAFE_T + 30, SAFE_W, TFT_CYAN);
+  dst->drawFastHLine(ox + SAFE_L, oy + SAFE_T + 30, SAFE_W, RCA_ACCENT);
   // A régua de cima do ticker também vive aqui: se ficar só no drawWeatherFrame,
   // a primeira transição repinta a tela e ela some pelo resto da sessão.
-  dst->drawFastHLine(ox + SAFE_L, oy + TICKER_Y - 4, SAFE_W, TFT_CYAN);
+  dst->drawFastHLine(ox + SAFE_L, oy + TICKER_Y - 4, SAFE_W, RCA_ACCENT);
 }
 
 // Página 0 — condições atuais: ícone grande à esquerda, dados à direita.
@@ -2778,6 +2939,7 @@ static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
     dst->setTextColor(TFT_WHITE);
     dst->setTextDatum(top_center);
     dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    weatherDrawTicker(dst, ox, oy);
     dst->endWrite();
     return;
   }
@@ -2803,6 +2965,7 @@ static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
   dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 140);
   snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
   dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 158);
+  weatherDrawTicker(dst, ox, oy);
   dst->endWrite();
 }
 
@@ -2819,6 +2982,7 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
     dst->setTextColor(TFT_WHITE);
     dst->setTextDatum(top_center);
     dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    weatherDrawTicker(dst, ox, oy);
     dst->endWrite();
     return;
   }
@@ -2830,7 +2994,7 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
     dst->setFont(&fonts::Font2);
     dst->setTextSize(1);
     dst->setTextDatum(top_center);
-    dst->setTextColor(TFT_CYAN);
+    dst->setTextColor(RCA_ACCENT);
     dst->drawString(w.days[i].name, cx, oy + SAFE_T + 42);
     wx::drawWeatherIcon(dst, cx, oy + SAFE_T + 96, 56, wx::iconFromWmo(w.days[i].wmoCode));
     dst->setTextColor(TFT_YELLOW);
@@ -2841,9 +3005,10 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
     dst->drawString(buf, cx, oy + SAFE_T + 148);
   }
   dst->setFont(&fonts::Font2);
-  dst->setTextColor(TFT_CYAN);
+  dst->setTextColor(RCA_ACCENT);
   dst->setTextDatum(top_center);
   dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 166);
+  weatherDrawTicker(dst, ox, oy);
   dst->endWrite();
 }
 
@@ -2915,17 +3080,9 @@ void startWeather() {
   lastWeatherAttempt = 0; // força a primeira consulta imediata
   state = WEATHER;
 
-  // Sprite do ticker (uma única vez). Em 16 bits, igual ao painel composto: o
-  // pushSprite vira cópia direta em vez de converter 5.120 pixels de RGB332 para
-  // RGB565 a cada 33 ms (~155 mil pixels por segundo convertidos à toa). Custa
-  // 5.120 bytes de SRAM a mais, que existem — o aperto de SRAM é o framebuffer
-  // do CVBS, e 5 KB nele não fazem diferença.
-  if (!weatherTicker.getBuffer()) {
-    weatherTicker.setPsram(false);
-    weatherTicker.setColorDepth(16);
-    weatherTicker.createSprite(CRT_W, TICKER_H);
-    weatherTicker.setFont(&fonts::Font2);
-  }
+  // O letreiro não usa mais sprite: weatherDrawTicker() desenha direto no
+  // framebuffer, o que elimina o segundo escritor da faixa e devolve os 5.120
+  // bytes de SRAM interna que o sprite ocupava.
   // Toda visita começa na página 0, com o rodízio e o controle de versão
   // zerados; senão a tela herda o estado da visita anterior.
   weatherPage = 0;
@@ -2943,7 +3100,7 @@ void startWeather() {
   M5.Display.setTextSize(2);
   M5.Display.drawString(PTBR::WEATHER, 12, 8);
   M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
+  M5.Display.setTextColor(RCA_ACCENT, TFT_NAVY);
   M5.Display.drawString("EXIBINDO NA TV", 12, 64);
   M5.Display.drawString("VOLTAR: BOTAO CENTRAL", 12, 88);
   drawBackButton();
@@ -2986,9 +3143,9 @@ void drawSettings() {
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
   M5.Display.drawString(PTBR::CONFIGURACOES, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, TFT_CYAN);
+  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
   M5.Display.setTextSize(2);
-  M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
+  M5.Display.setTextColor(RCA_ACCENT, TFT_NAVY);
   M5.Display.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], 20, 68);
   M5.Display.setTextSize(3);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -2998,9 +3155,9 @@ void drawSettings() {
   rca.setTextSize(2);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString(PTBR::CONFIGURACOES, SAFE_L, HEAD_Y);
-  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
   rca.setTextSize(1);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(RCA_ACCENT, TFT_NAVY);
   rca.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], SAFE_L, BODY_Y + 26);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString(value, SAFE_L + 10, BODY_Y + 58);
@@ -3016,10 +3173,10 @@ void drawInfo() {
     d->setTextSize(2);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->drawString(PTBR::INFO_SISTEMA, SAFE_L, HEAD_Y);
-    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
     d->setTextSize(1);
     const int y0 = BODY_Y;
-    d->setTextColor(TFT_CYAN, TFT_NAVY);
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
     if (!infoPage) {
       d->drawString("MEMORIA LIVRE", SAFE_L, y0);
       d->drawString("PSRAM LIVRE", SAFE_L, y0 + 26);
@@ -3036,7 +3193,7 @@ void drawInfo() {
       d->drawString(st, SAFE_L + 144, y0);
       if (WiFi.status() == WL_CONNECTED) {
         d->drawString(String(WiFi.RSSI()) + " dBm", SAFE_L + 144, y0 + 26);
-        d->setTextColor(TFT_CYAN, TFT_NAVY);
+        d->setTextColor(RCA_ACCENT, TFT_NAVY);
         d->drawString(PTBR::ENDERECO_IP, SAFE_L, y0 + 52);
         d->setTextColor(TFT_WHITE, TFT_NAVY);
         d->drawString(WiFi.localIP().toString(), SAFE_L + 144, y0 + 52);
@@ -3088,7 +3245,7 @@ void handleNavigation(NavAction a) {
     else if (a == NavAction::RIGHT)
       homeSelection = (homeSelection + 1) % 7;
     else if (a == NavAction::SELECT) {
-      if (homeSelection == 6) { // DESLIGAR: apaga o Core2 via AXP192.
+      if (homeSelection == 7) { // DESLIGAR: apaga o Core2 via AXP192.
         requestPowerOff();
         return;
       }
@@ -3105,11 +3262,19 @@ void handleNavigation(NavAction a) {
         drawSettings();
       else if (state == WEATHER)
         startWeather();
+      else if (state == FILE_TRANSFER)
+        startTransfer();
       else
         drawInfo();
       return;
     }
     drawHome();
+    return;
+  }
+  if (state == FILE_TRANSFER) {
+    // Qualquer botão sai: a tela não tem navegação interna.
+    if (a != NavAction::NONE)
+      stopTransfer();
     return;
   }
   if (state == VIDEO_LIBRARY) {
@@ -3519,6 +3684,50 @@ void serviceDiagnostics() {
       memset(line, 0, sizeof(line));
       continue;
     }
+    if (command == "diag scan") {
+      // Lê o framebuffer de volta e diz em QUE LINHAS existe tinta do ticker
+      // (ciano) e tinta clara. Se o texto do ticker aparecer fora da faixa,
+      // o defeito está na memória (software); se estiver só na faixa, o que a
+      // TV mostra fora dela é artefato de exibição (DMA/varredura).
+      static uint16_t linha[CRT_W];
+      Serial.println("[SCAN] linha: ciano claro  (faixa do ticker = 206..221)");
+      for (int y = 150; y < CRT_H; ++y) {
+        rca.readRect(0, y, CRT_W, 1, linha);
+        int ciano = 0, claro = 0;
+        for (int x = 0; x < CRT_W; ++x) {
+          const uint16_t c = linha[x];
+          const int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
+          if (g > 40 && b > 20 && r < 20)
+            ++ciano;
+          if (r > 20 && g > 40 && b > 20)
+            ++claro;
+        }
+        if (ciano || claro)
+          Serial.printf("[SCAN] %3d: %4d %4d\n", y, ciano, claro);
+      }
+      Serial.printf("[SCAN] tickerFull=%u chars offset=%d wrapAt=%d payload=%u\n",
+                    (unsigned)tickerFull.length(), tickerOffset, tickerWrapAt,
+                    (unsigned)tickerPayload.length());
+      Serial.printf("[SCAN] largura do texto=%d  TICKER_Y=%d TICKER_H=%d\n",
+                    rca.textWidth(tickerFull.c_str()), TICKER_Y, TICKER_H);
+      for (int y = TICKER_Y - 2; y < TICKER_Y + TICKER_H + 2; ++y) {
+        rca.readRect(0, y, CRT_W, 1, linha);
+        int distintas = 0;
+        uint16_t vistas[6] = {0};
+        for (int x = 0; x < CRT_W; ++x) {
+          bool nova = true;
+          for (int k = 0; k < distintas; ++k)
+            if (vistas[k] == linha[x])
+              nova = false;
+          if (nova && distintas < 6)
+            vistas[distintas++] = linha[x];
+        }
+        Serial.printf("[SCAN] faixa y=%d cores=%d [%04X %04X %04X]\n", y, distintas, vistas[0],
+                      vistas[1], vistas[2]);
+      }
+      memset(line, 0, sizeof(line));
+      continue;
+    }
     if (command == "diag colors") {
       testPixelColors();
       continue;
@@ -3792,6 +4001,11 @@ void loop() {
   if (state == MUSIC_NOW_PLAYING) {
     musicTick();
   }
+  if (state == FILE_TRANSFER) {
+    transferTick();
+  }
+  if (state == HOME && millis() - lastClockDraw >= 1000)
+    drawHomeClock(true);
   pollAircraft();
   if (state == AIRCRAFT_RADAR && radarDirty) {
     radarDirty = false;
@@ -3813,5 +4027,5 @@ void loop() {
   // (33 ms cada) e mantém baixo o polling I2C do touch que o M5.update() faz.
   // Só quando o vídeo já está atrás do relógio de PCM é que 4 ms de latência
   // passam a custar quadro, e aí o loop praticamente não dorme.
-  delay(videoBehind ? 1 : 4);
+  delay(state == VIDEO_PLAYBACK && videoBehind ? 1 : 4);
 }

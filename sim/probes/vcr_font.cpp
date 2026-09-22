@@ -295,8 +295,8 @@ static void pageOsd() {
   vcrfont::drawText(&rca, "VHS/DVD MIX WXYZ", 4, 138, white, 1, black);
 
   // Faixa do OSD, tal como o player a usa.
-  vcrfont::drawText(&rca, "CH 03 - 12/25", SAFE_L, OSD_Y + 2, white, 1, black);
-  vcrfont::drawTextCentered(&rca, "SP 0:12:34", 0, OSD_Y + 18, W, white, 1, black);
+  vcrfont::drawText(&rca, "CH 03 - 12/25", SAFE_L, crt::SAFE_B - 40, white, 1, black);
+  vcrfont::drawTextCentered(&rca, "SP 0:12:34", 0, crt::SAFE_B - 22, W, white, 1, black);
 
   savePng(&rca, W, H, "vcr_font_osd.png");
 }
