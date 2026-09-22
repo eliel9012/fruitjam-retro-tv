@@ -185,6 +185,11 @@ std::atomic<uint32_t> samplesPlayed{0};
 std::atomic<bool> playing{false}, paused{false}, playbackFinished{false};
 std::atomic<AudioOutput> audioOutput{AudioOutput::RCA};
 uint32_t videoFrameIndex = 0, decodedFrames = 0, renderedFrames = 0, droppedFrames = 0, jpegErrors = 0;
+// Instrumentação do "diag bench". Fora do benchmark benchActive é falso e o
+// jpegDraw não paga nada além de um teste de bool por bloco de MCU.
+bool benchActive = false;
+uint64_t benchBlitUs = 0;
+uint32_t benchBlitCalls = 0;
 LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
 uint32_t lastUiUpdate = 0;      // borda de 1 s que dispara o redesenho do HUD
 static bool backlightOn = true; // estado atual do backlight (DCDC3 do AXP192)
@@ -738,8 +743,13 @@ void audioTask(void *) {
 int jpegDraw(JPEGDRAW *draw) {
   // Saída de vídeo SOMENTE na RCA (composta). Nenhum pixel de frame é espelhado
   // no LCD: isso libera a banda do barramento SPI compartilhado com o microSD.
+  const int64_t t0 = benchActive ? esp_timer_get_time() : 0;
   rca.pushImage(draw->x + (CRT_W - videoWidth) / 2, draw->y + (CRT_H - videoHeight) / 2, draw->iWidth,
                 draw->iHeight, reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
+  if (benchActive) {
+    benchBlitUs += uint64_t(esp_timer_get_time() - t0);
+    ++benchBlitCalls;
+  }
   return 1;
 }
 
@@ -875,6 +885,156 @@ bool drawStaticPoster(const String &dir) {
   // O pôster nunca bloqueia o PLAY: retorna true até no fallback. (false só
   // caberia se o LCD estivesse inacessível, o que não ocorre após M5.begin.)
   return true;
+}
+
+// ============================================================================
+// Benchmark do caminho de vídeo da RCA ("diag bench")
+//
+// Responde na bancada a pergunta que nenhum simulador de PC responde: até que
+// resolução e taxa ESTE aparelho sustenta na saída composta. Mede as três
+// etapas separadamente, em microssegundos (millis() tem resolução grossa demais
+// para um quadro de ~20 ms), rodando o mais rápido possível, sem cadência de
+// áudio e sem descarte de quadros:
+//
+//   leitura   -> tirar o JPEG do cartão (mjpegReader.next)
+//   decode    -> JPEGDEC, já descontado o blit
+//   blit      -> pushImage no framebuffer CVBS, cronometrado dentro do jpegDraw
+//
+// O teto real não é do aparelho e sim do sinal: o NTSC entrega 59,94 campos por
+// segundo e a luminância tem ~4,2 MHz de banda, o que equivale a ~330 pontos por
+// linha. Acima de 320x240 a 30 quadros/s não há qualidade a ganhar no tubo, só
+// trabalho a mais. Este benchmark serve para saber se o Core2 alcança esse teto
+// com a mídia que você preparou.
+// ============================================================================
+static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
+  stopProgram(); // nada de áudio ou reprodução competindo pelo cartão
+
+  String video = "video.mjpeg";
+  float metaFps = 15.0f;
+  File meta = SD.open(dir + "/meta.json", FILE_READ);
+  if (meta) {
+    JsonDocument d;
+    if (!deserializeJson(d, meta)) {
+      video = (const char *)(d["video"] | "video.mjpeg");
+      metaFps = d["fps"] | 15.0f;
+    }
+    meta.close();
+  }
+
+  File f = SD.open(dir + "/" + video, FILE_READ);
+  if (!f) {
+    Serial.printf("[BENCH] nao abriu %s/%s\n", dir.c_str(), video.c_str());
+    return;
+  }
+  if (!jpegBuffer) {
+    Serial.println("[BENCH] sem buffer JPEG");
+    f.close();
+    return;
+  }
+
+  playback::MjpegReader reader;
+  reader.reset();
+  rca.fillScreen(TFT_BLACK);
+  videoFrameIndex = 0;
+
+  uint64_t readUs = 0, decodeUs = 0, totalBytes = 0;
+  uint32_t maxReadUs = 0, maxDecodeUs = 0, maxTotalUs = 0;
+  uint32_t frames = 0, errors = 0;
+  int w = 0, h = 0;
+
+  benchActive = true;
+  benchBlitUs = 0;
+  benchBlitCalls = 0;
+  const int64_t wallStart = esp_timer_get_time();
+
+  while (frames < maxFrames) {
+    const int64_t frameStart = esp_timer_get_time();
+
+    size_t used = 0;
+    const int64_t r0 = esp_timer_get_time();
+    const auto result = reader.next(f, jpegBuffer, MAX_JPEG, used);
+    const uint32_t rUs = uint32_t(esp_timer_get_time() - r0);
+    if (result != playback::FrameResult::Ready)
+      break; // fim do arquivo ou fluxo invalido
+    readUs += rUs;
+    maxReadUs = max(maxReadUs, rUs);
+    totalBytes += used;
+
+    const int64_t d0 = esp_timer_get_time();
+    if (!jpeg.openRAM(jpegBuffer, used, jpegDraw)) {
+      ++errors;
+      continue;
+    }
+    w = jpeg.getWidth();
+    h = jpeg.getHeight();
+    if (w < 1 || h < 1 || w > CRT_W || h > CRT_H) {
+      jpeg.close();
+      ++errors;
+      continue;
+    }
+    videoWidth = w; // o jpegDraw centraliza a partir destes
+    videoHeight = h;
+    jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+    const bool ok = jpeg.decode(0, 0, 0);
+    jpeg.close();
+    const uint32_t dUs = uint32_t(esp_timer_get_time() - d0);
+    if (!ok) {
+      ++errors;
+      continue;
+    }
+    decodeUs += dUs;
+    maxDecodeUs = max(maxDecodeUs, dUs);
+    maxTotalUs = max(maxTotalUs, uint32_t(esp_timer_get_time() - frameStart));
+    ++frames;
+
+    // O cão de guarda precisa respirar num laço apertado e sem delay.
+    if ((frames & 0x0F) == 0)
+      vTaskDelay(1);
+  }
+
+  const uint64_t wallUs = uint64_t(esp_timer_get_time() - wallStart);
+  benchActive = false;
+  f.close();
+
+  if (!frames) {
+    Serial.printf("[BENCH] nenhum quadro decodificado (erros:%lu)\n", errors);
+    return;
+  }
+
+  // O blit é cronometrado dentro do jpegDraw, que roda durante o decode, então
+  // o tempo de JPEGDEC puro é a diferença entre os dois.
+  const uint64_t blitUs = benchBlitUs;
+  const uint64_t pureDecodeUs = decodeUs > blitUs ? decodeUs - blitUs : 0;
+  const uint32_t avgRead = uint32_t(readUs / frames);
+  const uint32_t avgDecode = uint32_t(pureDecodeUs / frames);
+  const uint32_t avgBlit = uint32_t(blitUs / frames);
+  const uint32_t avgTotal = uint32_t(wallUs / frames);
+  const float sustainedFps = avgTotal ? 1000000.0f / avgTotal : 0.0f;
+  const float peakFps = maxTotalUs ? 1000000.0f / maxTotalUs : 0.0f;
+  const float mibPerS = wallUs ? (float)totalBytes / (float)wallUs : 0.0f; // bytes/us == MB/s
+
+  Serial.println("[BENCH] ----------------------------------------");
+  Serial.printf("[BENCH] pasta          : %s\n", dir.c_str());
+  Serial.printf("[BENCH] resolucao      : %dx%d   fps do meta.json: %.2f\n", w, h, metaFps);
+  Serial.printf("[BENCH] quadros        : %lu   erros: %lu   bytes: %llu\n", frames, errors,
+                (unsigned long long)totalBytes);
+  Serial.printf("[BENCH] leitura SD     : medio %lu us   maximo %lu us   %.2f MB/s\n", avgRead,
+                maxReadUs, mibPerS);
+  Serial.printf("[BENCH] decode JPEG    : medio %lu us   maximo %lu us\n", avgDecode, maxDecodeUs);
+  Serial.printf("[BENCH] blit CVBS      : medio %lu us   (%lu blocos)\n", avgBlit, benchBlitCalls);
+  Serial.printf("[BENCH] quadro inteiro : medio %lu us   pior caso %lu us\n", avgTotal, maxTotalUs);
+  Serial.printf("[BENCH] FPS sustentado : %.1f   pior caso %.1f\n", sustainedFps, peakFps);
+  // O NTSC entrega 59,94 campos/s; acima disso a TV nao tem como mostrar.
+  const float ceiling = min(sustainedFps, 59.94f);
+  Serial.printf("[BENCH] teto util      : %.1f fps (limitado por %s)\n", ceiling,
+                sustainedFps < 59.94f ? "decodificacao/cartao" : "taxa de campo do NTSC");
+  if (sustainedFps < metaFps)
+    Serial.printf("[BENCH] ATENCAO: abaixo dos %.2f fps do meta.json; havera descarte de quadros\n",
+                  metaFps);
+  Serial.println("[BENCH] ----------------------------------------");
+
+  rca.fillScreen(TFT_BLACK);
+  videoFrameIndex = 0;
 }
 
 bool startProgram(const String &dir) {
@@ -3071,6 +3231,33 @@ void serviceDiagnostics() {
     }
     if (command == "diag colors") {
       testPixelColors();
+      continue;
+    }
+    if (command == "diag bench" || command.startsWith("diag bench ")) {
+      // "diag bench" mede o programa selecionado na biblioteca; com argumento,
+      // mede a pasta indicada. O segundo argumento limita a contagem de quadros
+      // (padrao 150, o bastante para a media estabilizar sem prender o aparelho).
+      String arg = command.length() > 11 ? command.substring(11) : String();
+      arg.trim();
+      uint32_t limit = 150;
+      const int sp = arg.lastIndexOf(' ');
+      if (sp > 0) {
+        const long n = arg.substring(sp + 1).toInt();
+        if (n > 0) {
+          limit = uint32_t(n);
+          arg = arg.substring(0, sp);
+          arg.trim();
+        }
+      } else if (arg.length() && arg.toInt() > 0) {
+        limit = uint32_t(arg.toInt());
+        arg = "";
+      }
+      String dir = arg.length() ? normalizeSdPath(arg) : libraryProgramAt(librarySelection);
+      if (!dir.length())
+        Serial.println("[BENCH] nenhum programa selecionado; use: diag bench /M5RETRO/videos/<pasta>");
+      else
+        runVideoBenchmark(dir, limit);
+      memset(line, 0, sizeof(line));
       continue;
     }
     if (command == "diag backlight") {

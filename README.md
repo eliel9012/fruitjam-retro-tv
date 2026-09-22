@@ -201,10 +201,36 @@ de teste físico. `PINOUT.md` descreve as conexões utilizadas pelo código.
 ## Diagnóstico USB
 
 Serial a 115200 baud: `diag status`, `diag colors`, `diag play`, `diag pause`, `diag resume`,
-`diag stop`, `diag back`, `diag home`, `diag radar`, `diag weather`, `diag music` e
-`diag audio toggle`. O último comando usa
+`diag stop`, `diag back`, `diag home`, `diag radar`, `diag weather`, `diag music`,
+`diag bench` e `diag audio toggle`. O último comando usa
 a mesma rotina do botão do player. O status informa saída de áudio, erros, amostras PCM,
 quadros descartados, heap e resultado HTTP, sem imprimir credenciais.
+
+### Benchmark de vídeo
+
+`diag bench` mede, no próprio aparelho, até onde o Core2 sustenta a saída
+composta. Mede as três etapas separadamente em microssegundos, rodando o mais
+rápido possível, sem cadência de áudio e sem descarte de quadros:
+
+```text
+diag bench                                  # programa selecionado, 150 quadros
+diag bench 400                              # programa selecionado, 400 quadros
+diag bench /M5RETRO/videos/meu-filme        # pasta indicada
+diag bench /M5RETRO/videos/meu-filme 400    # pasta indicada, 400 quadros
+```
+
+O relatório traz leitura do cartão (média, pior caso e MB/s), decodificação
+JPEG já descontado o blit, blit no framebuffer CVBS, tempo do quadro inteiro e
+o FPS sustentado. Para comparar resoluções, prepare a mesma mídia em `240x160`
+e em `320x240` e rode o comando nas duas pastas.
+
+O teto de qualidade da RCA não é do aparelho, é do sinal: o NTSC entrega 59,94
+campos por segundo e a luminância tem cerca de 4,2 MHz de banda, o equivalente a
+~330 pontos por linha. Acima de **320×240 a 30 quadros/s** não há detalhe a
+ganhar num tubo — só trabalho a mais. Em 640×480 o framebuffer passaria de
+307 KiB, não caberia na SRAM interna do ESP32 e teria de ir para a PSRAM, que é
+lenta demais para o prazo por linha de varredura. O benchmark serve para saber
+se o Core2 alcança esse teto com a sua mídia, não para ultrapassá-lo.
 
 O teste de cores confere o caminho RGB565 nativo usado pelos blocos JPEG. A conferência visual
 da imagem e a medição das saídas RCA exigem observação/conexão física.
