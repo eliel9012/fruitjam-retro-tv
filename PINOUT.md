@@ -4,7 +4,7 @@ Alvo: M5Stack Core2 ESP32, com Module13.2 RCA M125 empilhado no M5-Bus.
 
 | Uso | GPIO | Observação |
 |---|---:|---|
-| Vídeo composto PAL-M | 26 | Seletor físico do M125 em GPIO26; periférico I2S0 |
+| Vídeo composto NTSC | 26 | Seletor físico do M125 em GPIO26; periférico I2S0 |
 | RCA PCM5102 BCK | 19 | Reservado ao áudio do módulo |
 | RCA PCM5102 DATA | 2 | Compartilhado com áudio interno |
 | RCA PCM5102 LRCK | 0 | Compartilhado com áudio interno |

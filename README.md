@@ -1,6 +1,6 @@
 # M5 RETRO TV — Core2 + Module13.2 RCA M125
 
-Firmware Arduino/ESP32 para reprodução de MJPEG + WAV no cartão microSD, saída composta PAL-M,
+Firmware Arduino/ESP32 para reprodução de MJPEG + WAV no cartão microSD, saída composta NTSC,
 pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em português.
 
 ## Estrutura do repositório
@@ -10,7 +10,7 @@ pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em p
   ele mostra um pôster estático + um HUD de 1 Hz (tempo e barra de progresso) via um
   `LGFX_Sprite` minúsculo. O vídeo sai somente pela RCA.
 - `weather/`: firmware alternativo, projeto PlatformIO separado — clone do
-  "The Weather Channel Local Forecast" (wttr.in + ticker + smooth jazz em loop).
+  "The Weather Channel Local Forecast" (Open-Meteo + ticker + smooth jazz em loop).
   Consulte `weather/README.md`.
 
 ## Telas
@@ -34,6 +34,24 @@ pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em p
 | Música | Now Playing (capa + ID3) |
 |---|---|
 | ![Music](docs/screens/music.png) | ![Music Playing](docs/screens/music_playing.png) |
+
+## Saída composta (RCA)
+
+O sinal é **NTSC** (525 linhas, 59,94 Hz, preto em 7,5 IRE). O modo `PAL_M` do
+M5GFX foi abandonado porque a tabela de sinal dele monta a linha com 908
+amostras, enquanto 4 × 3,57561149 MHz × 63,5556 µs dá 909,02: a linha sai ~0,11%
+curta, a fase da burst de cor anda a cada linha e o resultado na TV é uma faixa
+de cor diagonal caminhando pela tela. A tabela NTSC usa 910 amostras, valor
+exato para 4 × 3,579545 MHz, então a burst fica estável. TVs brasileiras de tubo
+com entrada de vídeo composto aceitam NTSC.
+
+Todo o texto, régua e faixa desenhados na RCA ficam dentro da **área segura**
+(`SAFE_*` em `src/main.cpp`): margem de 24 px na horizontal e 18 px na vertical,
+ou seja ~7% de cada borda, que é o que um tubo tipicamente esconde por overscan.
+O fundo continua preenchendo o raster inteiro, então não aparecem tarjas pretas.
+Vídeos continuam sendo centralizados no quadro de 320×240; num tubo as bordas
+externas desse quadro caem no overscan, então mídia acima de ~272×204 perde as
+extremidades na tela — o padrão de 240×160 do conversor cabe inteiro.
 
 ## Compilar
 
@@ -177,16 +195,76 @@ Os testes nativos usam um compilador C++ com AddressSanitizer/UndefinedBehaviorS
 sintéticos temporários, testa áudio e silêncio, lê os contêineres e decodifica os quadros com a
 mesma JPEGDEC fixada no firmware. Não mede FPS nem valida saída analógica do Core2.
 
+`AGENTS.md` descreve a arquitetura do firmware, as restrições de hardware que não
+são negociáveis e as armadilhas já conhecidas — é o ponto de partida para quem
+(ou o que) for mexer no código.
+
 Consulte `PLANO_E_REVISAO.md` para os problemas encontrados, as etapas executadas e o roteiro
 de teste físico. `PINOUT.md` descreve as conexões utilizadas pelo código.
 
 ## Diagnóstico USB
 
 Serial a 115200 baud: `diag status`, `diag colors`, `diag play`, `diag pause`, `diag resume`,
-`diag stop`, `diag back`, `diag home`, `diag radar`, `diag weather`, `diag music` e
-`diag audio toggle`. O último comando usa
+`diag stop`, `diag back`, `diag home`, `diag radar`, `diag weather`, `diag music`,
+`diag bench` e `diag audio toggle`. O último comando usa
 a mesma rotina do botão do player. O status informa saída de áudio, erros, amostras PCM,
 quadros descartados, heap e resultado HTTP, sem imprimir credenciais.
+
+### Benchmark de vídeo
+
+`diag bench` mede, no próprio aparelho, até onde o Core2 sustenta a saída
+composta. Mede as três etapas separadamente em microssegundos, rodando o mais
+rápido possível, sem cadência de áudio e sem descarte de quadros:
+
+```text
+diag bench                                  # programa selecionado, 150 quadros
+diag bench 400                              # programa selecionado, 400 quadros
+diag bench /M5RETRO/videos/meu-filme        # pasta indicada
+diag bench /M5RETRO/videos/meu-filme 400    # pasta indicada, 400 quadros
+```
+
+O relatório traz leitura do cartão (média, pior caso e MB/s), decodificação
+JPEG já descontado o blit, blit no framebuffer CVBS, tempo do quadro inteiro e
+o FPS sustentado. Para comparar resoluções, prepare a mesma mídia em `240x160`
+e em `320x240` e rode o comando nas duas pastas.
+
+O teto de qualidade da RCA não é do aparelho, é do sinal: o NTSC entrega 59,94
+campos por segundo e a luminância tem cerca de 4,2 MHz de banda, o equivalente a
+~330 pontos por linha. Acima de **320×240 a 30 quadros/s** não há detalhe a
+ganhar num tubo — só trabalho a mais. Em 640×480 o framebuffer passaria de
+307 KiB, não caberia na SRAM interna do ESP32 e teria de ir para a PSRAM, que é
+lenta demais para o prazo por linha de varredura. O benchmark serve para saber
+se o Core2 alcança esse teto com a sua mídia, não para ultrapassá-lo.
+
+### OSD do player e tela de previsão
+
+O OSD do player imita o de um videocassete Sony/Semp dos anos 90: texto flutua
+sobre a imagem sem tarja de fundo, com contorno preto por glifo, símbolo de
+transporte desenhado como forma (nunca a palavra "PLAY") e contador de fita em
+dígitos grandes. A tipografia é a `include/VcrFont.h`, uma fonte bitmap 12x16 de
+traço constante de 2 px: as fontes do M5GFX têm traço de 1 px e somem no borrão
+horizontal do NTSC. A fonte é ASCII (sem acentos, como os geradores de caractere
+da época); todo texto passa por `ascii::normalizeUpper` antes de ser desenhado.
+
+A tela de previsão alterna duas páginas a cada 10 s — condições atuais e previsão
+de três dias — com as transições do Weather Star 4000: cortina vertical quando
+chegam dados novos e deslizamento horizontal na troca de página
+(`include/ScreenFx.h`). Os esmaecimentos usam dithering ordenado de Bayer, não
+mistura por alfa: o framebuffer composto não tem canal alfa e não há folga de
+SRAM para dois quadros inteiros. Os ícones de condição (`include/WeatherIcons.h`)
+são escolhidos pelo código WMO da Open-Meteo, não pelo texto.
+
+### Orçamento de memória
+
+O recurso apertado **não é a PSRAM** — é a SRAM interna. O framebuffer do vídeo
+composto ocupa 320x240 a 16 bits = **153.600 bytes de SRAM**, e o `M5ModuleRCA`
+é construído com `psram_no_use` de propósito: a PSRAM é lenta demais para o
+prazo por linha de varredura do NTSC. Mover o framebuffer para lá liberaria
+150 KB e quebraria o vídeo.
+
+Da PSRAM (4,5 MB) saem o buffer de JPEG (`MAX_JPEG`, 128 KiB), os buffers do
+TLS e os sprites de capa e do HUD — menos de 3% do total. Não há o que economizar
+ali, e economizar não renderia nada.
 
 O teste de cores confere o caminho RGB565 nativo usado pelos blocos JPEG. A conferência visual
 da imagem e a medição das saídas RCA exigem observação/conexão física.

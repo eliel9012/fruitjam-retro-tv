@@ -1,6 +1,6 @@
 // ============================================================================
 //  The Weather Channel — Local Forecast (clone anos 80)
-//  M5Stack Core2 + módulo RCA (M125) — vídeo composto + áudio I2S
+//  M5Stack Core2 + módulo RCA (M125) — vídeo composto NTSC + áudio I2S
 //
 //  PINOS DO I2S (áudio do RCA) :
 //      BCK  = GPIO 19
@@ -13,7 +13,7 @@
 //                               (PCM 16-bit estéreo 22050 Hz — já confirmado)
 //
 //  WI-FI (TODO: preencher)    : WIFI_SSID / WIFI_PASS abaixo
-//  LOCALIDADE                 : Franca - SP (gerada via wttr.in/Franca?format=j1)
+//  LOCALIDADE                 : Franca - SP (Open-Meteo, API pública sem chave)
 //
 //  OBSERVAÇÃO DE HARDWARE: o cartão TF do Core2 usa o barramento VSPI
 //  (SCK=18, MISO=38, MOSI=23, CS=4). O GPIO 19 NÃO pode ser usado no SPI
@@ -49,8 +49,14 @@
 #define WIFI_SSID "..."   // TODO: preencher SSID
 #define WIFI_PASS "..."   // TODO: preencher senha
 
-// Localidade fixa (wttr.in aceita "Franca", resolvida como Franca - SP).
-static const char *WEATHER_URL = "https://wttr.in/Franca?format=j1";
+// Localidade fixa: Franca - SP. Fonte: Open-Meteo (api.open-meteo.com), API
+// pública, sem cadastro nem chave. Substituiu o wttr.in, cujo j1 devolve ~39 KB
+// e estourava a RAM/buffer do ESP32; esta resposta tem ~800 bytes.
+static const char *WEATHER_URL =
+    "https://api.open-meteo.com/v1/forecast?latitude=-20.5386&longitude=-47.4008"
+    "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,"
+    "wind_direction_10m&daily=weather_code,temperature_2m_max,temperature_2m_min"
+    "&timezone=America%2FSao_Paulo&forecast_days=3";
 
 // ---- Áudio (I2S1) ----
 static constexpr uint8_t RCA_BCK  = 19;   // BCK do RCA (I2S1)
@@ -70,13 +76,23 @@ static constexpr uint8_t SD_MOSI = 23;
 
 // ---- Dimensões e cadências ----
 static constexpr int CRT_W = 320, CRT_H = 240;
+// Área segura do tubo: uma TV CRT corta cerca de 7% de cada borda (overscan),
+// então o raster inteiro nunca aparece. Era isso que cortava o cabeçalho e o
+// ticker no aparelho. O fundo continua sangrando até a borda; texto, linhas e
+// faixas ficam dentro desta caixa.
+static constexpr int SAFE_X = 24, SAFE_Y = 18;
+static constexpr int SAFE_L = SAFE_X;          // 24
+static constexpr int SAFE_T = SAFE_Y;          // 18
+static constexpr int SAFE_R = CRT_W - SAFE_X;  // 296
+static constexpr int SAFE_B = CRT_H - SAFE_Y;  // 222
+static constexpr int SAFE_W = SAFE_R - SAFE_L; // 272
 static constexpr size_t AUDIO_CHUNK = 1024;          // bytes por bloco PCM
 static constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL; // 10 min
 static constexpr uint32_t WEATHER_RETRY_MS = 30UL * 1000UL;          // retenta falha
 static constexpr uint32_t TICKER_INTERVAL_MS = 33;  // ~30 fps para o ticker
 static constexpr int TICKER_STEP = 2;               // desloca 2 px por tick
 static constexpr int TICKER_H = 16;                 // altura da fonte Font2
-static constexpr int TICKER_Y = CRT_H - TICKER_H;   // 224
+static constexpr int TICKER_Y = SAFE_B - TICKER_H;  // 206
 
 // ----------------------------------------------------------------------------
 //  Rotinas de WAV (reaproveitadas do padrão já validado em PlaybackIO.h,
@@ -155,7 +171,12 @@ inline void scalePcm(int16_t *samples, size_t count, int volume) {
 //  Estado compartilhado
 // ----------------------------------------------------------------------------
 
-M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::PAL_M,
+// NTSC (525/59,94 Hz, preto em 7,5 IRE). O modo PAL_M do M5GFX monta a linha
+// com 908 amostras, mas 4x3,57561149 MHz x 63,5556 us dá 909,02 — a linha sai
+// ~0,11% curta e a fase da burst anda a cada linha, produzindo a faixa de cor
+// diagonal que caminha pela tela. A tabela NTSC usa 910 amostras, valor exato
+// para 4x3,579545 MHz, então a burst fica estável.
+M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::NTSC,
                 M5ModuleRCA::use_psram_t::psram_no_use, CVBS_PIN, 200);
 LGFX_Sprite ticker(&rca);
 
@@ -213,7 +234,7 @@ uint32_t lastTickerMs = 0;
 static const char TICKER_GAP[] = "      ";
 
 // ----------------------------------------------------------------------------
-//  Helpers de texto (fontes bitmap são ASCII-only; wttr.in pode mandar emoji)
+//  Helpers de texto (as fontes bitmap são ASCII-only)
 // ----------------------------------------------------------------------------
 
 static void asciiCopy(char *dst, size_t cap, const char *src) {
@@ -254,58 +275,77 @@ static const char *weekdayPt(int wd) {
 }
 
 // ----------------------------------------------------------------------------
-//  Consulta HTTP (wttr.in) + parse com filtro do ArduinoJson 7
+//  Consulta HTTP (Open-Meteo) + parse com ArduinoJson 7
 // ----------------------------------------------------------------------------
 
-static bool parseWeather(JsonDocument &doc, WeatherData &out) {
-  JsonArray cc = doc["current_condition"];
-  if (cc.isNull() || cc.size() == 0)
-    return false;
-  JsonObject c = cc[0];
-  if (c.isNull())
-    return false;
-
-  out.tempC = c["temp_C"] | 0;
-  out.humidity = c["humidity"] | 0;
-  out.windKmph = c["windspeedKmph"] | 0;
-  asciiCopy(out.cond, sizeof(out.cond), c["weatherDesc"][0]["value"] | "");
-  asciiCopy(out.windDir, sizeof(out.windDir), c["winddir16Point"] | "");
-  asciiUpper(out.cond);
-  asciiUpper(out.windDir);
-
-  JsonArray days = doc["weather"];
-  if (days.isNull() || days.size() < 3)
-    return false;
-  for (int i = 0; i < 3; ++i) {
-    JsonObject d = days[i];
-    if (d.isNull())
-      return false;
-    DayForecast &f = out.days[i];
-    const char *iso = d["date"] | "";
-    int wd = weekdayFromIso(iso);
-    snprintf(f.name, sizeof(f.name), "%s", weekdayPt(wd));
-    f.maxC = d["maxtempC"] | 0;
-    f.minC = d["mintempC"] | 0;
-    asciiCopy(f.cond, sizeof(f.cond),
-              d["hourly"][0]["weatherDesc"][0]["value"] | "");
-    asciiUpper(f.cond);
+// Código WMO (ww) do Open-Meteo -> condição em português, já em ASCII maiúsculo.
+static const char *wmoConditionPt(int code) {
+  switch (code) {
+  case 0: return "CEU LIMPO";
+  case 1: return "POUCAS NUVENS";
+  case 2: return "PARCIAL NUBLADO";
+  case 3: return "NUBLADO";
+  case 45: case 48: return "NEVOEIRO";
+  case 51: return "GAROA FRACA";
+  case 53: return "GAROA";
+  case 55: return "GAROA FORTE";
+  case 56: case 57: return "GAROA CONGELANTE";
+  case 61: return "CHUVA FRACA";
+  case 63: return "CHUVA";
+  case 65: return "CHUVA FORTE";
+  case 66: case 67: return "CHUVA CONGELANTE";
+  case 71: return "NEVE FRACA";
+  case 73: return "NEVE";
+  case 75: return "NEVE FORTE";
+  case 77: return "GRAOS DE NEVE";
+  case 80: return "PANCADAS FRACAS";
+  case 81: return "PANCADAS DE CHUVA";
+  case 82: return "PANCADAS FORTES";
+  case 85: case 86: return "PANCADAS DE NEVE";
+  case 95: return "TROVOADA";
+  case 96: case 99: return "TROVOADA C/ GRANIZO";
+  default: return "INDISPONIVEL";
   }
-  return true;
 }
 
-// Constrói o filtro que extrai SOMENTE os campos necessários do j1 completo.
-static void buildWeatherFilter(JsonDocument &filter) {
-  filter["current_condition"][0]["temp_C"] = true;
-  filter["current_condition"][0]["humidity"] = true;
-  filter["current_condition"][0]["weatherDesc"][0]["value"] = true;
-  filter["current_condition"][0]["windspeedKmph"] = true;
-  filter["current_condition"][0]["winddir16Point"] = true;
+// Direção do vento em graus -> rosa de 16 pontos em português (L = leste).
+static const char *windDirPt(float deg) {
+  static const char *P[16] = {"N",  "NNE", "NE", "ENE", "L",  "ESE", "SE", "SSE",
+                              "S",  "SSO", "SO", "OSO", "O",  "ONO", "NO", "NNO"};
+  if (!(deg >= 0.0f))
+    deg = 0.0f;
+  int i = (int)((deg + 11.25f) / 22.5f) % 16;
+  return P[i];
+}
+
+static bool parseWeather(JsonDocument &doc, WeatherData &out) {
+  JsonObject cur = doc["current"];
+  if (cur.isNull() || !cur["temperature_2m"].is<float>())
+    return false;
+  out.tempC = (int)lroundf(cur["temperature_2m"] | 0.0f);
+  out.humidity = (int)lroundf(cur["relative_humidity_2m"] | 0.0f);
+  out.windKmph = (int)lroundf(cur["wind_speed_10m"] | 0.0f);
+  snprintf(out.cond, sizeof(out.cond), "%s", wmoConditionPt(cur["weather_code"] | -1));
+  snprintf(out.windDir, sizeof(out.windDir), "%s",
+           windDirPt(cur["wind_direction_10m"] | 0.0f));
+
+  JsonObject daily = doc["daily"];
+  if (daily.isNull())
+    return false;
+  JsonArray date = daily["time"], code = daily["weather_code"],
+            tmax = daily["temperature_2m_max"], tmin = daily["temperature_2m_min"];
+  if (date.isNull() || tmax.isNull() || tmin.isNull() || date.size() < 3 ||
+      tmax.size() < 3 || tmin.size() < 3)
+    return false;
   for (int i = 0; i < 3; ++i) {
-    filter["weather"][i]["date"] = true;
-    filter["weather"][i]["maxtempC"] = true;
-    filter["weather"][i]["mintempC"] = true;
-    filter["weather"][i]["hourly"][0]["weatherDesc"][0]["value"] = true;
+    DayForecast &f = out.days[i];
+    snprintf(f.name, sizeof(f.name), "%s", weekdayPt(weekdayFromIso(date[i] | "")));
+    f.maxC = (int)lroundf(tmax[i] | 0.0f);
+    f.minC = (int)lroundf(tmin[i] | 0.0f);
+    snprintf(f.cond, sizeof(f.cond), "%s",
+             wmoConditionPt(code.isNull() ? -1 : (code[i] | -1)));
   }
+  return true;
 }
 
 static bool fetchWeather(WeatherData &out) {
@@ -321,14 +361,52 @@ static bool fetchWeather(WeatherData &out) {
   if (http.begin(client, WEATHER_URL)) {
     int code = http.GET();
     if (code == HTTP_CODE_OK) {
-      JsonDocument filter;
-      buildWeatherFilter(filter);
-      JsonDocument doc;
-      DeserializationError err = deserializeJson(
-          doc, http.getStream(), DeserializationOption::Filter(filter),
-          DeserializationOption::NestingLimit(8));
-      if (!err)
-        ok = parseWeather(doc, out);
+      // ~800 bytes: lê tudo para um buffer contíguo (o leitor Stream do
+      // ArduinoJson 7.4.2 descarta escalares no ESP32) e rejeita corpo
+      // truncado em vez de publicar dados pela metade.
+      // O buffer fica na PSRAM, não na pilha: esta função roda na tarefa
+      // WEATHER_HTTP, que tem 8 KB de pilha e ainda precisa acomodar os quadros
+      // do HTTPClient e do mbedTLS. 4 KB de array local comiam metade dela.
+      constexpr int cap = 4096;
+      char *buf = (char *)ps_malloc(cap);
+      if (!buf) {
+        Serial.println("[WEATHER] sem memoria para a resposta");
+        http.end();
+        return false;
+      }
+      size_t len = 0;
+      uint32_t quiet = 0;
+      Stream &st = http.getStream();
+      while (len < cap - 1 && quiet < 3000) {
+        int avail = st.available();
+        if (avail > 0) {
+          int n = st.readBytes(buf + len, min(avail, cap - 1 - (int)len));
+          if (n <= 0)
+            break;
+          len += n;
+          quiet = 0;
+        } else if (!http.connected()) {
+          break;
+        } else {
+          delay(5);
+          quiet += 5;
+        }
+      }
+      buf[len] = 0;
+      if (len >= cap - 1) {
+        Serial.println("[WEATHER] resposta maior que o buffer");
+      } else if (len) {
+        JsonDocument doc;
+        DeserializationError err =
+            deserializeJson(doc, buf, DeserializationOption::NestingLimit(8));
+        if (!err)
+          ok = parseWeather(doc, out);
+        else
+          Serial.printf("[WEATHER] parse %s (%u bytes)\n", err.c_str(), (unsigned)len);
+      } else {
+        Serial.println("[WEATHER] corpo vazio");
+      }
+      free(buf);
     } else {
       Serial.printf("[WEATHER] HTTP %d\n", code);
     }
@@ -374,14 +452,14 @@ static void pollWeather() {
     return;
   }
   const uint32_t now = millis();
-  if (weatherValid.load()) {
-    if (now - lastWeatherGood < WEATHER_REFRESH_MS)
-      return;   // cadência normal de 10 minutos
-  } else {
-    // Primeira consulta (ou falhas consecutivas): evita retry em loop apertado.
-    if (lastWeatherAttempt != 0 && now - lastWeatherAttempt < WEATHER_RETRY_MS)
-      return;
-  }
+  // O backoff vale para toda tentativa, não só antes da primeira que der certo.
+  // Antes, com dados já em mãos, o único portão era lastWeatherGood: se a
+  // consulta falhasse ele não avançava, a condição seguia falsa e cada loop()
+  // criava outra tarefa HTTP de 8 KB — dezenas por segundo com o roteador fora.
+  if (lastWeatherAttempt != 0 && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+    return;
+  if (weatherValid.load() && now - lastWeatherGood < WEATHER_REFRESH_MS)
+    return;   // cadência normal de 10 minutos
   lastWeatherAttempt = now;
   weatherBusy.store(true);
   int next = 1 - weatherActive.load();   // buffer oposto ao exibido
@@ -560,13 +638,14 @@ static void drawScreen() {
   rca.startWrite();
   rca.fillScreen(TFT_NAVY);
 
-  // Cabeçalho (amarelo, tipo teletexto)
+  // Cabeçalho (amarelo, tipo teletexto). Tudo dentro da área segura: antes o
+  // título ficava em y=6 e o ticker em y=224, ambos dentro do overscan da TV.
   rca.setFont(&fonts::Font4);
   rca.setTextDatum(top_center);
   rca.setTextColor(TFT_YELLOW, TFT_NAVY);
   rca.setTextSize(1);
-  rca.drawString("FRANCA - SP", CRT_W / 2, 6);
-  rca.drawFastHLine(8, 42, CRT_W - 16, TFT_CYAN);
+  rca.drawString("FRANCA - SP", CRT_W / 2, SAFE_T);
+  rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
 
   if (weatherValid.load()) {
     const WeatherData &w = weatherShadows[weatherActive.load()];
@@ -576,31 +655,31 @@ static void drawScreen() {
     rca.setFont(&fonts::Font4);
     rca.setTextSize(1);
     rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    rca.drawString(w.cond, CRT_W / 2, 54);
+    rca.drawString(w.cond, CRT_W / 2, SAFE_T + 40);
 
     // Temperatura grande
     snprintf(buf, sizeof(buf), "%d C", w.tempC);
     rca.setTextSize(2);
     rca.setTextColor(TFT_YELLOW, TFT_NAVY);
-    rca.drawString(buf, CRT_W / 2, 104);
+    rca.drawString(buf, CRT_W / 2, SAFE_T + 76);
 
     // Umidade + vento (fonte menor: Font2)
     rca.setFont(&fonts::Font2);
     rca.setTextSize(1);
     rca.setTextColor(TFT_WHITE, TFT_NAVY);
     snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
-    rca.drawString(buf, CRT_W / 2, 178);
+    rca.drawString(buf, CRT_W / 2, SAFE_T + 138);
     snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
-    rca.drawString(buf, CRT_W / 2, 198);
+    rca.drawString(buf, CRT_W / 2, SAFE_T + 158);
   } else {
     rca.setFont(&fonts::Font4);
     rca.setTextSize(1);
     rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    rca.drawString(weatherStatus, CRT_W / 2, 104);
+    rca.drawString(weatherStatus, CRT_W / 2, SAFE_T + 86);
   }
 
   // Faixa do ticker (rodapé)
-  rca.drawFastHLine(8, TICKER_Y - 2, CRT_W - 16, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
   rca.fillRect(0, TICKER_Y, CRT_W, TICKER_H, TFT_BLACK);
   rca.endWrite();
 
@@ -608,7 +687,7 @@ static void drawScreen() {
 }
 
 static void drawTicker() {
-  if (tickerOffsetPx >= tickerWrapAt)
+  if (tickerWrapAt > 0 && tickerOffsetPx >= tickerWrapAt)
     tickerOffsetPx -= tickerWrapAt;
 
   // Desenha no sprite (buffer offline), então copia para a tela sem flicker.
@@ -653,7 +732,7 @@ void setup() {
 
   // Vídeo composto (CVBS, I2S0 reservado ao DAC do painel).
   if (!rca.init()) {
-    Serial.println("[WEATHER] falha ao iniciar PAL-M (CVBS)");
+    Serial.println("[WEATHER] falha ao iniciar NTSC (CVBS)");
     for (;;)
       delay(1000);
   }
@@ -709,7 +788,7 @@ void setup() {
   if (audioFailed)
     fatal("FALHA AUDIO", "sem memoria DMA");
 
-  Serial.println("[WEATHER] Local Forecast iniciado (PAL-M + RCA audio)");
+  Serial.println("[WEATHER] Local Forecast iniciado (NTSC + RCA audio)");
 }
 
 void loop() {

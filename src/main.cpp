@@ -11,6 +11,11 @@
 #include <M5Unified.h>
 #include <M5GFX.h>
 #include <M5ModuleRCA.h>
+
+#include "SafeArea.h"
+#include "VcrOsd.h"
+#include "WeatherIcons.h"
+#include "ScreenFx.h"
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -126,12 +131,20 @@ static constexpr uint8_t SD_MISO = 38;
 static constexpr uint8_t SD_MOSI = 23;
 static constexpr size_t MAX_JPEG = 128 * 1024;
 static constexpr size_t AUDIO_CHUNK = 1024;
-static constexpr int CRT_W = 320, CRT_H = 240;
+// Geometria da saída composta: quadro, área segura do tubo e faixas padrão.
+// Definições em include/SafeArea.h, compartilhadas com o simulador de telas.
+static constexpr int CRT_W = crt::W, CRT_H = crt::H;
+static constexpr int SAFE_L = crt::SAFE_L, SAFE_T = crt::SAFE_T;
+static constexpr int SAFE_R = crt::SAFE_R, SAFE_B = crt::SAFE_B;
+static constexpr int SAFE_W = crt::SAFE_W;
+static constexpr int HEAD_Y = crt::HEAD_Y, HEAD_RULE_Y = crt::HEAD_RULE_Y;
+static constexpr int BODY_Y = crt::BODY_Y;
+static constexpr int BAR_H = crt::BAR_H, BAR_Y = crt::BAR_Y;
 // Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
 // 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
 static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
 // Weather Channel: faixa do ticker e cadências de consulta.
-static constexpr int TICKER_H = 16, TICKER_Y = 240 - 16;
+static constexpr int TICKER_H = crt::TICKER_H, TICKER_Y = crt::TICKER_Y;
 static constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
 static constexpr uint32_t WEATHER_RETRY_MS = 30UL * 1000UL;
 static const char *WEATHER_MUSIC = "/M5RETRO/weather_music.wav";
@@ -145,7 +158,12 @@ const char *CA_FILE = "/M5RETRO/config/ca.pem";
 const char *CACHE_FILE = "/M5RETRO/cache/aircraft.json";
 const char *MUSIC_ROOT = "/M5RETRO/music";
 
-M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::PAL_M,
+// NTSC (525/59,94 Hz, preto em 7,5 IRE). O modo PAL_M do M5GFX monta a linha
+// com 908 amostras, mas 4x3,57561149 MHz x 63,5556 us dá 909,02 — a linha sai
+// ~0,11% curta e a fase da burst anda a cada linha, o que produz a faixa de cor
+// diagonal que caminha pela tela. A tabela NTSC usa 910 amostras, que é o valor
+// exato para 4x3,579545 MHz, então a burst fica estável.
+M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::NTSC,
                 M5ModuleRCA::use_psram_t::psram_no_use, CVBS_PIN, 200);
 JPEGDEC jpeg;
 playback::MjpegReader mjpegReader;
@@ -169,6 +187,22 @@ std::atomic<uint32_t> samplesPlayed{0};
 std::atomic<bool> playing{false}, paused{false}, playbackFinished{false};
 std::atomic<AudioOutput> audioOutput{AudioOutput::RCA};
 uint32_t videoFrameIndex = 0, decodedFrames = 0, renderedFrames = 0, droppedFrames = 0, jpegErrors = 0;
+// Instrumentação do "diag bench". Fora do benchmark benchActive é falso e o
+// jpegDraw não paga nada além de um teste de bool por bloco de MCU.
+bool benchActive = false;
+// Tamanho do último JPEG decodificado, que continua inteiro no jpegBuffer. Com o
+// vídeo pausado é daí que o OSD restaura a imagem que fica atrás dele.
+size_t lastJpegUsed = 0;
+// Sequência monotônica de quadros efetivamente desenhados. O videoFrameIndex não
+// serve para o OSD: ele avança também nos quadros descartados sem render, então
+// o OSD acreditava ter imagem nova embaixo e pintava contador sobre contador.
+uint32_t renderedSeq = 0;
+// true enquanto o vídeo está atrasado em relação ao relógio de PCM. Só nesse
+// caso o loop encurta a soneca: dormir menos sempre quadruplicaria o polling
+// I2C do touch feito por M5.update() sem ganho nenhum.
+bool videoBehind = false;
+uint64_t benchBlitUs = 0;
+uint32_t benchBlitCalls = 0;
 LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
 uint32_t lastUiUpdate = 0;      // borda de 1 s que dispara o redesenho do HUD
 static bool backlightOn = true; // estado atual do backlight (DCDC3 do AXP192)
@@ -178,9 +212,13 @@ std::atomic<bool> weatherAudio{false}; // música do Weather Channel em loop (I2
 struct WeatherDay {
   char name[8]; // "DOM".."SAB"
   int maxC = 0, minC = 0;
+  // Código WMO do dia, guardado além do texto: o ícone é escolhido pelo código
+  // (ver include/WeatherIcons.h), não por comparação de string.
+  int wmoCode = -1;
 };
 struct WeatherData {
   int tempC = -100, humidity = 0, windKmph = 0;
+  int wmoCode = -1;
   char cond[24] = {0}, windDir[8] = {0};
   WeatherDay days[3];
 };
@@ -191,7 +229,7 @@ std::atomic<bool> weatherReady{false};
 std::atomic<bool> weatherBusy{false};
 std::atomic<const char *> weatherStatus{"CARREGANDO..."};
 uint32_t lastWeatherAttempt = 0, lastWeatherGood = 0;
-uint32_t lastWeatherDraw = 0, lastTickerMs = 0;
+uint32_t lastTickerMs = 0;
 uint16_t lastWeatherBg = 0;
 LGFX_Sprite weatherTicker(&rca);
 String tickerPayload, tickerFull;
@@ -421,11 +459,11 @@ void drawSetupPortal() {
     rca.setTextDatum(top_left);
     rca.setTextColor(TFT_WHITE, TFT_NAVY);
     rca.setTextSize(1);
-    rca.drawString("SENHA: " + portal.apPassword(), 26, 144);
-    rca.drawString("ABRA: 192.168.4.1", 26, 162);
+    rca.drawString("SENHA: " + portal.apPassword(), SAFE_L, 144);
+    rca.drawString("ABRA: 192.168.4.1", SAFE_L, 162);
     rca.drawString(portal.status() == PortalStatus::CONFIGURANDO ? "CONFIGURACAO ATIVA"
                                                                  : "AGUARDANDO CELULAR...",
-                   26, 180);
+                   SAFE_L, 180);
     M5.Display.fillScreen(TFT_NAVY);
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -722,8 +760,13 @@ void audioTask(void *) {
 int jpegDraw(JPEGDRAW *draw) {
   // Saída de vídeo SOMENTE na RCA (composta). Nenhum pixel de frame é espelhado
   // no LCD: isso libera a banda do barramento SPI compartilhado com o microSD.
+  const int64_t t0 = benchActive ? esp_timer_get_time() : 0;
   rca.pushImage(draw->x + (CRT_W - videoWidth) / 2, draw->y + (CRT_H - videoHeight) / 2, draw->iWidth,
                 draw->iHeight, reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
+  if (benchActive) {
+    benchBlitUs += uint64_t(esp_timer_get_time() - t0);
+    ++benchBlitCalls;
+  }
   return 1;
 }
 
@@ -781,8 +824,12 @@ bool readAndShowOneFrame(bool render) {
     videoReadError = true;
     return false;
   }
+  // Só agora o par (jpegBuffer, tamanho) está comprovadamente coerente, que é a
+  // pré-condição do redrawCurrentFrame().
+  lastJpegUsed = used;
   decodedFrames++;
   renderedFrames++;
+  ++renderedSeq;
   const uint32_t elapsed = millis() - started;
   jpegDecodeTotalMs += elapsed;
   jpegDecodeMaxMs = max(jpegDecodeMaxMs, elapsed);
@@ -861,6 +908,192 @@ bool drawStaticPoster(const String &dir) {
   return true;
 }
 
+// ============================================================================
+// Benchmark do caminho de vídeo da RCA ("diag bench")
+//
+// Responde na bancada a pergunta que nenhum simulador de PC responde: até que
+// resolução e taxa ESTE aparelho sustenta na saída composta. Mede as três
+// etapas separadamente, em microssegundos (millis() tem resolução grossa demais
+// para um quadro de ~20 ms), rodando o mais rápido possível, sem cadência de
+// áudio e sem descarte de quadros:
+//
+//   leitura   -> tirar o JPEG do cartão (mjpegReader.next)
+//   decode    -> JPEGDEC, já descontado o blit
+//   blit      -> pushImage no framebuffer CVBS, cronometrado dentro do jpegDraw
+//
+// O teto real não é do aparelho e sim do sinal: o NTSC entrega 59,94 campos por
+// segundo e a luminância tem ~4,2 MHz de banda, o que equivale a ~330 pontos por
+// linha. Acima de 320x240 a 30 quadros/s não há qualidade a ganhar no tubo, só
+// trabalho a mais. Este benchmark serve para saber se o Core2 alcança esse teto
+// com a mídia que você preparou.
+// ============================================================================
+static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
+  stopProgram(); // nada de áudio ou reprodução competindo pelo cartão
+
+  String video = "video.mjpeg";
+  float metaFps = 15.0f;
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  File meta = SD.open(dir + "/meta.json", FILE_READ);
+  if (meta) {
+    JsonDocument d;
+    if (!deserializeJson(d, meta)) {
+      video = (const char *)(d["video"] | "video.mjpeg");
+      metaFps = d["fps"] | 15.0f;
+    }
+    meta.close();
+  }
+
+  File f = SD.open(dir + "/" + video, FILE_READ);
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+  if (!f) {
+    Serial.printf("[BENCH] nao abriu %s/%s\n", dir.c_str(), video.c_str());
+    return;
+  }
+  if (!jpegBuffer) {
+    Serial.println("[BENCH] sem buffer JPEG");
+    if (sdMutex)
+      xSemaphoreTake(sdMutex, portMAX_DELAY);
+    f.close();
+    if (sdMutex)
+      xSemaphoreGive(sdMutex);
+    return;
+  }
+
+  // Reaproveita o leitor global: um MjpegReader local são 4104 bytes, e esta
+  // função roda na pilha do loopTask (8 KB), que ainda precisa de FATFS,
+  // deserializeJson e dos printf com float do relatório. O stopProgram() acima
+  // já resetou o leitor.
+  playback::MjpegReader &reader = mjpegReader;
+  reader.reset();
+  rca.fillScreen(TFT_BLACK);
+  videoFrameIndex = 0;
+
+  uint64_t readUs = 0, decodeUs = 0, totalBytes = 0;
+  uint32_t maxReadUs = 0, maxDecodeUs = 0, maxTotalUs = 0;
+  uint32_t frames = 0, errors = 0;
+  int w = 0, h = 0;
+
+  benchActive = true;
+  benchBlitUs = 0;
+  benchBlitCalls = 0;
+  const int64_t wallStart = esp_timer_get_time();
+
+  uint32_t iterations = 0;
+  while (frames < maxFrames) {
+    // O cão de guarda precisa respirar mesmo quando todo quadro dá erro: contar
+    // sucessos deixava os caminhos de falha girando sem yield e sem avançar o
+    // limite pedido pelo usuário.
+    if ((++iterations & 0x0F) == 0)
+      vTaskDelay(1);
+    if (errors > maxFrames) {
+      Serial.println("[BENCH] erros demais; abortando");
+      break;
+    }
+    const int64_t frameStart = esp_timer_get_time();
+
+    size_t used = 0;
+    const int64_t r0 = esp_timer_get_time();
+    // Mesma disciplina do caminho normal: o cartão é compartilhado com a tarefa
+    // de áudio, então nunca se lê fora do mutex. Toma e devolve por quadro, em
+    // vez de segurar durante todo o benchmark, para não matar o áudio de fome.
+    if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(150)) != pdTRUE) {
+      ++errors;
+      continue;
+    }
+    const auto result = reader.next(f, jpegBuffer, MAX_JPEG, used);
+    if (sdMutex)
+      xSemaphoreGive(sdMutex);
+    const uint32_t rUs = uint32_t(esp_timer_get_time() - r0);
+    if (result != playback::FrameResult::Ready)
+      break; // fim do arquivo ou fluxo invalido
+    readUs += rUs;
+    maxReadUs = max(maxReadUs, rUs);
+    totalBytes += used;
+
+    const int64_t d0 = esp_timer_get_time();
+    if (!jpeg.openRAM(jpegBuffer, used, jpegDraw)) {
+      ++errors;
+      continue;
+    }
+    w = jpeg.getWidth();
+    h = jpeg.getHeight();
+    if (w < 1 || h < 1 || w > CRT_W || h > CRT_H) {
+      jpeg.close();
+      ++errors;
+      continue;
+    }
+    videoWidth = w; // o jpegDraw centraliza a partir destes
+    videoHeight = h;
+    jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+    const bool ok = jpeg.decode(0, 0, 0);
+    jpeg.close();
+    const uint32_t dUs = uint32_t(esp_timer_get_time() - d0);
+    if (!ok) {
+      ++errors;
+      continue;
+    }
+    decodeUs += dUs;
+    maxDecodeUs = max(maxDecodeUs, dUs);
+    maxTotalUs = max(maxTotalUs, uint32_t(esp_timer_get_time() - frameStart));
+    ++frames;
+  }
+
+  const uint64_t wallUs = uint64_t(esp_timer_get_time() - wallStart);
+  benchActive = false;
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  f.close();
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+
+  if (!frames) {
+    Serial.printf("[BENCH] nenhum quadro decodificado (erros:%lu)\n", errors);
+    return;
+  }
+
+  // O blit é cronometrado dentro do jpegDraw, que roda durante o decode, então
+  // o tempo de JPEGDEC puro é a diferença entre os dois.
+  const uint64_t blitUs = benchBlitUs;
+  const uint64_t pureDecodeUs = decodeUs > blitUs ? decodeUs - blitUs : 0;
+  const uint32_t avgRead = uint32_t(readUs / frames);
+  const uint32_t avgDecode = uint32_t(pureDecodeUs / frames);
+  const uint32_t avgBlit = uint32_t(blitUs / frames);
+  const uint32_t avgTotal = uint32_t(wallUs / frames);
+  const float sustainedFps = avgTotal ? 1000000.0f / avgTotal : 0.0f;
+  const float peakFps = maxTotalUs ? 1000000.0f / maxTotalUs : 0.0f;
+  const float mibPerS = wallUs ? (float)totalBytes / (float)wallUs : 0.0f; // bytes/us == MB/s
+
+  Serial.println("[BENCH] ----------------------------------------");
+  Serial.printf("[BENCH] pasta          : %s\n", dir.c_str());
+  Serial.printf("[BENCH] resolucao      : %dx%d   fps do meta.json: %.2f\n", w, h, metaFps);
+  Serial.printf("[BENCH] quadros        : %lu   erros: %lu   bytes: %llu\n", frames, errors,
+                (unsigned long long)totalBytes);
+  Serial.printf("[BENCH] leitura SD     : medio %lu us   maximo %lu us   %.2f MB/s\n", avgRead,
+                maxReadUs, mibPerS);
+  Serial.printf("[BENCH] decode JPEG    : medio %lu us   maximo %lu us\n", avgDecode, maxDecodeUs);
+  Serial.printf("[BENCH] blit CVBS      : medio %lu us   (%lu blocos)\n", avgBlit, benchBlitCalls);
+  Serial.printf("[BENCH] quadro inteiro : medio %lu us   pior caso %lu us\n", avgTotal, maxTotalUs);
+  Serial.printf("[BENCH] FPS sustentado : %.1f   pior caso %.1f\n", sustainedFps, peakFps);
+  // O NTSC entrega 59,94 campos/s; acima disso a TV nao tem como mostrar.
+  const float ceiling = min(sustainedFps, 59.94f);
+  Serial.printf("[BENCH] teto util      : %.1f fps (limitado por %s)\n", ceiling,
+                sustainedFps < 59.94f ? "decodificacao/cartao" : "taxa de campo do NTSC");
+  if (sustainedFps < metaFps)
+    Serial.printf("[BENCH] ATENCAO: abaixo dos %.2f fps do meta.json; havera descarte de quadros\n",
+                  metaFps);
+  Serial.println("[BENCH] ----------------------------------------");
+
+  // stopProgram() já levou o estado para VIDEO_LIBRARY; sem redesenhar, a TV
+  // ficava preta enquanto o LCD mostrava a tela anterior e os botões passavam a
+  // agir como se estivessem na biblioteca.
+  videoFrameIndex = 0;
+  lastJpegUsed = 0;
+  state = VIDEO_LIBRARY;
+  drawLibrary();
+}
+
 bool startProgram(const String &dir) {
   stopProgram();
   if (!audioReady || audioFailed || !dir.length())
@@ -929,6 +1162,10 @@ bool startProgram(const String &dir) {
 }
 void stopProgram() {
   playing = false;
+  // A música em loop do Weather Channel também segura o áudio: se ela continuar
+  // ligada, a condição de ocioso do audioTask nunca vale e a espera abaixo não
+  // termina nunca. Tem que cair ANTES do while, não depois.
+  weatherAudio = false;
   // Wait for the consumer to acknowledge idle before closing or replacing files.
   while (audioReady && !audioIdle)
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -944,9 +1181,15 @@ void stopProgram() {
     xSemaphoreGive(sdMutex);
   uiHudClear(); // apaga só o HUD; o pôster permanece intacto no LCD
   playbackFinished = false;
+  // Sem isto o "pausado" vazava para a próxima tela: entrar no Weather depois de
+  // pausar um programa deixava o audioTask no ramo de pausa e a música nunca
+  // tocava, sem erro nenhum na tela.
+  paused = false;
+  lastJpegUsed = 0; // o conteúdo do jpegBuffer deixa de valer
   state = VIDEO_LIBRARY;
 }
 void videoTick() {
+  videoBehind = false;
   if (!playing || paused)
     return;
   const uint32_t target = uint32_t((double(samplesPlayed.load()) * fps) / sampleRate);
@@ -970,6 +1213,8 @@ void videoTick() {
       playing = false;
     }
   }
+  // Ainda atrás do relógio depois de trabalhar: o loop não deve dormir 4 ms.
+  videoBehind = playing && videoFrameIndex < target;
 }
 
 String stringAlias(JsonObject o, const char *a, const char *b = nullptr, const char *c = nullptr) {
@@ -1317,41 +1562,95 @@ void drawPlaybackController() {
   uiHudDraw();
 }
 
+// Apaga, dentro da faixa do OSD, só o que fica FORA do retângulo do vídeo (o
+// letterbox preto). A parte sobre a imagem é restaurada pelo próximo quadro,
+// ou por redrawCurrentFrame() com o vídeo pausado — assim o OSD some sem
+// piscar uma tarja preta sobre o filme.
+static void clearOsdLetterbox() {
+  const int top = vcr::layout::kTopY;
+  const int vx = (CRT_W - videoWidth) / 2, vy = (CRT_H - videoHeight) / 2;
+  const int vr = vx + videoWidth, vb = vy + videoHeight;
+  if (vb <= top || vy >= CRT_H) {
+    rca.fillRect(0, top, CRT_W, CRT_H - top, TFT_BLACK);
+    return;
+  }
+  const int y0 = max(top, vy);
+  if (y0 > top)
+    rca.fillRect(0, top, CRT_W, y0 - top, TFT_BLACK);
+  if (vb < CRT_H)
+    rca.fillRect(0, vb, CRT_W, CRT_H - vb, TFT_BLACK);
+  const int h = min(vb, CRT_H) - y0;
+  if (vx > 0)
+    rca.fillRect(0, y0, vx, h, TFT_BLACK);
+  if (vr < CRT_W)
+    rca.fillRect(vr, y0, CRT_W - vr, h, TFT_BLACK);
+}
+
+// Redecodifica o quadro atual a partir do jpegBuffer (sem tocar no cartão).
+// Custa um decode (~10-20 ms em 240x160) e só roda com o vídeo pausado, a
+// cada meio segundo, para o PAUSE piscar sobre a imagem parada.
+static bool redrawCurrentFrame() {
+  if (!jpegBuffer || !lastJpegUsed)
+    return false;
+  if (!jpeg.openRAM(jpegBuffer, lastJpegUsed, jpegDraw))
+    return false;
+  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  const bool ok = jpeg.decode(0, 0, 0);
+  jpeg.close();
+  return ok;
+}
+
 void drawPlaybackOsd() {
-  static bool visible = false, lastPaused = false;
-  static uint32_t lastPaint = 0, lastFrame = 0, lastDeadline = 0;
+  // OSD de videocassete (include/VcrOsd.h): texto flutuando sobre o vídeo, sem
+  // tarja, com contorno preto. Como não há fundo, cada repintura precisa partir
+  // de uma imagem limpa: com o filme rodando, logo depois de um quadro novo;
+  // pausado, depois de redecodificar o quadro parado.
+  static bool visible = false, lastPaused = false, lastBlink = true;
+  static uint32_t lastFrame = 0, lastDeadline = 0;
   const uint32_t now = millis();
   const bool isPaused = paused.load();
   const bool show = isPaused || !timeReached(now, osdUntil);
+  // O VCR piscava o símbolo de PAUSE; 2 Hz como nos aparelhos da época.
+  const bool blink = !isPaused || ((now / 500U) & 1U) == 0;
+
   if (visible && !show) {
-    const int belowPicture = max(202, (CRT_H + videoHeight) / 2);
-    if (belowPicture < CRT_H)
-      rca.fillRect(0, belowPicture, CRT_W, CRT_H - belowPicture, TFT_BLACK);
+    clearOsdLetterbox(); // o próximo quadro repinta o que ficou sobre a imagem
     visible = false;
+    return;
   }
-  // Repaint over new video frames, or at 4 Hz for the clock/controls, not on every loop.
-  if (show && (!visible || lastFrame != videoFrameIndex || lastPaused != isPaused ||
-               lastDeadline != osdUntil || now - lastPaint >= 250)) {
-    visible = true;
-    lastPaint = now;
-    lastFrame = videoFrameIndex;
-    lastPaused = isPaused;
-    lastDeadline = osdUntil;
-    rca.fillRect(0, 202, 320, 38, TFT_NAVY);
-    rca.setTextDatum(top_left);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    if (settings.vhsOsd)
-      rca.drawString(String(paused ? "PAUSE" : "PLAY  SP") + "   " + playbackClock(), 6, 205);
-    else
-      rca.drawString(String(PTBR::APP) + "  " + currentTitle, 6, 205);
-    rca.setTextColor(TFT_CYAN, TFT_NAVY);
-    rca.drawString(String("[ ") + PTBR::ANTERIOR + " ]  [ " + (paused ? PTBR::REPRODUZIR : PTBR::PAUSAR) +
-                       " ]  [ " + PTBR::PROXIMO + " ]",
-                   6, 222);
+  if (!show)
+    return;
+
+  const bool newFrame = lastFrame != renderedSeq;
+  const bool changed = !visible || lastPaused != isPaused || lastDeadline != osdUntil || lastBlink != blink;
+  if (!newFrame && !changed)
+    return;
+  if (!newFrame) {
+    // Sem quadro novo embaixo (pausado, ou mudança de estado entre quadros):
+    // restaura a imagem para não empilhar tinta velha do OSD.
+    redrawCurrentFrame();
   }
-  // O redesenho do LCD (pôster + HUD) não acontece mais aqui a cada 250 ms: a
-  // borda de 1 s é feita por uiHudTick() chamado em loop(), logo após este OSD.
+  clearOsdLetterbox();
+
+  visible = true;
+  lastFrame = renderedSeq;
+  lastPaused = isPaused;
+  lastDeadline = osdUntil;
+  lastBlink = blink;
+
+  vcr::State st;
+  st.transport = isPaused ? vcr::Transport::Pause : vcr::Transport::Play;
+  st.blinkOn = blink;
+  st.seconds = sampleRate ? samplesPlayed.load() / sampleRate : 0;
+  // "OSD estilo VHS" ligado: painel completo (símbolo, SP, contador). Desligado:
+  // só o símbolo e o título, mais discreto sobre o filme.
+  st.showCounter = settings.vhsOsd;
+  st.speed = settings.vhsOsd ? vcr::Speed::SP : vcr::Speed::None;
+  st.title = currentTitle.c_str(); // o OSD normaliza acentos por conta própria
+  st.buttonLeft = PTBR::ANTERIOR;
+  st.buttonCenter = isPaused ? "PLAY" : "PAUSA"; // vocabulário do painel do VCR
+  st.buttonRight = PTBR::PROXIMO;
+  vcr::draw(&rca, st);
 }
 
 void setAudioOutput(AudioOutput output) {
@@ -1419,12 +1718,16 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
     M5.Display.setTextColor(ink, fill);
     M5.Display.drawString(labels[i], x + w / 2, 211);
   }
-  if (!timeReached(millis(), osdUntil)) {
-    rca.fillRect(0, 220, 320, 20, TFT_NAVY);
+  // Antes isto dependia do osdUntil do player, então a barra sumia sozinha em
+  // telas que nada têm a ver com reprodução — e no boot nem aparecia. Durante o
+  // playback quem manda é o OSD de videocassete, que tem legendas próprias.
+  if (state != VIDEO_PLAYBACK) {
+    rca.fillRect(0, BAR_Y, CRT_W, BAR_H, TFT_NAVY);
     rca.setTextDatum(middle_center);
     rca.setTextSize(1);
     rca.setTextColor(TFT_CYAN, TFT_NAVY);
-    rca.drawString(String("[ ") + left + " ]  [ " + center + " ]  [ " + right + " ]", 160, 230);
+    rca.drawString(String("[ ") + left + " ]  [ " + center + " ]  [ " + right + " ]", CRT_W / 2,
+                   BAR_Y + BAR_H / 2);
   }
   drawBackButton();
 }
@@ -1506,30 +1809,31 @@ void drawMusicBrowser() {
     d->setTextDatum(top_left);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
-    d->drawString(PTBR::MUSICA, 12, 8);
-    d->drawFastHLine(8, 36, 304, TFT_CYAN);
+    d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
     // breadcrumb do diretório corrente.
     String crumb = musicDir;
     crumb.replace(String(MUSIC_ROOT), "/");
     d->setTextSize(1);
     d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
-    d->drawString(crumb, 12, 42);
+    d->drawString(crumb, SAFE_L, HEAD_RULE_Y + 6);
     if (!musicEntryCount)
-      d->drawString(PTBR::SEM_MUSICAS, 30, 92);
+      d->drawString(PTBR::SEM_MUSICAS, SAFE_L + 6, BODY_Y + 48);
     const int first = (musicSelection / 4) * 4;
     for (int row = 0; row < 4 && first + row < musicEntryCount; ++row) {
-      const int index = first + row, y = 56 + row * 32;
+      const int index = first + row, y = BODY_Y + 14 + row * 32;
       const bool selected = index == musicSelection;
-      d->fillRoundRect(12, y - 2, 296, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
+      d->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
       d->setTextColor(selected ? TFT_NAVY : (musicEntries[index].isFolder ? TFT_CYAN : TFT_WHITE),
                       selected ? TFT_CYAN : TFT_NAVY);
       String label = String(selected ? "> " : "  ") + musicEntries[index].name;
       if (musicEntries[index].isFolder)
         label += "/";
-      d->drawString(label.substring(0, 40), 20, y + 6);
+      d->drawString(label.substring(0, 40), SAFE_L + 8, y + 6);
     }
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount, 216, 16);
+    d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount,
+                  SAFE_R - 80, HEAD_Y);
   }
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
@@ -1655,7 +1959,7 @@ void drawMusicNowPlaying() {
     totalSec = (uint32_t)(mp3File.size() * 8ULL / (uint64_t)musicBitrateKbps / 1000ULL);
   }
   const uint32_t curSec = sampleRate ? samplesPlayed.load() / sampleRate : 0;
-  const int pct = totalSec ? (int)((uint64_t)curSec * 286 / totalSec) : 0;
+  const int pct = totalSec ? (int)((uint64_t)curSec * (SAFE_W - 2) / totalSec) : 0;
   // Nº da faixa corrente na fila (estilo iPod), para exibição.
   String trackNo = (musicQueueIndex >= 0 && musicQueueCount) ? String(musicQueueIndex + 1) + "/" + String(musicQueueCount) : String("");
   for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
@@ -1663,37 +1967,39 @@ void drawMusicNowPlaying() {
     d->setTextDatum(top_left);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextSize(2);
-    d->drawString(PTBR::MUSICA, 12, 8);
-    d->drawFastHLine(8, 36, 304, TFT_CYAN);
+    d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
     d->setTextSize(1);
     // Capa do álbum (esquerda) com borda estilo VHS.
+    const int coverY = BODY_Y + 8;
     if (coverSprite) {
       const int cw = coverSprite->width(), ch = coverSprite->height();
       const float sc = min(min(88.0f / cw, 88.0f / ch), 1.6f);
       coverSprite->setPivot(cw / 2.0f, ch / 2.0f);
-      coverSprite->pushRotateZoom(d, 16 + 44, 52 + 44, 0, sc, sc);
+      coverSprite->pushRotateZoom(d, SAFE_L + 44, coverY + 44, 0, sc, sc);
     }
-    d->drawRect(16, 52, 88, 88, coverSprite ? TFT_CYAN : TFT_DARKCYAN);
+    d->drawRect(SAFE_L, coverY, 88, 88, coverSprite ? TFT_CYAN : TFT_DARKCYAN);
     // Título + tags (truncados para não estourar à direita).
+    const int metaX = SAFE_L + 96;
     d->setTextColor(TFT_YELLOW, TFT_NAVY);
-    d->drawString(truncateText(title, 24), 120, 52);
+    d->drawString(truncateText(title, 24), metaX, coverY);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(truncateText(musicMeta.artist[0] ? musicMeta.artist : "---", 24), 120, 82);
-    d->drawString(truncateText(musicMeta.album[0] ? musicMeta.album : "---", 24), 120, 102);
+    d->drawString(truncateText(musicMeta.artist[0] ? musicMeta.artist : "---", 24), metaX, coverY + 30);
+    d->drawString(truncateText(musicMeta.album[0] ? musicMeta.album : "---", 24), metaX, coverY + 50);
     if (musicMeta.year[0])
-      d->drawString(musicMeta.year, 120, 122);
+      d->drawString(musicMeta.year, metaX, coverY + 70);
     // Nº da faixa + bitrate (canto sup. direito, à esquerda do botão voltar).
     if (trackNo.length()) {
       String meta = trackNo;
       if (mp3Mode && musicBitrateKbps > 0)
         meta += " " + String(musicBitrateKbps) + "K";
       d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
-      d->drawString(meta, 200, 42);
+      d->drawString(meta, SAFE_R - 96, HEAD_RULE_Y + 6);
     }
     // Progresso (com tempo total correto).
-    d->drawRect(16, 170, 288, 6, TFT_CYAN);
+    d->drawRect(SAFE_L, 160, SAFE_W, 6, TFT_CYAN);
     if (pct > 0)
-      d->fillRect(17, 171, pct, 4, TFT_YELLOW);
+      d->fillRect(SAFE_L + 1, 161, pct, 4, TFT_YELLOW);
     d->setTextColor(TFT_CYAN, TFT_NAVY);
     char clockLine[48];
     snprintf(clockLine, sizeof(clockLine), "%s %02lu:%02lu / %02lu:%02lu", isPaused ? "PAUSA" : "PLAY",
@@ -1702,7 +2008,7 @@ void drawMusicNowPlaying() {
       strncat(clockLine, "  SHUFFLE", sizeof(clockLine) - strlen(clockLine) - 1);
     else if (musicRepeat)
       strncat(clockLine, "  REPETIR", sizeof(clockLine) - strlen(clockLine) - 1);
-    d->drawString(clockLine, 16, 184);
+    d->drawString(clockLine, SAFE_L, 174);
   }
   drawBackButton();
 }
@@ -1968,13 +2274,13 @@ void drawHome() {
   rca.setTextDatum(top_left);
   rca.setTextSize(2);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(PTBR::APP, 12, 8);
-  rca.drawFastHLine(8, 36, 304, TFT_CYAN);
+  rca.drawString(PTBR::APP, SAFE_L, HEAD_Y);
+  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
   rca.setTextSize(1);
   for (int i = 0; i < HOME_COUNT; i++) {
-    int y = 44 + i * 20;
+    int y = BODY_Y + i * 20;
     rca.setTextColor(i == homeSelection ? TFT_CYAN : TFT_WHITE, TFT_NAVY);
-    rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], 28, y);
+    rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], SAFE_L + 4, y);
   }
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
@@ -1987,22 +2293,26 @@ void drawLibrary() {
     display->setTextDatum(top_left);
     display->setTextSize(2);
     display->setTextColor(TFT_WHITE, TFT_NAVY);
-    display->drawString(PTBR::VIDEOS, 12, 8);
-    display->drawFastHLine(8, 36, 304, TFT_CYAN);
+    display->drawString(PTBR::VIDEOS, SAFE_L, HEAD_Y);
+    display->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
     display->setTextSize(1);
     if (!count)
-      display->drawString("SEM VIDEOS NO CARTAO", 30, 92);
+      display->drawString("SEM VIDEOS NO CARTAO", SAFE_L + 6, BODY_Y + 48);
     for (int row = 0; row < 4 && first + row < count; ++row) {
-      const int index = first + row, y = 50 + row * 32;
+      const int index = first + row, y = BODY_Y + 14 + row * 32;
       String path = libraryProgramAt(index);
-      String title = path.substring(path.lastIndexOf('/') + 1);
+      // Nome de pasta vem do cartão e pode ter acento. As fontes bitmap são
+      // ASCII: sem normalizar, cada letra acentuada em UTF-8 vira DOIS espaços
+      // ("Nao Me Deixes" sairia "N  o Me Deixes").
+      char title[48];
+      ascii::normalize(title, sizeof(title), path.substring(path.lastIndexOf('/') + 1).c_str());
       const bool selected = index == librarySelection;
-      display->fillRoundRect(12, y - 2, 296, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
+      display->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
       display->setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? TFT_CYAN : TFT_NAVY);
-      display->drawString(String(selected ? "> " : "  ") + title.substring(0, 40), 20, y + 6);
+      display->drawString(String(selected ? "> " : "  ") + title, SAFE_L + 8, y + 6);
     }
     display->setTextColor(TFT_WHITE, TFT_NAVY);
-    display->drawString(String(count ? librarySelection + 1 : 0) + " / " + count, 216, 16);
+    display->drawString(String(count ? librarySelection + 1 : 0) + " / " + count, SAFE_R - 80, HEAD_Y);
   }
   drawControllerLabels("ANTERIOR", "PLAY", "PROXIMO");
 }
@@ -2045,11 +2355,13 @@ void drawRadar() {
     d->setTextDatum(top_left);
     d->setTextSize(1);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(PTBR::APP, 10, 7);
-    d->drawString(PTBR::TRAFEGO, 10, 22);
+    d->drawString(PTBR::APP, SAFE_L, SAFE_T);
+    d->drawString(PTBR::TRAFEGO, SAFE_L, SAFE_T + 15);
 
     // Scope: anel externo (alcance total), anel interno (metade) e mira.
-    const int cx = 105, cy = 105, R = 62;
+    // Centro/raio escolhidos para que os rótulos N/S/L/O e a legenda de
+    // alcance caibam inteiros na área segura, sem encostar no painel lateral.
+    const int cx = 96, cy = 118, R = 58;
     d->drawCircle(cx, cy, R, TFT_CYAN);
     d->drawCircle(cx, cy, R / 2, TFT_DARKCYAN);
     d->drawFastHLine(cx - R, cy, 2 * R, TFT_DARKCYAN);
@@ -2084,37 +2396,37 @@ void drawRadar() {
 
     // Painel lateral de dados (à direita do scope), sempre acima da barra de
     // controle (y < 184).
-    const int PX = 178;
+    const int PX = SAFE_L + 144; // 168
     d->setTextDatum(top_left);
     if (radarSelection >= 0 && radarSelection < aircraftCount) {
       const Aircraft &p = aircraft[radarSelection];
       d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(p.callsign.length() ? p.callsign : p.icao, PX, 28);
+      d->drawString(p.callsign.length() ? p.callsign : p.icao, PX, SAFE_T + 18);
       d->setTextColor(TFT_CYAN, TFT_NAVY);
-      d->drawString("ALT FL" + String((int)(p.altitude_ft / 100)), PX, 48);
-      d->drawString("VEL " + String((int)p.speed_kt) + " KT", PX, 66);
+      d->drawString("ALT FL" + String((int)(p.altitude_ft / 100)), PX, SAFE_T + 40);
+      d->drawString("VEL " + String((int)p.speed_kt) + " KT", PX, SAFE_T + 58);
       double y = (p.latitude - settings.lat) * 111.0;
       double x = (p.longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
       int distKm = (int)sqrt(x * x + y * y);
       int proa = (int)(atan2(x, y) * RAD_TO_DEG);
       if (proa < 0)
         proa += 360;
-      d->drawString("DIST " + String(distKm) + " km  PROA " + String(proa), PX, 84);
+      d->drawString("DIST " + String(distKm) + " km  PROA " + String(proa), PX, SAFE_T + 76);
       d->setTextColor(TFT_WHITE, TFT_NAVY);
       if (radarDetails) {
-        d->drawString(p.icao, PX, 112);
-        d->drawString(p.aircraft_type, PX, 128);
+        d->drawString(p.icao, PX, SAFE_T + 104);
+        d->drawString(p.aircraft_type, PX, SAFE_T + 120);
       }
     } else {
       d->setTextColor(TFT_CYAN, TFT_NAVY);
-      d->drawString(PTBR::AERONAVES_RASTREADAS, PX, 40);
+      d->drawString(PTBR::AERONAVES_RASTREADAS, PX, SAFE_T + 32);
       d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(String(aircraftCount), PX, 62);
+      d->drawString(String(aircraftCount), PX, SAFE_T + 54);
     }
     d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
-    d->drawString(String(settings.rangeKm) + " km de alcance", PX, 150);
+    d->drawString(String(settings.rangeKm) + " km de alcance", PX, SAFE_T + 142);
     d->setTextColor(TFT_CYAN, TFT_NAVY);
-    d->drawString(apiStatus.substring(0, 22), PX, 166);
+    d->drawString(apiStatus.substring(0, 20), PX, SAFE_T + 158);
     if (!aircraftCount) {
       d->setTextColor(TFT_WHITE, TFT_NAVY);
       d->setTextDatum(middle_center);
@@ -2146,44 +2458,86 @@ static const char *weekdayPt(int wd) {
   return (wd >= 0 && wd <= 6) ? W[wd] : "???";
 }
 
-static bool weatherParse(JsonDocument &doc, WeatherData &out) {
-  JsonArray cc = doc["current_condition"];
-  if (cc.isNull() || cc.size() == 0)
-    return false;
-  JsonObject c = cc[0];
-  if (c.isNull())
-    return false;
-  out.tempC = c["temp_C"] | -100;
-  out.humidity = c["humidity"] | 0;
-  out.windKmph = c["windspeedKmph"] | 0;
-  ascii::normalizeUpper(out.cond, sizeof(out.cond), c["weatherDesc"][0]["value"] | "");
-  ascii::normalizeUpper(out.windDir, sizeof(out.windDir), c["winddir16Point"] | "");
-  JsonArray days = doc["weather"];
-  if (days.isNull() || days.size() < 3)
-    return false;
-  for (int i = 0; i < 3; ++i) {
-    JsonObject d = days[i];
-    if (d.isNull())
-      return false;
-    const char *iso = d["date"] | "";
-    snprintf(out.days[i].name, sizeof(out.days[i].name), "%s", weekdayPt(weekdayFromIso(iso)));
-    out.days[i].maxC = d["maxtempC"] | 0;
-    out.days[i].minC = d["mintempC"] | 0;
+// Fonte: Open-Meteo (api.open-meteo.com) — API pública, sem cadastro nem chave.
+// Substituiu o wttr.in: o j1 de Franca devolve ~39 KB e não cabia no buffer de
+// 24 KB, então o JSON chegava truncado e toda consulta caía em "ERRO NA
+// CONSULTA". A resposta do Open-Meteo abaixo tem ~800 bytes.
+static const char *WEATHER_URL =
+    "https://api.open-meteo.com/v1/forecast?latitude=-20.5386&longitude=-47.4008"
+    "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,"
+    "wind_direction_10m&daily=weather_code,temperature_2m_max,temperature_2m_min"
+    "&timezone=America%2FSao_Paulo&forecast_days=3";
+
+// Código WMO (ww) do Open-Meteo -> condição em português, já em ASCII maiúsculo.
+static const char *wmoConditionPt(int code) {
+  switch (code) {
+  case 0: return "CEU LIMPO";
+  case 1: return "POUCAS NUVENS";
+  case 2: return "PARCIAL NUBLADO";
+  case 3: return "NUBLADO";
+  case 45: case 48: return "NEVOEIRO";
+  case 51: return "GAROA FRACA";
+  case 53: return "GAROA";
+  case 55: return "GAROA FORTE";
+  case 56: case 57: return "GAROA CONGELANTE";
+  case 61: return "CHUVA FRACA";
+  case 63: return "CHUVA";
+  case 65: return "CHUVA FORTE";
+  case 66: case 67: return "CHUVA CONGELANTE";
+  case 71: return "NEVE FRACA";
+  case 73: return "NEVE";
+  case 75: return "NEVE FORTE";
+  case 77: return "GRAOS DE NEVE";
+  case 80: return "PANCADAS FRACAS";
+  case 81: return "PANCADAS DE CHUVA";
+  case 82: return "PANCADAS FORTES";
+  case 85: case 86: return "PANCADAS DE NEVE";
+  case 95: return "TROVOADA";
+  case 96: case 99: return "TROVOADA C/ GRANIZO";
+  default: return "INDISPONIVEL";
   }
-  return true;
 }
 
-static void weatherFilterBuild(JsonDocument &filter) {
-  filter["current_condition"][0]["temp_C"] = true;
-  filter["current_condition"][0]["humidity"] = true;
-  filter["current_condition"][0]["weatherDesc"][0]["value"] = true;
-  filter["current_condition"][0]["windspeedKmph"] = true;
-  filter["current_condition"][0]["winddir16Point"] = true;
+// Direção do vento em graus -> rosa de 16 pontos em português (L = leste).
+static const char *windDirPt(float deg) {
+  static const char *P[16] = {"N",  "NNE", "NE", "ENE", "L",  "ESE", "SE", "SSE",
+                              "S",  "SSO", "SO", "OSO", "O",  "ONO", "NO", "NNO"};
+  if (!(deg >= 0.0f))
+    deg = 0.0f;
+  int i = (int)((deg + 11.25f) / 22.5f) % 16;
+  return P[i];
+}
+
+static bool weatherParse(JsonDocument &doc, WeatherData &out) {
+  JsonObject cur = doc["current"];
+  if (cur.isNull())
+    return false;
+  if (!cur["temperature_2m"].is<float>())
+    return false;
+  out.tempC = (int)lroundf(cur["temperature_2m"] | 0.0f);
+  out.humidity = (int)lroundf(cur["relative_humidity_2m"] | 0.0f);
+  out.windKmph = (int)lroundf(cur["wind_speed_10m"] | 0.0f);
+  out.wmoCode = cur["weather_code"] | -1;
+  snprintf(out.cond, sizeof(out.cond), "%s", wmoConditionPt(out.wmoCode));
+  snprintf(out.windDir, sizeof(out.windDir), "%s",
+           windDirPt(cur["wind_direction_10m"] | 0.0f));
+
+  JsonObject daily = doc["daily"];
+  if (daily.isNull())
+    return false;
+  JsonArray date = daily["time"], tmax = daily["temperature_2m_max"],
+            tmin = daily["temperature_2m_min"], dcode = daily["weather_code"];
+  if (date.isNull() || tmax.isNull() || tmin.isNull() || date.size() < 3 ||
+      tmax.size() < 3 || tmin.size() < 3)
+    return false;
   for (int i = 0; i < 3; ++i) {
-    filter["weather"][i]["date"] = true;
-    filter["weather"][i]["maxtempC"] = true;
-    filter["weather"][i]["mintempC"] = true;
+    snprintf(out.days[i].name, sizeof(out.days[i].name), "%s",
+             weekdayPt(weekdayFromIso(date[i] | "")));
+    out.days[i].maxC = (int)lroundf(tmax[i] | 0.0f);
+    out.days[i].minC = (int)lroundf(tmin[i] | 0.0f);
+    out.days[i].wmoCode = dcode.isNull() ? -1 : (dcode[i] | -1);
   }
+  return true;
 }
 
 static bool weatherFetch(WeatherData &out) {
@@ -2191,51 +2545,57 @@ static bool weatherFetch(WeatherData &out) {
   client.setInsecure(); // sem CA (economiza RAM)
   HTTPClient http;
   http.useHTTP10(true);
-  http.setConnectTimeout(8000);
-  http.setTimeout(8000);
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
   bool ok = false;
-  if (http.begin(client, "https://wttr.in/Franca,Brazil?format=j1")) {
+  if (http.begin(client, WEATHER_URL)) {
     const int code = http.GET();
     if (code == HTTP_CODE_OK) {
-      // Lê o corpo para um buffer contíguo em PSRAM e parseia a partir dele:
-      // o leitor Stream+Filter do ArduinoJson 7.4.2 descarta campos escalares no
-      // ESP32, e getString() retorna vazio com HTTP/1.0. Aqui unimos getStream()
-      // (comprovado no radar) + filtro sobre buffer (comprovado em teste nativo).
-      const int cap = 24000;
+      // A resposta tem ~800 bytes, então lê tudo para um buffer contíguo (o
+      // leitor Stream do ArduinoJson 7.4.2 descarta escalares no ESP32) e
+      // rejeita corpo truncado em vez de publicar dados pela metade.
+      // O buffer fica na PSRAM, não na pilha: esta função roda na tarefa
+      // WEATHER_HTTP, que tem 8 KB de pilha e ainda precisa acomodar os quadros
+      // do HTTPClient e do mbedTLS. 4 KB de array local comiam metade dela.
+      constexpr int cap = 4096;
       char *buf = (char *)ps_malloc(cap);
-      if (buf) {
-        Stream &s = http.getStream();
-        size_t len = 0;
-        uint32_t quiet = 0;
-        while (len < cap - 1 && quiet < 1500) {
-          int avail = s.available();
-          if (avail > 0) {
-            int n = s.readBytes(buf + len, min(avail, cap - 1 - (int)len));
-            if (n <= 0)
-              break;
-            len += n;
-            quiet = 0;
-          } else {
-            delay(5);
-            quiet += 5;
-          }
-        }
-        buf[len] = 0;
-        if (len) {
-          JsonDocument filter;
-          weatherFilterBuild(filter);
-          JsonDocument doc;
-          auto err = deserializeJson(doc, buf, DeserializationOption::Filter(filter),
-                                     DeserializationOption::NestingLimit(8));
-          if (!err)
-            ok = weatherParse(doc, out);
-          else
-            Serial.printf("[M5RETRO] Tempo: parse %s (%u bytes)\n", err.c_str(), (unsigned)len);
-        } else {
-          Serial.println("[M5RETRO] Tempo: corpo vazio");
-        }
-        free(buf);
+      if (!buf) {
+        Serial.println("[M5RETRO] Tempo: sem memoria para a resposta");
+        http.end();
+        return false;
       }
+      size_t len = 0;
+      uint32_t quiet = 0;
+      Stream &st = http.getStream();
+      while (len < cap - 1 && quiet < 3000) {
+        int avail = st.available();
+        if (avail > 0) {
+          int n = st.readBytes(buf + len, min(avail, cap - 1 - (int)len));
+          if (n <= 0)
+            break;
+          len += n;
+          quiet = 0;
+        } else if (!http.connected()) {
+          break;
+        } else {
+          delay(5);
+          quiet += 5;
+        }
+      }
+      buf[len] = 0;
+      if (len >= cap - 1) {
+        Serial.println("[M5RETRO] Tempo: resposta maior que o buffer");
+      } else if (len) {
+        JsonDocument doc;
+        auto err = deserializeJson(doc, buf, DeserializationOption::NestingLimit(8));
+        if (!err)
+          ok = weatherParse(doc, out);
+        else
+          Serial.printf("[M5RETRO] Tempo: parse %s (%u bytes)\n", err.c_str(), (unsigned)len);
+      } else {
+        Serial.println("[M5RETRO] Tempo: corpo vazio");
+      }
+      free(buf);
     } else {
       Serial.printf("[M5RETRO] Tempo: HTTP %d\n", code);
     }
@@ -2262,6 +2622,10 @@ void weatherNetworkTask(void *arg) {
   } else {
     weatherStatus.store("ERRO NA CONSULTA");
     Serial.println("[M5RETRO] Tempo: falha na consulta");
+    // Sem isso a tela fica presa em "CARREGANDO..." quando a PRIMEIRA consulta
+    // falha: weatherTick() só redesenha quando a versão muda.
+    if (!weatherReady.load())
+      weatherVersion.fetch_add(1);
   }
   weatherBusy.store(false);
   vTaskDelete(nullptr);
@@ -2276,10 +2640,13 @@ void pollWeather() {
     return;
   }
   const uint32_t now = millis();
-  if (weatherReady.load()) {
-    if (now - lastWeatherGood < WEATHER_REFRESH_MS)
-      return;
-  } else if (lastWeatherAttempt && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+  // O backoff vale para toda tentativa, não só antes da primeira que der certo.
+  // Antes, com dados já em mãos, o único portão era lastWeatherGood: se a
+  // consulta falhasse ele não avançava, a condição seguia falsa e cada loop()
+  // criava outra tarefa HTTP de 8 KB — dezenas por segundo com o roteador fora.
+  if (lastWeatherAttempt && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+    return;
+  if (weatherReady.load() && now - lastWeatherGood < WEATHER_REFRESH_MS)
     return;
   lastWeatherAttempt = now;
   weatherBusy.store(true);
@@ -2291,15 +2658,47 @@ void pollWeather() {
   }
 }
 
-// Fundo oscilante estilo "Local Forecast": tons escuros variando suavemente entre
-// azul, petróleo e roxo ao longo de um ciclo de ~12 s (quantizado em RGB565).
-static uint16_t weatherBackground() {
-  const float t = (millis() % 12000) / 12000.0f * 2.0f * PI;
-  int r = (int)(2.0f + 2.0f * sin(t));
-  int g = (int)(1.5f + 1.2f * sin(t + 2.09f));
-  int b = (int)(3.0f + 1.0f * sin(t + 4.19f));
-  uint16_t r5 = r * 31 / 4, g6 = g * 63 / 3, b5 = b * 31 / 4;
-  return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+// Fundo do Local Forecast: azul profundo estável com um gradiente vertical
+// discreto, como o Weather Star 4000.
+//
+// O que havia aqui antes era um ciclo COMPLETO de matiz de 12 s — as três
+// senoides defasadas levavam o fundo por verde, laranja e rosa. Era isso, e não
+// artefato de PAL-M, que deixava a tela ciano-berrante no tubo. O Weather
+// Channel dos anos 80 era azul e ficava azul; o movimento vinha do ticker e das
+// transições entre páginas, nunca do fundo.
+static constexpr uint16_t WX_TOP = 0x0010;    // azul quase preto (topo)
+static constexpr uint16_t WX_BOTTOM = 0x18BF; // azul de cobalto (base)
+
+static uint16_t weatherBackground() { return WX_BOTTOM; }
+
+// Pinta o gradiente por linhas. Em RGB565 as 32 faixas de azul e 64 de verde
+// dão passos imperceptíveis a 240 linhas; em RGB332 isso bandearia, mas o
+// painel composto roda em 16 bits.
+static inline uint16_t weatherGradientRow(int y) {
+  const int r0 = (WX_TOP >> 11) & 0x1F, g0 = (WX_TOP >> 5) & 0x3F, b0 = WX_TOP & 0x1F;
+  const int r1 = (WX_BOTTOM >> 11) & 0x1F, g1 = (WX_BOTTOM >> 5) & 0x3F, b1 = WX_BOTTOM & 0x1F;
+  const int r = r0 + (r1 - r0) * y / (CRT_H - 1);
+  const int g = g0 + (g1 - g0) * y / (CRT_H - 1);
+  const int b = b0 + (b1 - b0) * y / (CRT_H - 1);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Pinta o gradiente em FAIXAS, não linha a linha. Entre 0x0010 e 0x18BF cabem só
+// 16 cores distintas em 240 linhas, e elas saem contíguas: eram 240 chamadas de
+// desenho para 16 retângulos. Como um slide repinta as duas páginas a cada passo
+// (33 passos = 66 pinturas de fundo), a diferença é 15.840 chamadas contra 1.056.
+static void weatherPaintBackground(lgfx::LovyanGFX *dst, int oy) {
+  int start = 0;
+  uint16_t color = weatherGradientRow(0);
+  for (int y = 1; y < CRT_H; ++y) {
+    const uint16_t c = weatherGradientRow(y);
+    if (c == color)
+      continue;
+    dst->fillRect(0, oy + start, CRT_W, y - start, color);
+    start = y;
+    color = c;
+  }
+  dst->fillRect(0, oy + start, CRT_W, CRT_H - start, color);
 }
 
 static void weatherTickerBuild() {
@@ -2315,8 +2714,14 @@ static void weatherTickerBuild() {
       tickerPayload += " " + String(w.days[i].maxC) + "/" + String(w.days[i].minC) + "C";
     }
   }
-  tickerFull = tickerPayload + "      " + tickerPayload;
-  tickerWrapAt = weatherTicker.textWidth(tickerPayload.c_str()) + weatherTicker.textWidth("      ");
+  // Repete até o texto desenhado cobrir uma volta inteira MAIS a largura da
+  // tela. Com só duas cópias, depois do wrap sobrava exatamente uma volta e
+  // abria um vão preto na borda direita a cada ciclo.
+  const String unit = tickerPayload + "      ";
+  tickerWrapAt = weatherTicker.textWidth(unit.c_str());
+  tickerFull = unit;
+  while (tickerWrapAt > 0 && weatherTicker.textWidth(tickerFull.c_str()) < tickerWrapAt + CRT_W)
+    tickerFull += unit;
   tickerOffset = 0;
 }
 
@@ -2332,56 +2737,152 @@ static void weatherTickerTick() {
   weatherTicker.pushSprite(0, TICKER_Y);
 }
 
-void drawWeatherFrame() {
-  const uint16_t bg = weatherBackground();
-  lastWeatherBg = bg;
-  rca.fillScreen(bg);
-  rca.setFont(&fonts::Font4);
-  rca.setTextDatum(top_center);
-  rca.setTextSize(1);
-  rca.setTextColor(TFT_YELLOW, bg);
-  rca.drawString("FRANCA - SP", CRT_W / 2, 8);
-  rca.drawFastHLine(8, 44, CRT_W - 16, TFT_CYAN);
+// ----------------------------------------------------------------------------
+// Local Forecast em duas páginas, alternadas com transição — a cadência do
+// Weather Star 4000. Os pintores recebem (ox, oy) porque o slide desenha as
+// duas páginas deslocadas no mesmo quadro; com deslocamento zero é o desenho
+// normal. Ver include/ScreenFx.h.
+// ----------------------------------------------------------------------------
+static constexpr uint32_t WEATHER_PAGE_MS = 10000; // tempo de cada página
+static int weatherPage = 0;
+static uint32_t lastWeatherPageMs = 0;
+// Fora da função: precisa ser zerado ao entrar na tela, senão a volta ao Weather
+// reaproveita o estado da visita anterior e nada é redesenhado.
+static uint32_t lastWeatherVersion = UINT32_MAX;
+static crt::fx::Transition weatherFx;
 
-  if (weatherReady.load()) {
-    const WeatherData &w = weatherShadows[weatherActive.load()];
-    rca.setTextColor(TFT_WHITE, bg);
-    rca.drawString(w.cond, CRT_W / 2, 56);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d C", w.tempC);
-    rca.setTextSize(2);
-    rca.setTextColor(TFT_YELLOW, bg);
-    rca.drawString(buf, CRT_W / 2, 108);
-    rca.setFont(&fonts::Font2);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, bg);
-    snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
-    rca.drawString(buf, CRT_W / 2, 178);
-    snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
-    rca.drawString(buf, CRT_W / 2, 198);
-  } else {
-    rca.setFont(&fonts::Font2);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, bg);
-    rca.drawString(weatherStatus.load(), CRT_W / 2, 120);
-  }
-  rca.drawFastHLine(8, TICKER_Y - 2, CRT_W - 16, TFT_CYAN);
+// Cabeçalho comum: cidade + régua, a barra de título do WS4000.
+static void weatherHeader(lgfx::LovyanGFX *dst, int ox, int oy, const char *title) {
+  dst->setFont(&fonts::Font4);
+  dst->setTextDatum(top_center);
+  dst->setTextSize(1);
+  dst->setTextColor(TFT_YELLOW);
+  dst->drawString(title, ox + CRT_W / 2, oy + SAFE_T);
+  dst->drawFastHLine(ox + SAFE_L, oy + SAFE_T + 30, SAFE_W, TFT_CYAN);
+  // A régua de cima do ticker também vive aqui: se ficar só no drawWeatherFrame,
+  // a primeira transição repinta a tela e ela some pelo resto da sessão.
+  dst->drawFastHLine(ox + SAFE_L, oy + TICKER_Y - 4, SAFE_W, TFT_CYAN);
 }
 
+// Página 0 — condições atuais: ícone grande à esquerda, dados à direita.
+static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
+  // startWrite/endWrite agrupam a página inteira numa transação só, em vez de
+  // uma por primitiva. São dezenas de primitivas por pintura, e o slide pinta
+  // duas páginas por passo.
+  dst->startWrite();
+  weatherPaintBackground(dst, oy);
+  weatherHeader(dst, ox, oy, "FRANCA - SP");
+  if (!weatherReady.load()) {
+    dst->setFont(&fonts::Font2);
+    dst->setTextSize(1);
+    dst->setTextColor(TFT_WHITE);
+    dst->setTextDatum(top_center);
+    dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    dst->endWrite();
+    return;
+  }
+  const WeatherData &w = weatherShadows[weatherActive.load()];
+  wx::drawWeatherIcon(dst, ox + SAFE_L + 46, oy + SAFE_T + 96, 76, wx::iconFromWmo(w.wmoCode));
+
+  char buf[32];
+  const int col = ox + SAFE_L + 176; // coluna de texto, à direita do ícone
+  dst->setFont(&fonts::Font2);
+  dst->setTextSize(1);
+  dst->setTextDatum(top_center);
+  dst->setTextColor(TFT_WHITE);
+  dst->drawString(w.cond, col, oy + SAFE_T + 46);
+  snprintf(buf, sizeof(buf), "%d C", w.tempC);
+  dst->setFont(&fonts::Font4);
+  dst->setTextSize(2);
+  dst->setTextColor(TFT_YELLOW);
+  dst->drawString(buf, col, oy + SAFE_T + 70);
+  dst->setFont(&fonts::Font2);
+  dst->setTextSize(1);
+  dst->setTextColor(TFT_WHITE);
+  snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
+  dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 140);
+  snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
+  dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 158);
+  dst->endWrite();
+}
+
+// Página 1 — previsão de três dias em colunas, com ícone por dia.
+static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
+  dst->startWrite();
+  weatherPaintBackground(dst, oy);
+  weatherHeader(dst, ox, oy, "PREVISAO 3 DIAS");
+  if (!weatherReady.load()) {
+    // Mesmo recurso da página 0: sem isto, voltar à tela já na página 1 e sem
+    // rede deixava um azul vazio, só com o título, para sempre.
+    dst->setFont(&fonts::Font2);
+    dst->setTextSize(1);
+    dst->setTextColor(TFT_WHITE);
+    dst->setTextDatum(top_center);
+    dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    dst->endWrite();
+    return;
+  }
+  const WeatherData &w = weatherShadows[weatherActive.load()];
+  const int colW = SAFE_W / 3;
+  char buf[24];
+  for (int i = 0; i < 3; ++i) {
+    const int cx = ox + SAFE_L + colW * i + colW / 2;
+    dst->setFont(&fonts::Font2);
+    dst->setTextSize(1);
+    dst->setTextDatum(top_center);
+    dst->setTextColor(TFT_CYAN);
+    dst->drawString(w.days[i].name, cx, oy + SAFE_T + 42);
+    wx::drawWeatherIcon(dst, cx, oy + SAFE_T + 96, 56, wx::iconFromWmo(w.days[i].wmoCode));
+    dst->setTextColor(TFT_YELLOW);
+    snprintf(buf, sizeof(buf), "%d", w.days[i].maxC);
+    dst->drawString(buf, cx, oy + SAFE_T + 128);
+    dst->setTextColor(TFT_WHITE);
+    snprintf(buf, sizeof(buf), "%d", w.days[i].minC);
+    dst->drawString(buf, cx, oy + SAFE_T + 148);
+  }
+  dst->setFont(&fonts::Font2);
+  dst->setTextColor(TFT_CYAN);
+  dst->setTextDatum(top_center);
+  dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 160);
+  dst->endWrite();
+}
+
+static crt::fx::Screen weatherScreen(int page) {
+  return crt::fx::screen(page ? paintForecast : paintCurrent);
+}
+
+void drawWeatherFrame() {
+  lastWeatherBg = weatherBackground();
+  if (weatherPage)
+    paintForecast(&rca, 0, 0, nullptr);
+  else
+    paintCurrent(&rca, 0, 0, nullptr);
+}
 void weatherTick() {
   const uint32_t now = millis();
-  static uint32_t lastVersion = UINT32_MAX;
   const uint32_t version = weatherVersion.load();
-  if (version != lastVersion) {
-    lastVersion = version;
+
+  // Uma transição em curso manda no quadro: nada mais desenha até ela acabar.
+  if (weatherFx.busy()) {
+    weatherFx.tick(now);
+  } else if (version != lastWeatherVersion) {
+    // Dados novos entram com cortina de cima para baixo, como o WS4000 fazia ao
+    // trocar de cartela. Não precisa de buffer nenhum.
+    lastWeatherVersion = version;
     weatherTickerBuild();
-    drawWeatherFrame();
-  } else if (now - lastWeatherDraw >= 300) {
-    lastWeatherDraw = now;
-    const uint16_t bg = weatherBackground();
-    if (bg != lastWeatherBg)
-      drawWeatherFrame();
+    weatherFx.attach(&rca);
+    weatherFx.wipe(now, weatherScreen(weatherPage), crt::fx::DIR_DOWN);
+    lastWeatherPageMs = now;
+  } else if (weatherReady.load() && now - lastWeatherPageMs >= WEATHER_PAGE_MS) {
+    // Rodízio das páginas: slide horizontal, a transição típica entre
+    // "condições atuais" e "previsão estendida". Também sem buffer.
+    const int next = weatherPage ? 0 : 1;
+    weatherFx.attach(&rca);
+    weatherFx.slide(now, weatherScreen(weatherPage), weatherScreen(next), crt::fx::DIR_LEFT);
+    weatherPage = next;
+    lastWeatherPageMs = now;
   }
+
   if (now - lastTickerMs >= 33) {
     lastTickerMs = now;
     tickerOffset += 2;
@@ -2414,13 +2915,24 @@ void startWeather() {
   lastWeatherAttempt = 0; // força a primeira consulta imediata
   state = WEATHER;
 
-  // Sprite do ticker (uma única vez).
+  // Sprite do ticker (uma única vez). Em 16 bits, igual ao painel composto: o
+  // pushSprite vira cópia direta em vez de converter 5.120 pixels de RGB332 para
+  // RGB565 a cada 33 ms (~155 mil pixels por segundo convertidos à toa). Custa
+  // 5.120 bytes de SRAM a mais, que existem — o aperto de SRAM é o framebuffer
+  // do CVBS, e 5 KB nele não fazem diferença.
   if (!weatherTicker.getBuffer()) {
     weatherTicker.setPsram(false);
-    weatherTicker.setColorDepth(8);
+    weatherTicker.setColorDepth(16);
     weatherTicker.createSprite(CRT_W, TICKER_H);
     weatherTicker.setFont(&fonts::Font2);
   }
+  // Toda visita começa na página 0, com o rodízio e o controle de versão
+  // zerados; senão a tela herda o estado da visita anterior.
+  weatherPage = 0;
+  lastWeatherPageMs = millis();
+  lastWeatherVersion = UINT32_MAX;
+  weatherFx.attach(&rca);
+  weatherFx.skip();
   weatherTickerBuild();
   drawWeatherFrame();
 
@@ -2458,7 +2970,7 @@ void drawSettings() {
   String audio = settings.audioOutput == AudioOutput::RCA        ? PTBR::RCA
                  : settings.audioOutput == AudioOutput::INTERNAL ? PTBR::ALTO_FALANTE_INTERNO
                                                                  : PTBR::MUDO;
-  String value = settingsSelection == 0   ? "PAL-M"
+  String value = settingsSelection == 0   ? "NTSC"
                  : settingsSelection == 1 ? String(settings.volume) + "%"
                  : settingsSelection == 2 ? String(settings.rangeKm) + " km"
                  : settingsSelection == 3 ? String(settings.refreshSeconds) + " s"
@@ -2485,13 +2997,13 @@ void drawSettings() {
   rca.setTextDatum(top_left);
   rca.setTextSize(2);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(PTBR::CONFIGURACOES, 12, 8);
-  rca.drawFastHLine(8, 36, 304, TFT_CYAN);
+  rca.drawString(PTBR::CONFIGURACOES, SAFE_L, HEAD_Y);
+  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
   rca.setTextSize(1);
   rca.setTextColor(TFT_CYAN, TFT_NAVY);
-  rca.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], 20, 74);
+  rca.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], SAFE_L, BODY_Y + 26);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(value, 34, 105);
+  rca.drawString(value, SAFE_L + 10, BODY_Y + 58);
   drawControllerLabels(settingsEditing ? "-" : "ACIMA", settingsEditing ? "SALVAR" : "OK",
                        settingsEditing ? "+" : "ABAIXO");
 }
@@ -2503,33 +3015,33 @@ void drawInfo() {
     d->setTextDatum(top_left);
     d->setTextSize(2);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(PTBR::INFO_SISTEMA, 12, 8);
-    d->drawFastHLine(8, 36, 304, TFT_CYAN);
+    d->drawString(PTBR::INFO_SISTEMA, SAFE_L, HEAD_Y);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
     d->setTextSize(1);
-    const int y0 = 52;
+    const int y0 = BODY_Y;
     d->setTextColor(TFT_CYAN, TFT_NAVY);
     if (!infoPage) {
-      d->drawString("MEMORIA LIVRE", 20, y0);
-      d->drawString("PSRAM LIVRE", 20, y0 + 26);
-      d->drawString("VERSAO", 20, y0 + 52);
+      d->drawString("MEMORIA LIVRE", SAFE_L, y0);
+      d->drawString("PSRAM LIVRE", SAFE_L, y0 + 26);
+      d->drawString("VERSAO", SAFE_L, y0 + 52);
       d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(String(ESP.getFreeHeap()) + " bytes", 140, y0);
-      d->drawString(String(ESP.getFreePsram()) + " bytes", 140, y0 + 26);
-      d->drawString("core2", 140, y0 + 52);
+      d->drawString(String(ESP.getFreeHeap()) + " bytes", SAFE_L + 116, y0);
+      d->drawString(String(ESP.getFreePsram()) + " bytes", SAFE_L + 116, y0 + 26);
+      d->drawString("core2", SAFE_L + 116, y0 + 52);
     } else {
-      d->drawString(PTBR::STATUS_REDE, 20, y0);
-      d->drawString(PTBR::SINAL, 20, y0 + 26);
+      d->drawString(PTBR::STATUS_REDE, SAFE_L, y0);
+      d->drawString(PTBR::SINAL, SAFE_L, y0 + 26);
       const String st = (WiFi.status() == WL_CONNECTED) ? PTBR::CONECTADO : PTBR::DESCONECTADO;
       d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(st, 168, y0);
+      d->drawString(st, SAFE_L + 144, y0);
       if (WiFi.status() == WL_CONNECTED) {
-        d->drawString(String(WiFi.RSSI()) + " dBm", 168, y0 + 26);
+        d->drawString(String(WiFi.RSSI()) + " dBm", SAFE_L + 144, y0 + 26);
         d->setTextColor(TFT_CYAN, TFT_NAVY);
-        d->drawString(PTBR::ENDERECO_IP, 20, y0 + 52);
+        d->drawString(PTBR::ENDERECO_IP, SAFE_L, y0 + 52);
         d->setTextColor(TFT_WHITE, TFT_NAVY);
-        d->drawString(WiFi.localIP().toString(), 168, y0 + 52);
+        d->drawString(WiFi.localIP().toString(), SAFE_L + 144, y0 + 52);
       } else {
-        d->drawString("-", 168, y0 + 26);
+        d->drawString("-", SAFE_L + 144, y0 + 26);
       }
     }
   }
@@ -3011,6 +3523,33 @@ void serviceDiagnostics() {
       testPixelColors();
       continue;
     }
+    if (command == "diag bench" || command.startsWith("diag bench ")) {
+      // "diag bench" mede o programa selecionado na biblioteca; com argumento,
+      // mede a pasta indicada. O segundo argumento limita a contagem de quadros
+      // (padrao 150, o bastante para a media estabilizar sem prender o aparelho).
+      String arg = command.length() > 11 ? command.substring(11) : String();
+      arg.trim();
+      uint32_t limit = 150;
+      const int sp = arg.lastIndexOf(' ');
+      if (sp > 0) {
+        const long n = arg.substring(sp + 1).toInt();
+        if (n > 0) {
+          limit = uint32_t(n);
+          arg = arg.substring(0, sp);
+          arg.trim();
+        }
+      } else if (arg.length() && arg.toInt() > 0) {
+        limit = uint32_t(arg.toInt());
+        arg = "";
+      }
+      String dir = arg.length() ? normalizeSdPath(arg) : libraryProgramAt(librarySelection);
+      if (!dir.length())
+        Serial.println("[BENCH] nenhum programa selecionado; use: diag bench /M5RETRO/videos/<pasta>");
+      else
+        runVideoBenchmark(dir, limit);
+      memset(line, 0, sizeof(line));
+      continue;
+    }
     if (command == "diag backlight") {
       // Alterna o backlight (ligado <-> desligado) para inspeção. O próximo
       // botão/toque físico durante o playback religa o backlight sozinho.
@@ -3027,8 +3566,7 @@ void serviceDiagnostics() {
       stopProgram();
       startWeather();
     } else if (command == "diag music") {
-      weatherAudio = false; // para a música do weather (se ativa) antes de stopProgram
-      stopProgram();
+      stopProgram(); // já encerra a música do Weather Channel, se estiver ativa
       musicDir = MUSIC_ROOT;
       musicScanDir();
       state = MUSIC_BROWSER;
@@ -3105,7 +3643,7 @@ void setup() {
   uiHudInit(); // sprite do HUD criado uma única vez, fora do hot path
   jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
   if (!rca.init()) {
-    M5.Display.println("FALHA PAL-M");
+    M5.Display.println(PTBR::FALHA_NTSC);
     state = ERROR_SCREEN;
     drawBackButton();
     return;
@@ -3155,7 +3693,7 @@ void setup() {
     dualText(PTBR::APP, PTBR::CONECTANDO_WIFI);
     // NetworkManager retries without blocking the UI.
   }
-  dualText(PTBR::APP, PTBR::INICIANDO_PALM);
+  dualText(PTBR::APP, PTBR::INICIANDO_NTSC);
   if (!initExternalAudio()) {
     setError(PTBR::FALHA_AUDIO);
     return;
@@ -3271,5 +3809,9 @@ void loop() {
     renderedFrames = decodedFrames = 0;
     jpegDecodeTotalMs = jpegDecodeMaxMs = 0;
   }
-  delay(4);
+  // Soneca adaptativa. A cadência normal de 4 ms é folgada para 30 quadros/s
+  // (33 ms cada) e mantém baixo o polling I2C do touch que o M5.update() faz.
+  // Só quando o vídeo já está atrás do relógio de PCM é que 4 ms de latência
+  // passam a custar quadro, e aí o loop praticamente não dorme.
+  delay(videoBehind ? 1 : 4);
 }
