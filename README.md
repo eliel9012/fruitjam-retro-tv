@@ -250,5 +250,17 @@ mistura por alfa: o framebuffer composto não tem canal alfa e não há folga de
 SRAM para dois quadros inteiros. Os ícones de condição (`include/WeatherIcons.h`)
 são escolhidos pelo código WMO da Open-Meteo, não pelo texto.
 
+### Orçamento de memória
+
+O recurso apertado **não é a PSRAM** — é a SRAM interna. O framebuffer do vídeo
+composto ocupa 320x240 a 16 bits = **153.600 bytes de SRAM**, e o `M5ModuleRCA`
+é construído com `psram_no_use` de propósito: a PSRAM é lenta demais para o
+prazo por linha de varredura do NTSC. Mover o framebuffer para lá liberaria
+150 KB e quebraria o vídeo.
+
+Da PSRAM (4,5 MB) saem o buffer de JPEG (`MAX_JPEG`, 128 KiB), os buffers do
+TLS e os sprites de capa e do HUD — menos de 3% do total. Não há o que economizar
+ali, e economizar não renderia nada.
+
 O teste de cores confere o caminho RGB565 nativo usado pelos blocos JPEG. A conferência visual
 da imagem e a medição das saídas RCA exigem observação/conexão física.

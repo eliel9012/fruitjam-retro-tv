@@ -169,15 +169,28 @@ static void screenRadar() {
 // ciclo de matiz que existia antes e deixava a tela verde/rosa no tubo.
 static constexpr uint16_t WX_TOP = 0x0010, WX_BOTTOM = 0x18BF;
 
-static void weatherPaintBackground(int oy) {
+static inline uint16_t weatherGradientRow(int y) {
   const int r0 = (WX_TOP >> 11) & 0x1F, g0 = (WX_TOP >> 5) & 0x3F, b0 = WX_TOP & 0x1F;
   const int r1 = (WX_BOTTOM >> 11) & 0x1F, g1 = (WX_BOTTOM >> 5) & 0x3F, b1 = WX_BOTTOM & 0x1F;
-  for (int y = 0; y < H; ++y) {
-    const int r = r0 + (r1 - r0) * y / (H - 1);
-    const int g = g0 + (g1 - g0) * y / (H - 1);
-    const int b = b0 + (b1 - b0) * y / (H - 1);
-    rca.drawFastHLine(0, oy + y, W, (uint16_t)((r << 11) | (g << 5) | b));
+  const int r = r0 + (r1 - r0) * y / (H - 1);
+  const int g = g0 + (g1 - g0) * y / (H - 1);
+  const int b = b0 + (b1 - b0) * y / (H - 1);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Espelha o firmware: 16 faixas, não 240 linhas.
+static void weatherPaintBackground(int oy) {
+  int start = 0;
+  uint16_t color = weatherGradientRow(0);
+  for (int y = 1; y < H; ++y) {
+    const uint16_t c = weatherGradientRow(y);
+    if (c == color)
+      continue;
+    rca.fillRect(0, oy + start, W, y - start, color);
+    start = y;
+    color = c;
   }
+  rca.fillRect(0, oy + start, W, H - start, color);
 }
 
 static void weatherHeader(const char *title) {

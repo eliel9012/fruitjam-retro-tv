@@ -197,6 +197,10 @@ size_t lastJpegUsed = 0;
 // serve para o OSD: ele avança também nos quadros descartados sem render, então
 // o OSD acreditava ter imagem nova embaixo e pintava contador sobre contador.
 uint32_t renderedSeq = 0;
+// true enquanto o vídeo está atrasado em relação ao relógio de PCM. Só nesse
+// caso o loop encurta a soneca: dormir menos sempre quadruplicaria o polling
+// I2C do touch feito por M5.update() sem ganho nenhum.
+bool videoBehind = false;
 uint64_t benchBlitUs = 0;
 uint32_t benchBlitCalls = 0;
 LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
@@ -1185,6 +1189,7 @@ void stopProgram() {
   state = VIDEO_LIBRARY;
 }
 void videoTick() {
+  videoBehind = false;
   if (!playing || paused)
     return;
   const uint32_t target = uint32_t((double(samplesPlayed.load()) * fps) / sampleRate);
@@ -1208,6 +1213,8 @@ void videoTick() {
       playing = false;
     }
   }
+  // Ainda atrás do relógio depois de trabalhar: o loop não deve dormir 4 ms.
+  videoBehind = playing && videoFrameIndex < target;
 }
 
 String stringAlias(JsonObject o, const char *a, const char *b = nullptr, const char *c = nullptr) {
@@ -2667,15 +2674,31 @@ static uint16_t weatherBackground() { return WX_BOTTOM; }
 // Pinta o gradiente por linhas. Em RGB565 as 32 faixas de azul e 64 de verde
 // dão passos imperceptíveis a 240 linhas; em RGB332 isso bandearia, mas o
 // painel composto roda em 16 bits.
-static void weatherPaintBackground(lgfx::LovyanGFX *dst, int oy) {
+static inline uint16_t weatherGradientRow(int y) {
   const int r0 = (WX_TOP >> 11) & 0x1F, g0 = (WX_TOP >> 5) & 0x3F, b0 = WX_TOP & 0x1F;
   const int r1 = (WX_BOTTOM >> 11) & 0x1F, g1 = (WX_BOTTOM >> 5) & 0x3F, b1 = WX_BOTTOM & 0x1F;
-  for (int y = 0; y < CRT_H; ++y) {
-    const int r = r0 + (r1 - r0) * y / (CRT_H - 1);
-    const int g = g0 + (g1 - g0) * y / (CRT_H - 1);
-    const int b = b0 + (b1 - b0) * y / (CRT_H - 1);
-    dst->drawFastHLine(0, oy + y, CRT_W, (uint16_t)((r << 11) | (g << 5) | b));
+  const int r = r0 + (r1 - r0) * y / (CRT_H - 1);
+  const int g = g0 + (g1 - g0) * y / (CRT_H - 1);
+  const int b = b0 + (b1 - b0) * y / (CRT_H - 1);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Pinta o gradiente em FAIXAS, não linha a linha. Entre 0x0010 e 0x18BF cabem só
+// 16 cores distintas em 240 linhas, e elas saem contíguas: eram 240 chamadas de
+// desenho para 16 retângulos. Como um slide repinta as duas páginas a cada passo
+// (33 passos = 66 pinturas de fundo), a diferença é 15.840 chamadas contra 1.056.
+static void weatherPaintBackground(lgfx::LovyanGFX *dst, int oy) {
+  int start = 0;
+  uint16_t color = weatherGradientRow(0);
+  for (int y = 1; y < CRT_H; ++y) {
+    const uint16_t c = weatherGradientRow(y);
+    if (c == color)
+      continue;
+    dst->fillRect(0, oy + start, CRT_W, y - start, color);
+    start = y;
+    color = c;
   }
+  dst->fillRect(0, oy + start, CRT_W, CRT_H - start, color);
 }
 
 static void weatherTickerBuild() {
@@ -2743,6 +2766,10 @@ static void weatherHeader(lgfx::LovyanGFX *dst, int ox, int oy, const char *titl
 
 // Página 0 — condições atuais: ícone grande à esquerda, dados à direita.
 static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
+  // startWrite/endWrite agrupam a página inteira numa transação só, em vez de
+  // uma por primitiva. São dezenas de primitivas por pintura, e o slide pinta
+  // duas páginas por passo.
+  dst->startWrite();
   weatherPaintBackground(dst, oy);
   weatherHeader(dst, ox, oy, "FRANCA - SP");
   if (!weatherReady.load()) {
@@ -2751,6 +2778,7 @@ static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
     dst->setTextColor(TFT_WHITE);
     dst->setTextDatum(top_center);
     dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    dst->endWrite();
     return;
   }
   const WeatherData &w = weatherShadows[weatherActive.load()];
@@ -2775,10 +2803,12 @@ static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
   dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 140);
   snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
   dst->drawString(buf, ox + CRT_W / 2, oy + SAFE_T + 158);
+  dst->endWrite();
 }
 
 // Página 1 — previsão de três dias em colunas, com ícone por dia.
 static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
+  dst->startWrite();
   weatherPaintBackground(dst, oy);
   weatherHeader(dst, ox, oy, "PREVISAO 3 DIAS");
   if (!weatherReady.load()) {
@@ -2789,6 +2819,7 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
     dst->setTextColor(TFT_WHITE);
     dst->setTextDatum(top_center);
     dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
+    dst->endWrite();
     return;
   }
   const WeatherData &w = weatherShadows[weatherActive.load()];
@@ -2813,6 +2844,7 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
   dst->setTextColor(TFT_CYAN);
   dst->setTextDatum(top_center);
   dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 160);
+  dst->endWrite();
 }
 
 static crt::fx::Screen weatherScreen(int page) {
@@ -2883,10 +2915,14 @@ void startWeather() {
   lastWeatherAttempt = 0; // força a primeira consulta imediata
   state = WEATHER;
 
-  // Sprite do ticker (uma única vez).
+  // Sprite do ticker (uma única vez). Em 16 bits, igual ao painel composto: o
+  // pushSprite vira cópia direta em vez de converter 5.120 pixels de RGB332 para
+  // RGB565 a cada 33 ms (~155 mil pixels por segundo convertidos à toa). Custa
+  // 5.120 bytes de SRAM a mais, que existem — o aperto de SRAM é o framebuffer
+  // do CVBS, e 5 KB nele não fazem diferença.
   if (!weatherTicker.getBuffer()) {
     weatherTicker.setPsram(false);
-    weatherTicker.setColorDepth(8);
+    weatherTicker.setColorDepth(16);
     weatherTicker.createSprite(CRT_W, TICKER_H);
     weatherTicker.setFont(&fonts::Font2);
   }
@@ -3773,5 +3809,9 @@ void loop() {
     renderedFrames = decodedFrames = 0;
     jpegDecodeTotalMs = jpegDecodeMaxMs = 0;
   }
-  delay(4);
+  // Soneca adaptativa. A cadência normal de 4 ms é folgada para 30 quadros/s
+  // (33 ms cada) e mantém baixo o polling I2C do touch que o M5.update() faz.
+  // Só quando o vídeo já está atrás do relógio de PCM é que 4 ms de latência
+  // passam a custar quadro, e aí o loop praticamente não dorme.
+  delay(videoBehind ? 1 : 4);
 }
