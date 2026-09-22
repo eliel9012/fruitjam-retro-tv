@@ -2843,7 +2843,7 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
   dst->setFont(&fonts::Font2);
   dst->setTextColor(TFT_CYAN);
   dst->setTextDatum(top_center);
-  dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 160);
+  dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 166);
   dst->endWrite();
 }
 

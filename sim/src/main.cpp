@@ -193,6 +193,8 @@ static void weatherPaintBackground(int oy) {
   rca.fillRect(0, oy + start, W, H - start, color);
 }
 
+static void weatherTicker(int tickerOffset);
+
 static void weatherHeader(const char *title) {
   rca.setFont(&fonts::Font4);
   rca.setTextDatum(top_center);
@@ -200,6 +202,9 @@ static void weatherHeader(const char *title) {
   rca.setTextColor(TFT_YELLOW);
   rca.drawString(title, W / 2, SAFE_T);
   rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
+  // Igual ao firmware: a régua do ticker vive no cabeçalho, senão some na
+  // primeira transição.
+  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
 }
 
 // Página 1 da previsão: três dias em colunas, com ícone por dia.
@@ -228,7 +233,8 @@ static void screenForecast() {
   }
   rca.setFont(&fonts::Font2);
   rca.setTextColor(TFT_CYAN);
-  rca.drawString("MAXIMA / MINIMA EM GRAUS C", W / 2, SAFE_T + 172);
+  rca.drawString("MAXIMA / MINIMA EM GRAUS C", W / 2, SAFE_T + 166);
+  weatherTicker(0);
 }
 
 static void screenWeather(uint32_t ms, int tickerOffset) {
@@ -253,7 +259,12 @@ static void screenWeather(uint32_t ms, int tickerOffset) {
   rca.drawString("VENTO  12 KM/H  SO", W / 2, SAFE_T + 158);
   rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
 
-  // Ticker rolante, como o sprite do firmware.
+  weatherTicker(tickerOffset);
+}
+
+// O ticker existe nas duas páginas: no firmware ele é um sprite empurrado a
+// 30 Hz, independente de qual página está desenhada.
+static void weatherTicker(int tickerOffset) {
   static const char *payload = "SEG 26/15C    TER 27/14C    QUA 25/12C      ";
   rca.fillRect(0, TICKER_Y, W, TICKER_H, TFT_BLACK);
   rca.setClipRect(0, TICKER_Y, W, TICKER_H);
@@ -312,11 +323,83 @@ static void screenMusicPlaying() {
   controllerLabels("ANTERIOR", "PAUSAR", "PROXIMO");
 }
 
+
+// Página 1 do SISTEMA (espelha drawInfo com infoPage = 1).
+static void screenInfoNetwork() {
+  rca.fillScreen(TFT_NAVY);
+  header("SISTEMA");
+  const int y0 = BODY_Y;
+  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.drawString("STATUS DA REDE", SAFE_L, y0);
+  rca.drawString("SINAL", SAFE_L, y0 + 26);
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.drawString("CONECTADO", SAFE_L + 144, y0);
+  rca.drawString("-58 dBm", SAFE_L + 144, y0 + 26);
+  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.drawString("ENDERECO IP", SAFE_L, y0 + 52);
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.drawString("192.168.0.42", SAFE_L + 144, y0 + 52);
+  controllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
+}
+
+// Navegador de pastas da MUSICA (espelha drawMusicBrowser).
+static void screenMusicBrowser() {
+  static const char *itens[4] = {"Gilberto Gil/", "Realce/", "Nao Chores Mais.mp3",
+                                 "Toda Menina Baiana.mp3"};
+  static const bool pasta[4] = {true, true, false, false};
+  rca.fillScreen(TFT_NAVY);
+  header("MUSICA");
+  rca.setTextDatum(top_left);
+  rca.setTextColor(TFT_DARKCYAN, TFT_NAVY);
+  rca.drawString("/Gilberto Gil/Realce", SAFE_L, HEAD_RULE_Y + 6);
+  for (int row = 0; row < 4; ++row) {
+    const int y = BODY_Y + 14 + row * 32;
+    const bool sel = (row == 2);
+    rca.fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, sel ? TFT_CYAN : TFT_NAVY);
+    rca.setTextColor(sel ? TFT_NAVY : (pasta[row] ? TFT_CYAN : TFT_WHITE), sel ? TFT_CYAN : TFT_NAVY);
+    rca.drawString((std::string(sel ? "> " : "  ") + itens[row]).c_str(), SAFE_L + 8, y + 6);
+  }
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.drawString("3 / 4", SAFE_R - 80, HEAD_Y);
+  controllerLabels("ACIMA", "OK", "ABAIXO");
+}
+
+// Portal de configuracao de rede (espelha drawSetupPortal sobre o dualText).
+static void screenPortal() {
+  rca.fillScreen(TFT_NAVY);
+  rca.setTextDatum(middle_center);
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.setTextSize(2);
+  rca.drawString("CONFIGURACAO", W / 2, 94);
+  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextSize(1);
+  rca.drawString("WI-FI: M5RETRO-SETUP", W / 2, 130);
+  rca.setTextDatum(top_left);
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.drawString("SENHA: retro1988", SAFE_L, 144);
+  rca.drawString("ABRA: 192.168.4.1", SAFE_L, 162);
+  rca.drawString("AGUARDANDO CELULAR...", SAFE_L, 180);
+}
+
+// Tela de erro (espelha setError, que passa pelo dualText).
+static void screenError() {
+  rca.fillScreen(TFT_NAVY);
+  rca.setTextDatum(middle_center);
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.setTextSize(2);
+  rca.drawString("ERRO DO SISTEMA", W / 2, 94);
+  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextSize(1);
+  rca.drawString("CARTAO SD NAO ENCONTRADO", W / 2, 130);
+}
+
 // ---------------------------------------------------------------------------
-static const char *SCREEN_NAMES[] = {"INICIO",   "BIBLIOTECA",    "PLAYER",  "RADAR",
-                                     "PREVISAO", "CONFIGURACOES", "SISTEMA", "MUSICA",
-                                     "PREVISAO3DIAS"};
-constexpr int SCREEN_COUNT = 9;
+static const char *SCREEN_NAMES[] = {"INICIO",        "BIBLIOTECA", "PLAYER",
+                                     "RADAR",         "PREVISAO",   "PREVISAO3DIAS",
+                                     "CONFIGURACOES", "SISTEMA",    "SISTEMA_REDE",
+                                     "MUSICA",        "MUSICA_TOCANDO", "PORTAL",
+                                     "ERRO"};
+constexpr int SCREEN_COUNT = 13;
 
 static void drawCurrent(uint32_t ms, int tickerOffset) {
   switch (screenIndex) {
@@ -325,10 +408,14 @@ static void drawCurrent(uint32_t ms, int tickerOffset) {
   case 2: screenPlayback(); break;
   case 3: screenRadar(); break;
   case 4: screenWeather(ms, tickerOffset); break;
-  case 5: screenSettings(); break;
-  case 6: screenInfo(); break;
-  case 7: screenMusicPlaying(); break;
-  default: screenForecast(); break;
+  case 5: screenForecast(); break;
+  case 6: screenSettings(); break;
+  case 7: screenInfo(); break;
+  case 8: screenInfoNetwork(); break;
+  case 9: screenMusicBrowser(); break;
+  case 10: screenMusicPlaying(); break;
+  case 11: screenPortal(); break;
+  default: screenError(); break;
   }
   drawGuide();
 }
@@ -346,7 +433,9 @@ static constexpr uint8_t PIN_SCREEN0 = 64; // teclas 1..8 -> 64..71
 static void registerKeys() {
   lgfx::Panel_sdl::addKeyCodeMapping(SDLK_g, PIN_GUIDE);
   lgfx::Panel_sdl::addKeyCodeMapping(SDLK_ESCAPE, PIN_QUIT);
-  for (int i = 0; i < SCREEN_COUNT; ++i)
+  // Só 1..9 têm tecla própria; o resto se alcança pelas setas.
+  const int mapped = SCREEN_COUNT < 9 ? SCREEN_COUNT : 9;
+  for (int i = 0; i < mapped; ++i)
     lgfx::Panel_sdl::addKeyCodeMapping((SDL_KeyCode)(SDLK_1 + i), PIN_SCREEN0 + i);
 }
 
@@ -403,6 +492,9 @@ static int simLoop(bool *running) {
 // com o rasterizador real, em vez dos mockups em Python.
 static int exportPng(const char *dir) {
   char path[512];
+  // A guia magenta é ferramenta de depuração, não pertence a uma captura que
+  // vai para a documentação.
+  showGuide = false;
   for (screenIndex = 0; screenIndex < SCREEN_COUNT; ++screenIndex) {
     drawCurrent(0, 0);
     size_t len = 0;
