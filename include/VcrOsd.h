@@ -196,7 +196,14 @@ inline void drawTransportIcon(lgfx::LovyanGFX *gfx, Transport mode, int x, int y
 
 // Contador de fita no formato do painel: horas sem zero a esquerda, "0:00:00".
 inline void formatCounter(uint32_t seconds, char *out, size_t outN) {
-  const uint32_t h = seconds / 3600U, m = (seconds / 60U) % 60U, s = seconds % 60U;
+  uint32_t h = seconds / 3600U;
+  const uint32_t m = (seconds / 60U) % 60U, s = seconds % 60U;
+  // Único texto do OSD que não passa por fitText: alinhado à direita, uma string
+  // larga demais empurraria o x para fora da área segura pela esquerda. Duas
+  // casas de hora é o que o contador de um videocassete mostrava de qualquer
+  // forma; acima disso o dado já veio de um WAV com taxa corrompida.
+  if (h > 99U)
+    h = 99U;
   snprintf(out, outN, "%lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
 }
 
@@ -207,8 +214,8 @@ inline void fitText(const char *src, char *out, size_t outN, int maxW, int scale
   if (!out || outN < 4)
     return;
   out[0] = '\0';
-  if (!src || !*src || maxW <= 0)
-    return;
+  if (!src || !*src || maxW <= 0 || scale <= 0)
+    return; // scale zero seria divisão por zero adiante (exceção de CPU no xtensa)
   const size_t n = ::ascii::normalizeUpper(out, outN, src);
   const size_t maxChars = size_t(maxW / (vcrfont::CELL_W * scale));
   if (n <= maxChars)

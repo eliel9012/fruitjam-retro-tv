@@ -140,7 +140,6 @@ static constexpr int SAFE_W = crt::SAFE_W;
 static constexpr int HEAD_Y = crt::HEAD_Y, HEAD_RULE_Y = crt::HEAD_RULE_Y;
 static constexpr int BODY_Y = crt::BODY_Y;
 static constexpr int BAR_H = crt::BAR_H, BAR_Y = crt::BAR_Y;
-static constexpr int OSD_H = crt::OSD_H, OSD_Y = crt::OSD_Y;
 // Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
 // 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
 static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
@@ -194,6 +193,10 @@ bool benchActive = false;
 // Tamanho do último JPEG decodificado, que continua inteiro no jpegBuffer. Com o
 // vídeo pausado é daí que o OSD restaura a imagem que fica atrás dele.
 size_t lastJpegUsed = 0;
+// Sequência monotônica de quadros efetivamente desenhados. O videoFrameIndex não
+// serve para o OSD: ele avança também nos quadros descartados sem render, então
+// o OSD acreditava ter imagem nova embaixo e pintava contador sobre contador.
+uint32_t renderedSeq = 0;
 uint64_t benchBlitUs = 0;
 uint32_t benchBlitCalls = 0;
 LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
@@ -822,6 +825,7 @@ bool readAndShowOneFrame(bool render) {
   lastJpegUsed = used;
   decodedFrames++;
   renderedFrames++;
+  ++renderedSeq;
   const uint32_t elapsed = millis() - started;
   jpegDecodeTotalMs += elapsed;
   jpegDecodeMaxMs = max(jpegDecodeMaxMs, elapsed);
@@ -1610,7 +1614,7 @@ void drawPlaybackOsd() {
   if (!show)
     return;
 
-  const bool newFrame = lastFrame != videoFrameIndex;
+  const bool newFrame = lastFrame != renderedSeq;
   const bool changed = !visible || lastPaused != isPaused || lastDeadline != osdUntil || lastBlink != blink;
   if (!newFrame && !changed)
     return;
@@ -1622,7 +1626,7 @@ void drawPlaybackOsd() {
   clearOsdLetterbox();
 
   visible = true;
-  lastFrame = videoFrameIndex;
+  lastFrame = renderedSeq;
   lastPaused = isPaused;
   lastDeadline = osdUntil;
   lastBlink = blink;
@@ -1707,7 +1711,10 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
     M5.Display.setTextColor(ink, fill);
     M5.Display.drawString(labels[i], x + w / 2, 211);
   }
-  if (!timeReached(millis(), osdUntil)) {
+  // Antes isto dependia do osdUntil do player, então a barra sumia sozinha em
+  // telas que nada têm a ver com reprodução — e no boot nem aparecia. Durante o
+  // playback quem manda é o OSD de videocassete, que tem legendas próprias.
+  if (state != VIDEO_PLAYBACK) {
     rca.fillRect(0, BAR_Y, CRT_W, BAR_H, TFT_NAVY);
     rca.setTextDatum(middle_center);
     rca.setTextSize(1);
@@ -1818,7 +1825,8 @@ void drawMusicBrowser() {
       d->drawString(label.substring(0, 40), SAFE_L + 8, y + 6);
     }
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount, 216, 16);
+    d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount,
+                  SAFE_R - 80, HEAD_Y);
   }
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
@@ -2286,11 +2294,15 @@ void drawLibrary() {
     for (int row = 0; row < 4 && first + row < count; ++row) {
       const int index = first + row, y = BODY_Y + 14 + row * 32;
       String path = libraryProgramAt(index);
-      String title = path.substring(path.lastIndexOf('/') + 1);
+      // Nome de pasta vem do cartão e pode ter acento. As fontes bitmap são
+      // ASCII: sem normalizar, cada letra acentuada em UTF-8 vira DOIS espaços
+      // ("Nao Me Deixes" sairia "N  o Me Deixes").
+      char title[48];
+      ascii::normalize(title, sizeof(title), path.substring(path.lastIndexOf('/') + 1).c_str());
       const bool selected = index == librarySelection;
       display->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? TFT_CYAN : TFT_NAVY);
       display->setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? TFT_CYAN : TFT_NAVY);
-      display->drawString(String(selected ? "> " : "  ") + title.substring(0, 40), SAFE_L + 8, y + 6);
+      display->drawString(String(selected ? "> " : "  ") + title, SAFE_L + 8, y + 6);
     }
     display->setTextColor(TFT_WHITE, TFT_NAVY);
     display->drawString(String(count ? librarySelection + 1 : 0) + " / " + count, SAFE_R - 80, HEAD_Y);
@@ -2679,8 +2691,14 @@ static void weatherTickerBuild() {
       tickerPayload += " " + String(w.days[i].maxC) + "/" + String(w.days[i].minC) + "C";
     }
   }
-  tickerFull = tickerPayload + "      " + tickerPayload;
-  tickerWrapAt = weatherTicker.textWidth(tickerPayload.c_str()) + weatherTicker.textWidth("      ");
+  // Repete até o texto desenhado cobrir uma volta inteira MAIS a largura da
+  // tela. Com só duas cópias, depois do wrap sobrava exatamente uma volta e
+  // abria um vão preto na borda direita a cada ciclo.
+  const String unit = tickerPayload + "      ";
+  tickerWrapAt = weatherTicker.textWidth(unit.c_str());
+  tickerFull = unit;
+  while (tickerWrapAt > 0 && weatherTicker.textWidth(tickerFull.c_str()) < tickerWrapAt + CRT_W)
+    tickerFull += unit;
   tickerOffset = 0;
 }
 
@@ -2705,6 +2723,9 @@ static void weatherTickerTick() {
 static constexpr uint32_t WEATHER_PAGE_MS = 10000; // tempo de cada página
 static int weatherPage = 0;
 static uint32_t lastWeatherPageMs = 0;
+// Fora da função: precisa ser zerado ao entrar na tela, senão a volta ao Weather
+// reaproveita o estado da visita anterior e nada é redesenhado.
+static uint32_t lastWeatherVersion = UINT32_MAX;
 static crt::fx::Transition weatherFx;
 
 // Cabeçalho comum: cidade + régua, a barra de título do WS4000.
@@ -2715,6 +2736,9 @@ static void weatherHeader(lgfx::LovyanGFX *dst, int ox, int oy, const char *titl
   dst->setTextColor(TFT_YELLOW);
   dst->drawString(title, ox + CRT_W / 2, oy + SAFE_T);
   dst->drawFastHLine(ox + SAFE_L, oy + SAFE_T + 30, SAFE_W, TFT_CYAN);
+  // A régua de cima do ticker também vive aqui: se ficar só no drawWeatherFrame,
+  // a primeira transição repinta a tela e ela some pelo resto da sessão.
+  dst->drawFastHLine(ox + SAFE_L, oy + TICKER_Y - 4, SAFE_W, TFT_CYAN);
 }
 
 // Página 0 — condições atuais: ícone grande à esquerda, dados à direita.
@@ -2757,8 +2781,16 @@ static void paintCurrent(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
 static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
   weatherPaintBackground(dst, oy);
   weatherHeader(dst, ox, oy, "PREVISAO 3 DIAS");
-  if (!weatherReady.load())
+  if (!weatherReady.load()) {
+    // Mesmo recurso da página 0: sem isto, voltar à tela já na página 1 e sem
+    // rede deixava um azul vazio, só com o título, para sempre.
+    dst->setFont(&fonts::Font2);
+    dst->setTextSize(1);
+    dst->setTextColor(TFT_WHITE);
+    dst->setTextDatum(top_center);
+    dst->drawString(weatherStatus.load(), ox + CRT_W / 2, oy + SAFE_T + 86);
     return;
+  }
   const WeatherData &w = weatherShadows[weatherActive.load()];
   const int colW = SAFE_W / 3;
   char buf[24];
@@ -2780,7 +2812,7 @@ static void paintForecast(lgfx::LovyanGFX *dst, int ox, int oy, void *) {
   dst->setFont(&fonts::Font2);
   dst->setTextColor(TFT_CYAN);
   dst->setTextDatum(top_center);
-  dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 172);
+  dst->drawString("MAXIMA / MINIMA EM GRAUS C", ox + CRT_W / 2, oy + SAFE_T + 160);
 }
 
 static crt::fx::Screen weatherScreen(int page) {
@@ -2793,20 +2825,18 @@ void drawWeatherFrame() {
     paintForecast(&rca, 0, 0, nullptr);
   else
     paintCurrent(&rca, 0, 0, nullptr);
-  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
 }
 void weatherTick() {
   const uint32_t now = millis();
-  static uint32_t lastVersion = UINT32_MAX;
   const uint32_t version = weatherVersion.load();
 
   // Uma transição em curso manda no quadro: nada mais desenha até ela acabar.
   if (weatherFx.busy()) {
     weatherFx.tick(now);
-  } else if (version != lastVersion) {
+  } else if (version != lastWeatherVersion) {
     // Dados novos entram com cortina de cima para baixo, como o WS4000 fazia ao
     // trocar de cartela. Não precisa de buffer nenhum.
-    lastVersion = version;
+    lastWeatherVersion = version;
     weatherTickerBuild();
     weatherFx.attach(&rca);
     weatherFx.wipe(now, weatherScreen(weatherPage), crt::fx::DIR_DOWN);
@@ -2860,6 +2890,13 @@ void startWeather() {
     weatherTicker.createSprite(CRT_W, TICKER_H);
     weatherTicker.setFont(&fonts::Font2);
   }
+  // Toda visita começa na página 0, com o rodízio e o controle de versão
+  // zerados; senão a tela herda o estado da visita anterior.
+  weatherPage = 0;
+  lastWeatherPageMs = millis();
+  lastWeatherVersion = UINT32_MAX;
+  weatherFx.attach(&rca);
+  weatherFx.skip();
   weatherTickerBuild();
   drawWeatherFrame();
 

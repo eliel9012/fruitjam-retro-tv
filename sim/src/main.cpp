@@ -24,6 +24,7 @@
 #include <string>
 
 #include "SafeArea.h"
+#include "VcrOsd.h"
 #include "WeatherIcons.h"
 
 using namespace crt;
@@ -115,13 +116,17 @@ static void screenPlayback() {
   rca.setTextColor(TFT_DARKGREY, rca.color565(40, 60, 90));
   rca.drawString("(quadro MJPEG 240x160)", W / 2, H / 2);
 
-  rca.fillRect(0, OSD_Y, W, OSD_H, TFT_NAVY);
-  rca.setTextDatum(top_left);
-  rca.setTextSize(1);
-  rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString("PLAY  SP   00:42 / 03:15", SAFE_L, OSD_Y + 3);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
-  rca.drawString("[ ANTERIOR ]  [ PAUSAR ]  [ PROXIMO ]", SAFE_L, OSD_Y + 21);
+  // Chama o MESMO OSD do firmware (include/VcrOsd.h) em vez de imitá-lo: era
+  // daqui que vinha a divergência com a tela real do aparelho.
+  vcr::State osd;
+  osd.transport = vcr::Transport::Play;
+  osd.speed = vcr::Speed::SP;
+  osd.seconds = 42;
+  osd.title = "CIDADE MARAVILHOSA 1988";
+  osd.buttonLeft = "ANTERIOR";
+  osd.buttonCenter = "PAUSA";
+  osd.buttonRight = "PROXIMO";
+  vcr::draw(&rca, osd);
 }
 
 static void screenRadar() {

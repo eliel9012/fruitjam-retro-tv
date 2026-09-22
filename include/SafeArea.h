@@ -34,10 +34,6 @@ constexpr int BODY_Y = SAFE_T + 36;      // 54
 constexpr int BAR_H = 20;
 constexpr int BAR_Y = SAFE_B - BAR_H; // 202
 
-// Faixa do OSD do player.
-constexpr int OSD_H = 38;
-constexpr int OSD_Y = SAFE_B - OSD_H; // 184
-
 // Ticker da tela de previsão do tempo.
 constexpr int TICKER_H = 16;
 constexpr int TICKER_Y = SAFE_B - TICKER_H; // 206

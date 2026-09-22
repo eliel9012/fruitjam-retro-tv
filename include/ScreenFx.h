@@ -229,8 +229,17 @@ public:
   // terminou (e também quando não há nenhuma em curso), para o chamador poder
   // escrever `if (tx.tick(now)) { ... voltou ao desenho normal ... }`.
   bool tick(uint32_t now) {
-    if (kind_ == KIND_IDLE || dst_ == nullptr)
+    if (kind_ == KIND_IDLE)
       return true;
+    if (dst_ == nullptr) {
+      // Sem destino não há o que desenhar. Encerrar de verdade, senão busy()
+      // continuaria true e o laço `if (busy()) tick(); else desenhaNormal();`
+      // travaria para sempre.
+      kind_ = KIND_IDLE;
+      src_ = nullptr;
+      chain_ = false;
+      return true;
+    }
     switch (kind_) {
     case KIND_FADE:
     case KIND_DISSOLVE:
@@ -317,6 +326,12 @@ private:
       return false;
     if (scratch->width() < dst_->width() || scratch->height() < dst_->height())
       return false;
+    // revealLevel() lê o sprite como RGB332. Num sprite de 16 bpp isso pegaria o
+    // byte baixo de um RGB565 e pintaria cor aleatória — e o LGFX_Sprite nasce em
+    // rgb565_2Byte, então esquecer o setColorDepth(8) é o erro provável. Recusar
+    // aqui degrada para corte seco, que é o contrato documentado.
+    if (scratch->getColorDepth() != lgfx::color_depth_t::rgb332_1Byte)
+      return false;
     scratch->clearClipRect();
     to.paint(scratch, 0, 0, to.user);
     src_ = scratch;
@@ -371,7 +386,7 @@ private:
   }
 
   void tickDither(uint32_t now) {
-    int target = (int)(elapsed(now) * LEVELS / dur_);
+    int target = (int)((uint64_t)elapsed(now) * LEVELS / dur_);
     if (target > LEVELS)
       target = LEVELS;
     progress_ = target * 100 / LEVELS;
@@ -410,7 +425,7 @@ private:
     const int w = dst_->width(), h = dst_->height();
     const bool horiz = (dir_ == DIR_LEFT || dir_ == DIR_RIGHT);
     const int span = horiz ? w : h;
-    int s = (int)(elapsed(now) * span / dur_);
+    int s = (int)((uint64_t)elapsed(now) * span / dur_);
     if (s > span)
       s = span;
     progress_ = s * 100 / span;
@@ -460,7 +475,7 @@ private:
     const int w = dst_->width(), h = dst_->height();
     const bool horiz = (dir_ == DIR_LEFT || dir_ == DIR_RIGHT);
     const int span = horiz ? w : h;
-    int p = (int)(elapsed(now) * span / dur_);
+    int p = (int)((uint64_t)elapsed(now) * span / dur_);
     if (p > span)
       p = span;
     progress_ = p * 100 / span;
