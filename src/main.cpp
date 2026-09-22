@@ -11,6 +11,8 @@
 #include <M5Unified.h>
 #include <M5GFX.h>
 #include <M5ModuleRCA.h>
+
+#include "SafeArea.h"
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -126,32 +128,21 @@ static constexpr uint8_t SD_MISO = 38;
 static constexpr uint8_t SD_MOSI = 23;
 static constexpr size_t MAX_JPEG = 128 * 1024;
 static constexpr size_t AUDIO_CHUNK = 1024;
-static constexpr int CRT_W = 320, CRT_H = 240;
-// Área segura do tubo. Uma TV CRT corta cerca de 7% de cada borda (overscan),
-// então o raster inteiro nunca é visível: era isso que cortava o cabeçalho e o
-// ticker da tela de previsão do tempo na saída RCA. O fundo continua sangrando
-// até a borda do raster; texto, linhas e barras ficam dentro desta caixa.
-static constexpr int SAFE_X = 24, SAFE_Y = 18;
-static constexpr int SAFE_L = SAFE_X;          // 24
-static constexpr int SAFE_T = SAFE_Y;          // 18
-static constexpr int SAFE_R = CRT_W - SAFE_X;  // 296
-static constexpr int SAFE_B = CRT_H - SAFE_Y;  // 222
-static constexpr int SAFE_W = SAFE_R - SAFE_L; // 272
-// Cabeçalho padrão das telas da RCA (título, régua e início do corpo).
-static constexpr int HEAD_Y = SAFE_T;           // 18
-static constexpr int HEAD_RULE_Y = SAFE_T + 28; // 46
-static constexpr int BODY_Y = SAFE_T + 36;      // 54
-// Barra de legendas dos três botões, encostada na base da área segura.
-static constexpr int BAR_H = 20;
-static constexpr int BAR_Y = SAFE_B - BAR_H; // 202
-// Faixa do OSD do player, também dentro da área segura.
-static constexpr int OSD_H = 38;
-static constexpr int OSD_Y = SAFE_B - OSD_H; // 184
+// Geometria da saída composta: quadro, área segura do tubo e faixas padrão.
+// Definições em include/SafeArea.h, compartilhadas com o simulador de telas.
+static constexpr int CRT_W = crt::W, CRT_H = crt::H;
+static constexpr int SAFE_L = crt::SAFE_L, SAFE_T = crt::SAFE_T;
+static constexpr int SAFE_R = crt::SAFE_R, SAFE_B = crt::SAFE_B;
+static constexpr int SAFE_W = crt::SAFE_W;
+static constexpr int HEAD_Y = crt::HEAD_Y, HEAD_RULE_Y = crt::HEAD_RULE_Y;
+static constexpr int BODY_Y = crt::BODY_Y;
+static constexpr int BAR_H = crt::BAR_H, BAR_Y = crt::BAR_Y;
+static constexpr int OSD_H = crt::OSD_H, OSD_Y = crt::OSD_Y;
 // Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
 // 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
 static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
 // Weather Channel: faixa do ticker e cadências de consulta.
-static constexpr int TICKER_H = 16, TICKER_Y = SAFE_B - TICKER_H;
+static constexpr int TICKER_H = crt::TICKER_H, TICKER_Y = crt::TICKER_Y;
 static constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
 static constexpr uint32_t WEATHER_RETRY_MS = 30UL * 1000UL;
 static const char *WEATHER_MUSIC = "/M5RETRO/weather_music.wav";
