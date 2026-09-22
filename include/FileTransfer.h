@@ -611,6 +611,8 @@ public:
   uint64_t total() const { return _total; }
   uint16_t filesInstalled() const { return _installed; }
   const char *lastError() const { return _error; }
+  // Diagnóstico: o socket de escuta realmente subiu? (WiFiServer::operator bool)
+  bool listening() { return (bool)_server; }
   uint8_t percent() const {
     if (!_total)
       return 0;

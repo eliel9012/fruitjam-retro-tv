@@ -158,6 +158,14 @@ static constexpr int BAR_H = crt::BAR_H, BAR_Y = crt::BAR_Y;
 // preservando a luminância e a leitura de "azul claro". Regra de ouro de
 // gráficos para tubo: contraste por luminância, não por saturação.
 static constexpr uint16_t RCA_ACCENT = 0x96BC;
+// Itens do menu inicial. Uma constante só: já houve divergência entre o
+// desenho, a navegação por botão e o mapeamento de toque, e o resultado foi o
+// último item (DESLIGAR) ficar inalcançável.
+static constexpr int HOME_COUNT = 8;
+static constexpr int HOME_POWER_OFF = HOME_COUNT - 1;
+// Passo dos itens no LCD. Com 8 itens, 20 px faria o último cair sobre a faixa
+// de botões que começa em 184 e o toque em DESLIGAR teria 4 px úteis.
+static constexpr int HOME_LCD_Y0 = 40, HOME_LCD_STEP = 18;
 
 // Transferência de arquivos por Wi-Fi (include/FileTransfer.h + TransferScreen.h).
 xfer::FileTransfer fileTransfer;
@@ -2324,7 +2332,13 @@ void startTransfer() {
     setError(PTBR::SEM_WIFI);
     return;
   }
+  // Sem isto o Wi-Fi fica em modem sleep: o rádio só acorda a cada DTIM, o ping
+  // sobe para centenas de ms e o SYN de entrada se perde. Para receber dezenas
+  // de MB o rádio precisa ficar acordado. Religado ao sair, para não custar
+  // bateria nas outras telas.
+  WiFi.setSleep(false);
   if (!fileTransfer.begin(sdMutex)) {
+    WiFi.setSleep(true);
     setError(fileTransfer.lastError());
     return;
   }
@@ -2332,12 +2346,14 @@ void startTransfer() {
   lastTransferStage = xfer::Stage::Error; // garante o primeiro desenho
   lastTransferDraw = 0;
   drawTransferFrame();
-  Serial.printf("[M5RETRO] Transferencia em http://%s usuario:%s senha:%s\n",
-                fileTransfer.ip().c_str(), fileTransfer.user(), fileTransfer.password());
+  Serial.printf("[M5RETRO] Transferencia em http://%s:%u usuario:%s senha:%s escutando:%d\n",
+                fileTransfer.ip().c_str(), (unsigned)fileTransfer.port(), fileTransfer.user(),
+                fileTransfer.password(), (int)fileTransfer.listening());
 }
 
 void stopTransfer() {
   fileTransfer.stop();
+  WiFi.setSleep(true); // devolve a economia de energia às demais telas
   state = HOME;
   drawHome();
 }
@@ -2391,7 +2407,6 @@ void drawHome() {
   const char *items[] = {PTBR::VIDEOS,       PTBR::MUSICA,  PTBR::TRAFEGO,
                          PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA, PTBR::WEATHER,
                          PTBR::TRANSFERENCIA, PTBR::DESLIGAR};
-  constexpr int HOME_COUNT = 8;
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -2400,7 +2415,7 @@ void drawHome() {
   M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
   M5.Display.setTextSize(2);
   for (int i = 0; i < HOME_COUNT; i++) {
-    int y = 40 + i * 20;
+    int y = HOME_LCD_Y0 + i * HOME_LCD_STEP;
     bool selected = i == homeSelection;
     if (selected)
       M5.Display.fillRoundRect(12, y - 2, 296, 18, 4, RCA_ACCENT);
@@ -3241,11 +3256,11 @@ void handleNavigation(NavAction a) {
   }
   if (state == HOME) {
     if (a == NavAction::LEFT)
-      homeSelection = (homeSelection + 6) % 7;
+      homeSelection = (homeSelection + HOME_COUNT - 1) % HOME_COUNT;
     else if (a == NavAction::RIGHT)
-      homeSelection = (homeSelection + 1) % 7;
+      homeSelection = (homeSelection + 1) % HOME_COUNT;
     else if (a == NavAction::SELECT) {
-      if (homeSelection == 7) { // DESLIGAR: apaga o Core2 via AXP192.
+      if (homeSelection == HOME_POWER_OFF) { // DESLIGAR: apaga o Core2 via AXP192.
         requestPowerOff();
         return;
       }
@@ -3527,10 +3542,11 @@ void handleTouch() {
       button = touchButton(p.x, p.y);
     else {
       button = -1;
-      if (state == HOME && p.y >= 40 && p.y < 180) {
-        homeSelection = (p.y - 40) / 20;
-        if (homeSelection >= 7)
-          homeSelection = 6;
+      if (state == HOME && p.y >= HOME_LCD_Y0 &&
+          p.y < HOME_LCD_Y0 + HOME_COUNT * HOME_LCD_STEP) {
+        homeSelection = (p.y - HOME_LCD_Y0) / HOME_LCD_STEP;
+        if (homeSelection >= HOME_COUNT)
+          homeSelection = HOME_COUNT - 1;
         input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
       } else if (state == MUSIC_NOW_PLAYING && p.y >= 166 && p.y < 192 && p.x >= 16 && p.x < 304) {
         // Toque na região do progresso: alterna NORMAL -> SHUFFLE -> REPETIR -> NORMAL.
