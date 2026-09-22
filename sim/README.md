@@ -44,6 +44,16 @@ Para apontar para outra cópia do M5GFX:
 make -C sim M5GFX=/caminho/para/M5GFX/src
 ```
 
+## Exportar PNGs (headless)
+
+```sh
+./sim/build/m5sim --png docs/screens/rca
+```
+
+Desenha as oito telas e grava um PNG 320x240 de cada uma, sem abrir a janela.
+Serve para conferir diagramação em CI — inclusive um teste automático de que
+nada escapou da área segura.
+
 ## Teclas
 
 | Tecla | Ação |

@@ -12,22 +12,31 @@
 M5GFX ?= ../.pio/libdeps/m5stack-core2/M5GFX@0.2.29/src
 
 CXX      ?= c++
+CC       ?= cc
+CFLAGS   := -O2 -g -w -I$(M5GFX)
 CXXFLAGS := -std=c++17 -O2 -g -Wall -Wno-unused-parameter -Wno-sign-compare
-CXXFLAGS += -I$(M5GFX) -I../include $(shell sdl2-config --cflags)
+# O M5GFX inclui <SDL2/SDL.h>, então além do que o sdl2-config devolve
+# (.../include/SDL2) é preciso o diretório pai, para resolver o prefixo SDL2/.
+SDL_PREFIX := $(shell sdl2-config --prefix)
+CXXFLAGS += -I$(M5GFX) -I../include -I$(SDL_PREFIX)/include $(shell sdl2-config --cflags)
 LDFLAGS  := $(shell sdl2-config --libs)
 
 BUILD := build
 BIN   := $(BUILD)/m5sim
 
 # Todo o M5GFX menos os backends de MCU (só o caminho SDL é compilado aqui).
-M5GFX_SRC := $(shell find $(M5GFX) -name '*.cpp' \
-	-not -path '*/platforms/esp32*' \
+# Os utilitários em C (qoi, qrcode, pngle, tjpgd, miniz) e as fontes CJK são
+# referenciados pelo LGFXBase, então entram no link.
+EXCLUDE := -not -path '*/platforms/esp32*' \
 	-not -path '*/platforms/framebuffer/*' \
-	-not -path '*/platforms/arduino*' 2>/dev/null)
-SRC := src/main.cpp $(M5GFX_SRC)
-OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(notdir $(SRC)))
+	-not -path '*/platforms/arduino*'
+M5GFX_CPP := $(shell find $(M5GFX) -name '*.cpp' $(EXCLUDE) 2>/dev/null)
+M5GFX_C   := $(shell find $(M5GFX) -name '*.c' $(EXCLUDE) 2>/dev/null)
+OBJ := $(BUILD)/main.o \
+	$(patsubst %.cpp,$(BUILD)/%.o,$(notdir $(M5GFX_CPP))) \
+	$(patsubst %.c,$(BUILD)/%.c.o,$(notdir $(M5GFX_C)))
 
-VPATH := src:$(sort $(dir $(M5GFX_SRC)))
+VPATH := src:$(sort $(dir $(M5GFX_CPP)) $(dir $(M5GFX_C)))
 
 .PHONY: all run clean check
 
@@ -43,6 +52,9 @@ check:
 
 $(BUILD)/%.o: %.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/%.c.o: %.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BIN): $(OBJ)
 	$(CXX) $(OBJ) $(LDFLAGS) -o $@

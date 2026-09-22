@@ -268,36 +268,64 @@ static void drawCurrent(uint32_t ms, int tickerOffset) {
   drawGuide();
 }
 
+// O Panel_sdl bombeia os eventos na thread principal (obrigatório no Cocoa) e
+// roda esta função numa thread secundária, então aqui NÃO se chama nada do SDL.
+// A comunicação é pelos "GPIOs" emulados: o Panel_sdl derruba o pino no keydown
+// e levanta no keyup, e esta thread só lê o nível com gpio_in().
+static constexpr uint8_t PIN_PREV = 39;  // seta esquerda (padrão do Panel_sdl)
+static constexpr uint8_t PIN_NEXT = 37;  // seta direita  (padrão do Panel_sdl)
+static constexpr uint8_t PIN_GUIDE = 60; // tecla G
+static constexpr uint8_t PIN_QUIT = 61;  // tecla ESC
+static constexpr uint8_t PIN_SCREEN0 = 64; // teclas 1..8 -> 64..71
+
+static void registerKeys() {
+  lgfx::Panel_sdl::addKeyCodeMapping(SDLK_g, PIN_GUIDE);
+  lgfx::Panel_sdl::addKeyCodeMapping(SDLK_ESCAPE, PIN_QUIT);
+  for (int i = 0; i < SCREEN_COUNT; ++i)
+    lgfx::Panel_sdl::addKeyCodeMapping((SDL_KeyCode)(SDLK_1 + i), PIN_SCREEN0 + i);
+}
+
+// Nível baixo = tecla pressionada. Devolve true só na borda de descida.
+static bool pressed(uint8_t pin, bool *prev) {
+  const bool down = !lgfx::gpio_in(pin);
+  const bool edge = down && !*prev;
+  *prev = down;
+  return edge;
+}
+
 // Chamada em laço pelo Panel_sdl::main(). Retorna 0 para continuar.
 static int simLoop(bool *running) {
   static uint32_t tick = 0;
   static int tickerOffset = 0;
-  SDL_Event e;
-  while (SDL_PollEvent(&e)) {
-    if (e.type == SDL_QUIT) {
-      *running = false;
-      return 0;
+  static bool wasPrev = false, wasNext = false, wasGuide = false, wasQuit = false;
+  static bool wasScreen[SCREEN_COUNT] = {};
+
+  bool changed = false;
+  if (pressed(PIN_QUIT, &wasQuit)) {
+    *running = false;
+    return 0;
+  }
+  if (pressed(PIN_GUIDE, &wasGuide)) {
+    showGuide = !showGuide;
+    changed = true;
+  }
+  if (pressed(PIN_NEXT, &wasNext)) {
+    screenIndex = (screenIndex + 1) % SCREEN_COUNT;
+    changed = true;
+  }
+  if (pressed(PIN_PREV, &wasPrev)) {
+    screenIndex = (screenIndex + SCREEN_COUNT - 1) % SCREEN_COUNT;
+    changed = true;
+  }
+  for (int i = 0; i < SCREEN_COUNT; ++i) {
+    if (pressed(PIN_SCREEN0 + i, &wasScreen[i])) {
+      screenIndex = i;
+      changed = true;
     }
-    if (e.type != SDL_KEYDOWN)
-      continue;
-    const SDL_Keycode k = e.key.keysym.sym;
-    if (k == SDLK_ESCAPE) {
-      *running = false;
-      return 0;
-    } else if (k == SDLK_g) {
-      showGuide = !showGuide;
-    } else if (k == SDLK_RIGHT) {
-      screenIndex = (screenIndex + 1) % SCREEN_COUNT;
-    } else if (k == SDLK_LEFT) {
-      screenIndex = (screenIndex + SCREEN_COUNT - 1) % SCREEN_COUNT;
-    } else if (k >= SDLK_1 && k <= SDLK_8) {
-      screenIndex = k - SDLK_1;
-    } else {
-      continue;
-    }
+  }
+  if (changed)
     printf("[sim] tela: %s   guia de overscan: %s\n", SCREEN_NAMES[screenIndex],
            showGuide ? "ligada" : "desligada");
-  }
 
   tick += 33;
   tickerOffset = (tickerOffset + 2) % 512;
@@ -305,7 +333,36 @@ static int simLoop(bool *running) {
   return 0;
 }
 
-int main(int, char **) {
+// Modo headless: desenha cada tela e grava um PNG, sem abrir o laço da janela.
+// Útil para conferir a diagramação em CI ou para gerar os renders da documentação
+// com o rasterizador real, em vez dos mockups em Python.
+static int exportPng(const char *dir) {
+  char path[512];
+  for (screenIndex = 0; screenIndex < SCREEN_COUNT; ++screenIndex) {
+    drawCurrent(0, 0);
+    size_t len = 0;
+    uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, W, H);
+    if (!png) {
+      fprintf(stderr, "falha ao gerar PNG de %s\n", SCREEN_NAMES[screenIndex]);
+      return 1;
+    }
+    snprintf(path, sizeof(path), "%s/rca_%d_%s.png", dir, screenIndex + 1,
+             SCREEN_NAMES[screenIndex]);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+      fprintf(stderr, "nao consegui escrever %s\n", path);
+      free(png);
+      return 1;
+    }
+    fwrite(png, 1, len, f);
+    fclose(f);
+    free(png);
+    printf("[sim] %s (%zu bytes)\n", path, len);
+  }
+  return 0;
+}
+
+int main(int argc, char **argv) {
   panel.setWindowTitle("M5 RETRO TV - saida RCA (320x240, 4:3)");
   panel.setScaling(3, 3); // janela de 960x720; o quadro em si segue 320x240
   rca.setPanel(&panel);
@@ -314,6 +371,11 @@ int main(int, char **) {
     return 1;
   }
   rca.setColorDepth(16);
+  registerKeys();
+
+  if (argc >= 2 && !strcmp(argv[1], "--png"))
+    return exportPng(argc >= 3 ? argv[2] : ".");
+
   printf("[sim] ESQ/DIR ou 1..8 troca de tela, G liga/desliga a guia de overscan, ESC fecha.\n");
   printf("[sim] tela: %s\n", SCREEN_NAMES[screenIndex]);
   return lgfx::Panel_sdl::main(simLoop, 33);
