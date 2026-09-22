@@ -788,7 +788,6 @@ bool readAndShowOneFrame(bool render) {
   }
   if (!render)
     return true;
-  lastJpegUsed = used;
   const uint32_t started = millis();
   if (!jpeg.openRAM(jpegBuffer, used, jpegDraw)) {
     jpegErrors++;
@@ -818,6 +817,9 @@ bool readAndShowOneFrame(bool render) {
     videoReadError = true;
     return false;
   }
+  // Só agora o par (jpegBuffer, tamanho) está comprovadamente coerente, que é a
+  // pré-condição do redrawCurrentFrame().
+  lastJpegUsed = used;
   decodedFrames++;
   renderedFrames++;
   const uint32_t elapsed = millis() - started;
@@ -943,11 +945,19 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   }
   if (!jpegBuffer) {
     Serial.println("[BENCH] sem buffer JPEG");
+    if (sdMutex)
+      xSemaphoreTake(sdMutex, portMAX_DELAY);
     f.close();
+    if (sdMutex)
+      xSemaphoreGive(sdMutex);
     return;
   }
 
-  playback::MjpegReader reader;
+  // Reaproveita o leitor global: um MjpegReader local são 4104 bytes, e esta
+  // função roda na pilha do loopTask (8 KB), que ainda precisa de FATFS,
+  // deserializeJson e dos printf com float do relatório. O stopProgram() acima
+  // já resetou o leitor.
+  playback::MjpegReader &reader = mjpegReader;
   reader.reset();
   rca.fillScreen(TFT_BLACK);
   videoFrameIndex = 0;
@@ -962,7 +972,17 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   benchBlitCalls = 0;
   const int64_t wallStart = esp_timer_get_time();
 
+  uint32_t iterations = 0;
   while (frames < maxFrames) {
+    // O cão de guarda precisa respirar mesmo quando todo quadro dá erro: contar
+    // sucessos deixava os caminhos de falha girando sem yield e sem avançar o
+    // limite pedido pelo usuário.
+    if ((++iterations & 0x0F) == 0)
+      vTaskDelay(1);
+    if (errors > maxFrames) {
+      Serial.println("[BENCH] erros demais; abortando");
+      break;
+    }
     const int64_t frameStart = esp_timer_get_time();
 
     size_t used = 0;
@@ -1010,10 +1030,6 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
     maxDecodeUs = max(maxDecodeUs, dUs);
     maxTotalUs = max(maxTotalUs, uint32_t(esp_timer_get_time() - frameStart));
     ++frames;
-
-    // O cão de guarda precisa respirar num laço apertado e sem delay.
-    if ((frames & 0x0F) == 0)
-      vTaskDelay(1);
   }
 
   const uint64_t wallUs = uint64_t(esp_timer_get_time() - wallStart);
@@ -1061,8 +1077,13 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
                   metaFps);
   Serial.println("[BENCH] ----------------------------------------");
 
-  rca.fillScreen(TFT_BLACK);
+  // stopProgram() já levou o estado para VIDEO_LIBRARY; sem redesenhar, a TV
+  // ficava preta enquanto o LCD mostrava a tela anterior e os botões passavam a
+  // agir como se estivessem na biblioteca.
   videoFrameIndex = 0;
+  lastJpegUsed = 0;
+  state = VIDEO_LIBRARY;
+  drawLibrary();
 }
 
 bool startProgram(const String &dir) {
@@ -1133,6 +1154,10 @@ bool startProgram(const String &dir) {
 }
 void stopProgram() {
   playing = false;
+  // A música em loop do Weather Channel também segura o áudio: se ela continuar
+  // ligada, a condição de ocioso do audioTask nunca vale e a espera abaixo não
+  // termina nunca. Tem que cair ANTES do while, não depois.
+  weatherAudio = false;
   // Wait for the consumer to acknowledge idle before closing or replacing files.
   while (audioReady && !audioIdle)
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -1148,6 +1173,11 @@ void stopProgram() {
     xSemaphoreGive(sdMutex);
   uiHudClear(); // apaga só o HUD; o pôster permanece intacto no LCD
   playbackFinished = false;
+  // Sem isto o "pausado" vazava para a próxima tela: entrar no Weather depois de
+  // pausar um programa deixava o audioTask no ramo de pausa e a música nunca
+  // tocava, sem erro nenhum na tela.
+  paused = false;
+  lastJpegUsed = 0; // o conteúdo do jpegBuffer deixa de valer
   state = VIDEO_LIBRARY;
 }
 void videoTick() {
@@ -2496,8 +2526,8 @@ static bool weatherFetch(WeatherData &out) {
   client.setInsecure(); // sem CA (economiza RAM)
   HTTPClient http;
   http.useHTTP10(true);
-  http.setConnectTimeout(8000);
-  http.setTimeout(8000);
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
   bool ok = false;
   if (http.begin(client, WEATHER_URL)) {
     const int code = http.GET();
@@ -2573,6 +2603,10 @@ void weatherNetworkTask(void *arg) {
   } else {
     weatherStatus.store("ERRO NA CONSULTA");
     Serial.println("[M5RETRO] Tempo: falha na consulta");
+    // Sem isso a tela fica presa em "CARREGANDO..." quando a PRIMEIRA consulta
+    // falha: weatherTick() só redesenha quando a versão muda.
+    if (!weatherReady.load())
+      weatherVersion.fetch_add(1);
   }
   weatherBusy.store(false);
   vTaskDelete(nullptr);
@@ -2587,10 +2621,13 @@ void pollWeather() {
     return;
   }
   const uint32_t now = millis();
-  if (weatherReady.load()) {
-    if (now - lastWeatherGood < WEATHER_REFRESH_MS)
-      return;
-  } else if (lastWeatherAttempt && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+  // O backoff vale para toda tentativa, não só antes da primeira que der certo.
+  // Antes, com dados já em mãos, o único portão era lastWeatherGood: se a
+  // consulta falhasse ele não avançava, a condição seguia falsa e cada loop()
+  // criava outra tarefa HTTP de 8 KB — dezenas por segundo com o roteador fora.
+  if (lastWeatherAttempt && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+    return;
+  if (weatherReady.load() && now - lastWeatherGood < WEATHER_REFRESH_MS)
     return;
   lastWeatherAttempt = now;
   weatherBusy.store(true);
@@ -3456,8 +3493,7 @@ void serviceDiagnostics() {
       stopProgram();
       startWeather();
     } else if (command == "diag music") {
-      weatherAudio = false; // para a música do weather (se ativa) antes de stopProgram
-      stopProgram();
+      stopProgram(); // já encerra a música do Weather Channel, se estiver ativa
       musicDir = MUSIC_ROOT;
       musicScanDir();
       state = MUSIC_BROWSER;

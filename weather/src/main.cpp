@@ -452,14 +452,14 @@ static void pollWeather() {
     return;
   }
   const uint32_t now = millis();
-  if (weatherValid.load()) {
-    if (now - lastWeatherGood < WEATHER_REFRESH_MS)
-      return;   // cadência normal de 10 minutos
-  } else {
-    // Primeira consulta (ou falhas consecutivas): evita retry em loop apertado.
-    if (lastWeatherAttempt != 0 && now - lastWeatherAttempt < WEATHER_RETRY_MS)
-      return;
-  }
+  // O backoff vale para toda tentativa, não só antes da primeira que der certo.
+  // Antes, com dados já em mãos, o único portão era lastWeatherGood: se a
+  // consulta falhasse ele não avançava, a condição seguia falsa e cada loop()
+  // criava outra tarefa HTTP de 8 KB — dezenas por segundo com o roteador fora.
+  if (lastWeatherAttempt != 0 && now - lastWeatherAttempt < WEATHER_RETRY_MS)
+    return;
+  if (weatherValid.load() && now - lastWeatherGood < WEATHER_REFRESH_MS)
+    return;   // cadência normal de 10 minutos
   lastWeatherAttempt = now;
   weatherBusy.store(true);
   int next = 1 - weatherActive.load();   // buffer oposto ao exibido
@@ -687,7 +687,7 @@ static void drawScreen() {
 }
 
 static void drawTicker() {
-  if (tickerOffsetPx >= tickerWrapAt)
+  if (tickerWrapAt > 0 && tickerOffsetPx >= tickerWrapAt)
     tickerOffsetPx -= tickerWrapAt;
 
   // Desenha no sprite (buffer offline), então copia para a tela sem flicker.
