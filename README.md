@@ -195,6 +195,10 @@ Os testes nativos usam um compilador C++ com AddressSanitizer/UndefinedBehaviorS
 sintéticos temporários, testa áudio e silêncio, lê os contêineres e decodifica os quadros com a
 mesma JPEGDEC fixada no firmware. Não mede FPS nem valida saída analógica do Core2.
 
+`AGENTS.md` descreve a arquitetura do firmware, as restrições de hardware que não
+são negociáveis e as armadilhas já conhecidas — é o ponto de partida para quem
+(ou o que) for mexer no código.
+
 Consulte `PLANO_E_REVISAO.md` para os problemas encontrados, as etapas executadas e o roteiro
 de teste físico. `PINOUT.md` descreve as conexões utilizadas pelo código.
 
