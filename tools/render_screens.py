@@ -268,17 +268,23 @@ def music_playing():
     s.save("docs/screens/music_playing.png")
 
 def weather():
+    # Tela da saida RCA. Todo o conteudo fica na area segura do tubo
+    # (SAFE_L=24, SAFE_T=18, SAFE_B=222), porque a TV CRT corta ~7% de
+    # cada borda por overscan; so o fundo sangra ate o limite do raster.
+    SAFE_L, SAFE_T, SAFE_W, SAFE_B = 24, 18, 272, 222
+    TICKER_H = 16
+    TICKER_Y = SAFE_B - TICKER_H  # 206
     s = Screen()
     s.fill_screen(NAVY)
-    s.text("FRANCA - SP", 160, 6, YELLOW, M, "mc")
-    s.hline(8, 42, 304, CYAN)
-    s.text("SUNNY", 160, 54, WHITE, M, "mc")
-    s.text("26 C", 160, 104, YELLOW, L, "mc")
-    s.text("UMIDADE  62%", 160, 178, WHITE, S, "mc")
-    s.text("VENTO  12 KM/H  NW", 160, 198, WHITE, S, "mc")
-    s.hline(8, 222, 304, CYAN)
-    s.rect(0, 224, W, 16, BLACK)
-    s.text("SEG 26/15 SUNNY    TER 27/14 CLOUDY    QUA 25/12 RAIN ...", 160, 228, WHITE, S, "mc")
+    s.text("FRANCA - SP", 160, SAFE_T, YELLOW, M, "mc")
+    s.hline(SAFE_L, SAFE_T + 30, SAFE_W, CYAN)
+    s.text("PARCIAL NUBLADO", 160, SAFE_T + 40, WHITE, M, "mc")
+    s.text("26 C", 160, SAFE_T + 76, YELLOW, L, "mc")
+    s.text("UMIDADE  62%", 160, SAFE_T + 138, WHITE, S, "mc")
+    s.text("VENTO  12 KM/H  SO", 160, SAFE_T + 158, WHITE, S, "mc")
+    s.hline(SAFE_L, TICKER_Y - 4, SAFE_W, CYAN)
+    s.rect(0, TICKER_Y, W, TICKER_H, BLACK)
+    s.text("SEG 26/15C    TER 27/14C    QUA 25/12C", 160, TICKER_Y + 4, WHITE, S, "mc")
     s.save("docs/screens/weather.png")
 
 def main():

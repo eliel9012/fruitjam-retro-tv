@@ -1,10 +1,13 @@
 # The Weather Channel — Local Forecast (clone anos 80)
 
 Firmware para **M5Stack Core2** + módulo **RCA (M125)**: saída de vídeo composto
-(PAL-M) para TV e áudio pelo RCA, recriando a estética do *Local Forecast* dos
-anos 80. Os dados vêm do [wttr.in](https://wttr.in) (`Franca?format=j1`), lidos
-pela rede Wi-Fi e exibidos com uma fonte bitmap estilo VCR/teletexto sobre fundo
-azul-escuro, com um ticker de previsão rolando no rodapé.
+(NTSC) para TV e áudio pelo RCA, recriando a estética do *Local Forecast* dos
+anos 80. Os dados vêm da [Open-Meteo](https://open-meteo.com) — API pública,
+sem cadastro nem chave — lidos pela rede Wi-Fi e exibidos com uma fonte bitmap
+estilo VCR/teletexto sobre fundo azul-escuro, com um ticker de previsão rolando
+no rodapé. Todo o conteúdo é desenhado dentro da área segura do tubo (margem de
+24 px na horizontal e 18 px na vertical), porque a TV corta cerca de 7% de cada
+borda por overscan.
 
 ## Arquitetura FreeRTOS
 
@@ -22,10 +25,11 @@ No **core 1** ficam o `loop()` do Arduino e a tarefa HTTP periódica
 estática apenas quando chegam dados novos e desliza o ticker de forma
 **não-bloqueante** usando `millis()` (2 px a cada ~33 ms), sem `delay()` longo e
 sem travar o áudio. A tarefa HTTP roda em prioridade baixa (abaixo do loop e do
-áudio), a cada ~10 minutos, faz o `GET` em `wttr.in`, extrai só os campos
-necessários com `DeserializationOption::Filter` do ArduinoJson 7 e publica o
+áudio), a cada ~10 minutos, faz o `GET` na Open-Meteo, lê a resposta inteira
+(~800 bytes) para um buffer de 4 KiB, parseia com o ArduinoJson 7 e publica o
 resultado num buffer duplo protegido por atômicos — o loop apenas consome, sem
-tearing.
+tearing. A resposta é rejeitada quando chega truncada, em vez de publicar dados
+pela metade.
 
 ## Gravação
 

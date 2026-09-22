@@ -1,6 +1,6 @@
 # M5 RETRO TV — Core2 + Module13.2 RCA M125
 
-Firmware Arduino/ESP32 para reprodução de MJPEG + WAV no cartão microSD, saída composta PAL-M,
+Firmware Arduino/ESP32 para reprodução de MJPEG + WAV no cartão microSD, saída composta NTSC,
 pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em português.
 
 ## Estrutura do repositório
@@ -10,7 +10,7 @@ pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em p
   ele mostra um pôster estático + um HUD de 1 Hz (tempo e barra de progresso) via um
   `LGFX_Sprite` minúsculo. O vídeo sai somente pela RCA.
 - `weather/`: firmware alternativo, projeto PlatformIO separado — clone do
-  "The Weather Channel Local Forecast" (wttr.in + ticker + smooth jazz em loop).
+  "The Weather Channel Local Forecast" (Open-Meteo + ticker + smooth jazz em loop).
   Consulte `weather/README.md`.
 
 ## Telas
@@ -34,6 +34,24 @@ pôster estático no LCD e consulta de tráfego aéreo por HTTPS. Interface em p
 | Música | Now Playing (capa + ID3) |
 |---|---|
 | ![Music](docs/screens/music.png) | ![Music Playing](docs/screens/music_playing.png) |
+
+## Saída composta (RCA)
+
+O sinal é **NTSC** (525 linhas, 59,94 Hz, preto em 7,5 IRE). O modo `PAL_M` do
+M5GFX foi abandonado porque a tabela de sinal dele monta a linha com 908
+amostras, enquanto 4 × 3,57561149 MHz × 63,5556 µs dá 909,02: a linha sai ~0,11%
+curta, a fase da burst de cor anda a cada linha e o resultado na TV é uma faixa
+de cor diagonal caminhando pela tela. A tabela NTSC usa 910 amostras, valor
+exato para 4 × 3,579545 MHz, então a burst fica estável. TVs brasileiras de tubo
+com entrada de vídeo composto aceitam NTSC.
+
+Todo o texto, régua e faixa desenhados na RCA ficam dentro da **área segura**
+(`SAFE_*` em `src/main.cpp`): margem de 24 px na horizontal e 18 px na vertical,
+ou seja ~7% de cada borda, que é o que um tubo tipicamente esconde por overscan.
+O fundo continua preenchendo o raster inteiro, então não aparecem tarjas pretas.
+Vídeos continuam sendo centralizados no quadro de 320×240; num tubo as bordas
+externas desse quadro caem no overscan, então mídia acima de ~272×204 perde as
+extremidades na tela — o padrão de 240×160 do conversor cabe inteiro.
 
 ## Compilar
 

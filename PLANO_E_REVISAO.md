@@ -14,7 +14,7 @@ O original foi preservado em um arquivo de backup separado.
 | 4. Navegação e configuração | Menu, toque, paginação, portal, persistência e reconexão | Implementada; testes de software e USB |
 | 5. Rede/radar | Vida útil do certificado, autenticação, validação de posição e timeouts | Validado no Core2: HTTPS 200 e 22 aeronaves |
 | 6. Verificação e distribuição | Testes nativos, decodificação real, build ESP32, exportação consistente | Concluída |
-| 7. Bancada | Gravação no Core2, PAL-M, som, toque físico e medição de desempenho | Deploy USB e testes do player executados; RCA físico pendente |
+| 7. Bancada | Gravação no Core2, NTSC, som, toque físico e medição de desempenho | Deploy USB e testes do player executados; RCA físico pendente |
 
 ## Falhas encontradas e correções
 
@@ -85,7 +85,11 @@ A contagem de leituras é do teste em memória; não é uma medição de FPS ou 
 
 ## Conferências físicas ainda necessárias
 
-1. Conectar uma TV/monitor e alto-falantes às saídas RCA; conferir PAL-M, cores, som e sincronismo labial.
+1. Conectar uma TV/monitor e alto-falantes às saídas RCA; conferir NTSC, cores, som e sincronismo labial.
+   O sinal saiu de `PAL_M` para `NTSC`: a tabela PAL_M do M5GFX usa 908 amostras por linha, contra as
+   909,02 exigidas por 4 × 3,57561149 MHz, o que fazia a fase da burst andar e produzia uma faixa de cor
+   diagonal na tela. As telas da RCA passaram a respeitar a área segura (`SAFE_*`, ~7% de cada borda),
+   porque cabeçalho e ticker caíam no overscan do tubo e apareciam cortados.
 2. Confirmar visualmente no LCD a correção das cores e tocar nos novos botões de áudio e voltar.
 3. Medir o perfil 320×240, cartões lentos e uma biblioteca com mais de quatro programas no hardware.
 4. Conferir volume 0/50/100 e configuração do portal pelo navegador de um celular.
