@@ -382,6 +382,25 @@ Lista curta do que já quebrou, para não repetir.
 9. **Texto externo sem normalizar** — acento vira buraco duplo.
 10. **Sprite com profundidade diferente do painel** — cor errada em silêncio, e
     memória dobrada.
+11. **Passar cor como `uint32_t` para o LovyanGFX** — o formato é escolhido pelo
+    **tipo do argumento**, não pelo valor. Em `misc/colortype.hpp:861-866`,
+    `uint8_t` vira RGB332, `uint16_t`/`int16_t`/`int32_t` viram RGB565 e
+    `uint32_t` vira **RGB888**. Um `(uint32_t)0xBDF7` é lido como `0x00BDF7`, ou
+    seja R=0, G=189, B=247: o cinza das barras SMPTE saía esverdeado. Como
+    literal `int` funciona (é `int32_t`), o erro só aparece em quem escreve o
+    cast — e não dá aviso nenhum. Passe `uint16_t`.
+12. **`>> 8` para escalar amostra com sinal** — o deslocamento arredonda para
+    −infinito, a divisão trunca em direção ao zero. No gerador do tom de 1 kHz,
+    220 das 441 amostras são negativas e cada uma perdia 1 LSB: −218 por
+    período, −10900 de offset DC em um segundo, mandado para o amplificador. Em
+    aritmética de ponto fixo com sinal, use `/ 256` ou arredonde de propósito.
+13. **Binário de teste sobrevivendo ao fonte apagado** — um `probe_*` em
+    `sim/build/` continua executável depois que o `.cpp` sai, e acusa bugs já
+    corrigidos como se fossem regressões. Se um teste falhar apontando algo que
+    você sabe que foi resolvido, confira se o fonte ainda existe.
+14. **Probe que escreve PNG rodado da raiz do repositório** — o caminho é
+    relativo a `sim/`, o `fopen` devolve NULL, e um `fprintf` em cima disso é
+    segfault sem nenhuma saída. Rode de dentro de `sim/`, e confira o `fopen`.
 
 ---
 
