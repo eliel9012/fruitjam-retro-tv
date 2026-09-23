@@ -262,7 +262,8 @@ the build was validated with PlatformIO.
 
 Serial at 115200 baud: `diag status`, `diag colors`, `diag play`, `diag pause`,
 `diag resume`, `diag stop`, `diag back`, `diag home`, `diag radar`,
-`diag weather`, `diag music`, `diag bench` and `diag audio toggle`. The last one
+`diag weather`, `diag music`, `diag bench`, `diag fb`, `diag cores`, `diag scan`
+and `diag audio toggle`. The last one
 uses the same routine as the player button. The status line reports audio output,
 errors, PCM samples, dropped frames, heap and HTTP result, without printing
 credentials.
@@ -313,6 +314,34 @@ blending: the composite framebuffer has no alpha channel and there is no SRAM
 headroom for two whole frames. Condition icons (`include/WeatherIcons.h`) are
 chosen by Open-Meteo's WMO code, not by matching text.
 
+### Colour depth and frame rate
+
+The composite framebuffer runs at **RGB565**, set explicitly — `Panel_CVBS`
+defaults to RGB332, which caps the picture at **256 colours**. Measured on the
+device: a frame holding 5,584 distinct colours in the file reached the
+framebuffer with 74 to 98. That, and not the MJPEG encoding, was the source of
+the washed-out colour. Encoder settings make no difference: the same source
+frame at `q5 4:2:0`, `q2 4:2:0` and `q2 4:4:4` all land within 3,300 to 3,460
+distinct colours after RGB565 quantisation, while costing up to twice the
+bitrate.
+
+RGB565 needs 153,600 bytes, which does not fit in internal SRAM, so the panel
+runs with `psram_half_use`: half the scanlines live in PSRAM behind a line
+cache, and internal SRAM use stays at the same 76,800 bytes as before. The
+trade, measured with `diag bench` at 240x160:
+
+| | RGB332 | RGB565 |
+|---|---|---|
+| colours in the framebuffer | 74-98 | 894 |
+| ceiling | 256 | 65,536 |
+| JPEG decode | 20.6 ms | 25.3 ms |
+| CVBS blit | 7.45 ms | 12.3 ms |
+| sustained FPS | 31.1 | 23.5 |
+
+Nine times the colour for 24% of the frame rate. At the converter's 240x160 and
+15 fps default that leaves 57% of headroom, so the trade is free; at 320x240 and
+30 fps the device was already skipping frames and skips more.
+
 ### Memory budget
 
 The scarce resource is **not PSRAM** — it is internal SRAM. The composite video
@@ -325,7 +354,11 @@ Out of PSRAM (4.5 MB) come the JPEG buffer (`MAX_JPEG`, 128 KiB), the TLS buffer
 and the artwork and HUD sprites — under 3% of the total. There is nothing to save
 there, and saving it would gain nothing.
 
-The colour test checks the native RGB565 path used by the JPEG blocks. Visually
+`diag fb` reports the framebuffer's depth and size, `diag cores` counts the
+distinct RGB565 colours it currently holds, and `diag scan` reads rows back to
+show where ink actually landed — the three that turned the colour question from
+guesswork into measurement. The colour test checks the native RGB565 path used
+by the JPEG blocks. Visually
 inspecting the picture and measuring the RCA outputs require physical
 observation and connection.
 
@@ -554,7 +587,8 @@ a compilação foi validada pelo PlatformIO.
 
 Serial a 115200 baud: `diag status`, `diag colors`, `diag play`, `diag pause`,
 `diag resume`, `diag stop`, `diag back`, `diag home`, `diag radar`,
-`diag weather`, `diag music`, `diag bench` e `diag audio toggle`. O último comando
+`diag weather`, `diag music`, `diag bench`, `diag fb`, `diag cores`, `diag scan`
+e `diag audio toggle`. O último comando
 usa a mesma rotina do botão do player. O status informa saída de áudio, erros,
 amostras PCM, quadros descartados, heap e resultado HTTP, sem imprimir
 credenciais.
@@ -603,6 +637,33 @@ mistura por alfa: o framebuffer composto não tem canal alfa e não há folga de
 SRAM para dois quadros inteiros. Os ícones de condição (`include/WeatherIcons.h`)
 são escolhidos pelo código WMO da Open-Meteo, não pelo texto.
 
+### Profundidade de cor e taxa de quadros
+
+O framebuffer composto roda em **RGB565**, definido explicitamente — o padrão do
+`Panel_CVBS` é RGB332, que limita a imagem a **256 cores**. Medido no aparelho:
+um quadro com 5.584 cores distintas no arquivo chegava ao framebuffer com 74 a
+98. Era isso, e não a codificação MJPEG, que lavava a cor. Configuração de
+codificador não muda nada: o mesmo quadro fonte em `q5 4:2:0`, `q2 4:2:0` e
+`q2 4:4:4` fica entre 3.300 e 3.460 cores após a quantização RGB565, custando
+até o dobro de banda.
+
+RGB565 pede 153.600 bytes, que não cabem na SRAM interna, então o painel usa
+`psram_half_use`: metade das linhas fica na PSRAM atrás de um cache de linha, e
+o consumo de SRAM interna continua nos mesmos 76.800 bytes. A troca, medida com
+`diag bench` a 240x160:
+
+| | RGB332 | RGB565 |
+|---|---|---|
+| cores no framebuffer | 74-98 | 894 |
+| teto | 256 | 65.536 |
+| decode JPEG | 20,6 ms | 25,3 ms |
+| blit CVBS | 7,45 ms | 12,3 ms |
+| FPS sustentado | 31,1 | 23,5 |
+
+Nove vezes mais cor por 24% da taxa de quadros. No padrão de 240x160 a 15 fps do
+conversor sobram 57% de folga, então a troca sai de graça; em 320x240 a 30 fps o
+aparelho já descartava quadros e passa a descartar mais.
+
 ### Orçamento de memória
 
 O recurso apertado **não é a PSRAM** — é a SRAM interna. O framebuffer do vídeo
@@ -615,7 +676,11 @@ Da PSRAM (4,5 MB) saem o buffer de JPEG (`MAX_JPEG`, 128 KiB), os buffers do
 TLS e os sprites de capa e do HUD — menos de 3% do total. Não há o que economizar
 ali, e economizar não renderia nada.
 
-O teste de cores confere o caminho RGB565 nativo usado pelos blocos JPEG. A
+`diag fb` informa a profundidade e o tamanho do framebuffer, `diag cores` conta
+quantas cores RGB565 distintas ele contém, e `diag scan` lê linhas de volta para
+mostrar onde a tinta caiu de fato — os três que tiraram a questão das cores do
+chute e a puseram na medição. O teste de cores confere o caminho RGB565 nativo
+usado pelos blocos JPEG. A
 conferência visual da imagem e a medição das saídas RCA exigem observação e
 conexão física.
 

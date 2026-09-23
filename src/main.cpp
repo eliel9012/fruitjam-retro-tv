@@ -199,7 +199,7 @@ const char *MUSIC_ROOT = "/M5RETRO/music";
 // diagonal que caminha pela tela. A tabela NTSC usa 910 amostras, que é o valor
 // exato para 4x3,579545 MHz, então a burst fica estável.
 M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::NTSC,
-                M5ModuleRCA::use_psram_t::psram_no_use, CVBS_PIN, 200);
+                M5ModuleRCA::use_psram_t::psram_half_use, CVBS_PIN, 200);
 JPEGDEC jpeg;
 playback::MjpegReader mjpegReader;
 bool videoReadError = false;
@@ -3700,6 +3700,37 @@ void serviceDiagnostics() {
       memset(line, 0, sizeof(line));
       continue;
     }
+    if (command == "diag fb") {
+      Serial.printf("[FB] profundidade=%d bits  %dx%d  bytes=%d\n",
+                    (int)(rca.getColorDepth() & 0xFF), rca.width(), rca.height(),
+                    rca.width() * rca.height() * ((rca.getColorDepth() & 0xFF) / 8));
+      memset(line, 0, sizeof(line));
+      continue;
+    }
+    if (command == "diag cores") {
+      // Conta cores RGB565 distintas no framebuffer inteiro. Responde onde a cor
+      // se perde: se o valor bater com o do arquivo, o caminho digital está
+      // intacto e o que reduz cor é o elo analógico (largura de banda de croma
+      // do NTSC), não o MJPEG.
+      static uint16_t linha[CRT_W];
+      static uint8_t vistos[8192]; // bitmap de 65536 valores
+      memset(vistos, 0, sizeof(vistos));
+      uint32_t distintas = 0;
+      for (int y = 0; y < CRT_H; ++y) {
+        rca.readRect(0, y, CRT_W, 1, linha);
+        for (int x = 0; x < CRT_W; ++x) {
+          const uint16_t c = (uint16_t)((linha[x] >> 8) | (linha[x] << 8)); // readRect troca os bytes
+          if (!(vistos[c >> 3] & (1u << (c & 7)))) {
+            vistos[c >> 3] |= (uint8_t)(1u << (c & 7));
+            ++distintas;
+          }
+        }
+      }
+      Serial.printf("[CORES] distintas no framebuffer: %lu de 76800 pixels\n",
+                    (unsigned long)distintas);
+      memset(line, 0, sizeof(line));
+      continue;
+    }
     if (command == "diag scan") {
       // Lê o framebuffer de volta e diz em QUE LINHAS existe tinta do ticker
       // (ciano) e tinta clara. Se o texto do ticker aparecer fora da faixa,
@@ -3873,6 +3904,13 @@ void setup() {
     drawBackButton();
     return;
   }
+  // RGB565. O padrão do Panel_CVBS é RGB332, de 256 cores: medido no aparelho,
+  // um quadro com 5.584 cores no arquivo chegava ao framebuffer com 74 a 98. E
+  // como a JPEGDEC entrega RGB565, cada pixel ainda pagava uma conversão — o
+  // blit custava 193 ns/pixel, 46 ciclos a 240 MHz, para o que deveria ser
+  // cópia. Com psram_half_use o consumo de SRAM interna continua o mesmo
+  // (76.800 B), porque metade das linhas vai para a PSRAM com cache de linha.
+  rca.setColorDepth(16);
   rca.setOutputBoost(true);
   dualText(PTBR::APP, PTBR::INICIANDO);
   if (!jpegBuffer) {
