@@ -22,6 +22,7 @@
 #include "Subtitles.h"
 #include "BurnIn.h"
 #include "VhsFx.h"
+#include "AudioScope.h"
 #include "VcrOsd.h"
 #include "WeatherIcons.h"
 #include "ScreenFx.h"
@@ -327,6 +328,13 @@ burnin::Manager idleMgr;
 // Artefatos de fita sobre a reproducao. 972 B de SRAM (tabela de deslocamento
 // por linha + um buffer de uma linha). Global, nunca na pilha de tarefa.
 vhs::Filter vhsFilter;
+// Visualizador de audio. O Tap e escrito pelo audioTask no core 0 e lido pelo
+// loop no core 1: a entrega e por seqlock de banco duplo, sem mutex e sem
+// espera -- segurar o audioTask para salvar um quadro de analise trocaria um
+// defeito invisivel por um audivel. 1.152 B de SRAM no total.
+audioscope::Tap audioTap;
+audioscope::Scope audioScope;
+bool musicScopeOn = true;
 // Tom de referencia de 1 kHz do padrao de barras. Atomico porque quem liga e o
 // loop (core 1) e quem consome e o audioTask (core 0).
 std::atomic<bool> toneActive{false};
@@ -770,6 +778,7 @@ void audioTask(void *) {
         continue;
       }
       playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
+      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
       const size_t bytes = amostras * sizeof(int16_t);
       size_t written = 0;
       if (active == AudioOutput::RCA)
@@ -785,6 +794,7 @@ void audioTask(void *) {
           testTone.fillPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
       const size_t bytes = amostras * sizeof(int16_t);
       playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
+      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
       size_t written = 0;
       if (active == AudioOutput::RCA)
         i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
@@ -883,6 +893,7 @@ void audioTask(void *) {
       }
     }
     playback::scalePcm(reinterpret_cast<int16_t *>(buf), bytes / sizeof(int16_t), playbackVolume.load());
+    audioTap.publish(reinterpret_cast<int16_t *>(buf), bytes / sizeof(int16_t), wavChannels);
     size_t delivered = bytes;
     if (active == AudioOutput::RCA) {
       size_t written = 0;
@@ -2200,6 +2211,17 @@ void drawMusicNowPlaying() {
     d->setTextSize(1);
     // Capa do álbum (esquerda) com borda estilo VHS.
     const int coverY = BODY_Y + 8;
+    // No tubo, o visualizador OCUPA a faixa da capa e dos metadados. Nao ha
+    // outro lugar: a capa vai de 62 a 150, o progresso de 160 a 192 e a faixa
+    // de botoes comeca em 202 -- nao sobra vao de 48 linhas em canto nenhum.
+    // A troca e boa de qualquer forma: quem le o nome da faixa olha o LCD, e o
+    // tubo ganha imagem em movimento, que e o que o anti-queima quer.
+    if (d == static_cast<M5GFX *>(&rca) && musicScopeOn) {
+      audioScope.x = SAFE_L + 8;
+      audioScope.y = coverY + 20; // 82..130, centrado na faixa da capa
+      audioscope::drawStatic(d, 0, 0, audioScope);
+      audioscope::drawModeLabel(d, 0, 0, audioScope);
+    } else {
     if (coverSprite) {
       const int cw = coverSprite->width(), ch = coverSprite->height();
       const float sc = min(min(88.0f / cw, 88.0f / ch), 1.6f);
@@ -2216,6 +2238,7 @@ void drawMusicNowPlaying() {
     d->drawString(truncateText(musicMeta.album[0] ? musicMeta.album : "---", 24), metaX, coverY + 50);
     if (musicMeta.year[0])
       d->drawString(musicMeta.year, metaX, coverY + 70);
+    } // fim do ramo sem visualizador
     // Nº da faixa + bitrate (canto sup. direito, à esquerda do botão voltar).
     if (trackNo.length()) {
       String meta = trackNo;
@@ -2337,6 +2360,10 @@ static size_t mp3ReadPcm(int16_t *dst, size_t samples) {
 }
 
 bool startMusic(const String &path) {
+  // Estado do visualizador zerado ao entrar: sem isto a faixa nova herdaria as
+  // barras da anterior por alguns quadros (armadilha 6 do AGENTS.md).
+  audioTap.clear();
+  audioscope::reset(audioScope);
   // Garante I2S1 livre: encerra qualquer vídeo/weather em andamento.
   playing = false;
   while (audioReady && !audioIdle && !audioFailed)
@@ -3581,6 +3608,8 @@ void enterRadio() {
   }
   radioActive = true;
   radioLastDraw = 0;
+  audioTap.clear();
+  audioscope::reset(audioScope);
   state = RADIO;
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
@@ -4049,6 +4078,22 @@ void handleTouch() {
           homeSelection = hit;
           input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
         }
+      } else if (state == MUSIC_NOW_PLAYING && p.y >= BODY_Y + 8 && p.y < BODY_Y + 96 &&
+                 p.x >= SAFE_L && p.x < SAFE_L + 88) {
+        // Toque na capa (no LCD) alterna o visualizador do tubo: OSCILOSCOPIO ->
+        // ESPECTRO -> VU, e um quarto toque desliga e devolve capa e metadados
+        // ao CRT. Os tres botoes ja estao tomados nesta tela (voltar, pausa,
+        // faixa anterior/proxima), entao a zona da arte e o lugar que sobrou --
+        // e tocar a arte para mudar o que a TV mostra se explica sozinho.
+        if (!musicScopeOn) {
+          musicScopeOn = true;
+          audioscope::setMode(audioScope, audioscope::SCOPE);
+        } else if (audioScope.mode == audioscope::MODE_COUNT - 1) {
+          musicScopeOn = false;
+        } else {
+          audioscope::cycleMode(audioScope);
+        }
+        drawMusicNowPlaying();
       } else if (state == MUSIC_NOW_PLAYING && p.y >= 166 && p.y < 192 && p.x >= 16 && p.x < 304) {
         // Toque na região do progresso: alterna NORMAL -> SHUFFLE -> REPETIR -> NORMAL.
         if (musicRepeat) {
@@ -4626,6 +4671,8 @@ void loop() {
   }
   if (state == MUSIC_NOW_PLAYING) {
     musicTick();
+    if (musicScopeOn)
+      audioscope::tick(&rca, 0, 0, audioScope, audioTap, millis());
   }
   if (state == FILE_TRANSFER) {
     transferTick();

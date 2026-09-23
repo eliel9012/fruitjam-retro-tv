@@ -271,6 +271,15 @@ constexpr int PANEL_H = 48;
 constexpr int DEFAULT_X = crt::SAFE_L + (crt::SAFE_W - PANEL_W) / 2; // 32
 constexpr int DEFAULT_Y = 100;
 
+// AVISO AO INTEGRADOR: com y = 100 o painel ocupa as linhas 99 a 148, que na
+// MUSIC_NOW_PLAYING de hoje sao da capa do album (24..112 x 62..150) e da
+// metade de baixo dos metadados. Essa tela esta cheia: header ate 46, capa e
+// tags 62..150, barra de progresso 160..166, relogio 174..182, e a base da
+// area segura em 222. Nao sobram 50 linhas livres em lugar nenhum — abrir
+// espaco e decisao de quem integra (encolher a capa de 88 para 64 px ja
+// libera as linhas 96..150, por exemplo). Mova o painel escrevendo Scope::x /
+// Scope::y; toda a geometria deste arquivo e relativa a esse canto.
+
 // Barras: 12 x 19 + 11 x 2 = 250, sobrando 3 px de folga a esquerda.
 constexpr int BAR_W = 19;
 constexpr int BAR_GAP = 2;
@@ -628,6 +637,9 @@ inline void setMode(Scope &s, Mode m) {
   memset(s.drawnLevel, 0, sizeof(s.drawnLevel));
   memset(s.drawnPeak, 0, sizeof(s.drawnPeak));
   s.drawnVuL = s.drawnVuR = s.drawnVuPeakL = s.drawnVuPeakR = 0;
+  // `work` pode conter dado JANELADO (analyzeSpectrum destroi a onda in loco);
+  // o osciloscopio desenharia isso ate a proxima janela chegar.
+  memset(s.work, 0, sizeof(s.work));
   for (int i = 0; i < N; ++i) {
     s.prevTop[i] = 1;
     s.prevBot[i] = 0;
@@ -660,33 +672,60 @@ namespace detail {
 // em 0 Hz" (nao ha banda em 0 Hz): produz o ESPECTRO DA PROPRIA JANELA, cujo
 // lobulo principal cai justamente em cima das bandas graves. Medido pelo
 // probe antes desta correcao: uma entrada constante de +10000 (DC puro,
-// nenhum som) levantava a barra de 177 Hz a 23 px de 44 — um mostrador
-// mentindo meia escala. Nao e hipotese de laboratorio: este repositorio
+// nenhum som) levantava a barra de 177 Hz a 23 px de 44, e um tom de 1 kHz a
+// -12 dBFS com +9000 de offset era DOMINADO pelo offset — a barra de 177 Hz
+// ficava acima da de 1 kHz. Nao e hipotese de laboratorio: este repositorio
 // acabou de descobrir um gerador de tom que injetava -10.900 de DC por
-// segundo, e um WAV mal produzido faz o mesmo. Custo do conserto: uma passada
-// de 128 somas e uma divisao, ~2 us, dentro do orcamento.
+// segundo, e um WAV mal produzido faz o mesmo.
 //
-// A saturacao no fim importa: com media muito negativa e amostra em +32767 a
-// subtracao passaria de 16 bits. Com audio de verdade a media e minuscula e
-// nada satura; o limite so garante que o limite |x| <= 32767 assumido pela
-// analise de estouro do Goertzel continua valendo.
+// QUAL MEDIA. Subtrair a media ARITMETICA do bloco nao serve e chega a
+// PIORAR: a janela pesa as amostras de forma desigual, entao o termo DC do
+// bloco janelado e a media PONDERADA PELA JANELA. Medido no mesmo sinal de
+// 1 kHz de fundo de escala, energia da banda de 177 Hz relativa ao pico:
 //
-// `/ N` e `/ 32768` e nao `>> 7` / `>> 15`: divisao trunca para ZERO, que e
+//     sem remocao alguma .................. -54,4 dB
+//     media aritmetica .................... -34,7 dB   (piorou 20 dB)
+//     media ponderada pela janela ......... -52,7 dB   (correto)
+//
+// e, com +9000 de offset grudado no mesmo tom, -0,0 dB / -34,3 dB / -52,3 dB.
+// So a terceira le o tom em vez de ler o offset.
+//
+// COMO, SEM DIVISAO DE 64 BITS. A media ponderada e soma(x*h)/soma(h). A
+// primeira passada ja calcula y[n] = x[n]*h[n]/32768, entao basta somar esses
+// y (cabe em int32: 128 * 32767 = 4,2e6) e dividir por soma(h)/32768 =
+// 2.097.088/32768 = 63,998, arredondado para 64 — o resto de 0,003% fica 28
+// bits abaixo do piso do mostrador. Divisao por 64 de inteiro de 32 bits, e
+// nao __divdi3.
+//
+// Custo: uma segunda passada de 128 multiplicacoes, ~1.500 ciclos, ~6 us.
+//
+// A saturacao no fim importa: com media grande e amostra no extremo a
+// subtracao passaria de 16 bits. Com audio de verdade nada satura; o limite so
+// garante que o |x| <= 32767 assumido pela analise de estouro do Goertzel
+// continua valendo.
+//
+// `/ 64` e `/ 32768` e nao `>> 6` / `>> 15`: divisao trunca para ZERO, que e
 // simetrica. O deslocamento arredondaria para -infinito e injetaria
 // exatamente o DC que esta funcao existe para tirar (secao 4 do cabecalho).
 inline void applyWindow(int16_t *w128) {
-  int32_t sum = 0; // 128 * 32767 = 4,2e6: cabe de sobra em int32_t
-  for (int n = 0; n < N; ++n)
-    sum += w128[n];
-  const int32_t mean = sum / N;
   const int16_t *h = hann();
+  int32_t sum = 0;
   for (int n = 0; n < N; ++n) {
-    int32_t v = (int32_t)w128[n] - mean;
+    const int32_t y = ((int32_t)w128[n] * h[n]) / 32768;
+    w128[n] = (int16_t)y;
+    sum += y;
+  }
+  // Media ponderada pela janela, em unidades de amostra. soma(h)/32768 = 64.
+  const int32_t mean = sum / 64;
+  if (!mean)
+    return; // caso comum com audio de verdade: nada a corrigir
+  for (int n = 0; n < N; ++n) {
+    int32_t v = (int32_t)w128[n] - (mean * h[n]) / 32768;
     if (v > 32767)
       v = 32767;
     else if (v < -32768)
       v = -32768;
-    w128[n] = (int16_t)((v * h[n]) / 32768);
+    w128[n] = (int16_t)v;
   }
 }
 
@@ -942,12 +981,17 @@ inline uint8_t fall(uint8_t cur, int step) {
   return (uint8_t)(cur > (uint8_t)step ? cur - step : 0);
 }
 
+// ATENCAO ao `>=` e nao `>`: com `>`, um alvo ESTAVEL cai na perna do
+// decaimento, perde BAR_FALL pixels e no quadro seguinte o ataque o traz de
+// volta — a barra fica tremendo 4 px para sempre. O probe pegou isso medindo
+// 266 px reescritos por quadro com sinal parado, onde o certo e ZERO. Num tubo
+// isso e cintilacao visivel; aqui e um unico caractere de diferenca.
 inline void ballistics(Scope &s) {
   for (int b = 0; b < BANDS; ++b) {
     const uint8_t t = s.target[b];
-    s.level[b] = (t > s.level[b]) ? t : fall(s.level[b], BAR_FALL);
+    s.level[b] = (t >= s.level[b]) ? t : fall(s.level[b], BAR_FALL);
     // O pico nunca fica abaixo da barra, senao some por baixo dela.
-    uint8_t p = (s.level[b] > s.peak[b]) ? s.level[b] : fall(s.peak[b], PEAK_FALL);
+    uint8_t p = (s.level[b] >= s.peak[b]) ? s.level[b] : fall(s.peak[b], PEAK_FALL);
     if (p < s.level[b])
       p = s.level[b];
     s.peak[b] = p;
@@ -955,10 +999,10 @@ inline void ballistics(Scope &s) {
 }
 
 inline void vuBallistics(Scope &s, int tl, int tr) {
-  s.vuL = (uint8_t)((tl > s.vuL) ? tl : fall(s.vuL, VU_FALL));
-  s.vuR = (uint8_t)((tr > s.vuR) ? tr : fall(s.vuR, VU_FALL));
-  uint8_t pl = (s.vuL > s.vuPeakL) ? s.vuL : fall(s.vuPeakL, PEAK_FALL);
-  uint8_t pr = (s.vuR > s.vuPeakR) ? s.vuR : fall(s.vuPeakR, PEAK_FALL);
+  s.vuL = (uint8_t)((tl >= s.vuL) ? tl : fall(s.vuL, VU_FALL));
+  s.vuR = (uint8_t)((tr >= s.vuR) ? tr : fall(s.vuR, VU_FALL));
+  uint8_t pl = (s.vuL >= s.vuPeakL) ? s.vuL : fall(s.vuPeakL, PEAK_FALL);
+  uint8_t pr = (s.vuR >= s.vuPeakR) ? s.vuR : fall(s.vuPeakR, PEAK_FALL);
   if (pl < s.vuL)
     pl = s.vuL;
   if (pr < s.vuR)
