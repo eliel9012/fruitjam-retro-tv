@@ -52,13 +52,31 @@ make -C sim cxx11
 
 | Recurso | Uso | Total |
 |---|---|---|
-| **SRAM interna** | **153.600 B só do framebuffer do CVBS** (320×240 × 16 bits) | ~320 KB |
+| **SRAM interna** | **~76.800 B do framebuffer do CVBS** (metade das linhas; ver abaixo) | ~320 KB |
 | PSRAM | `MAX_JPEG` 128 KiB, buffers TLS, sprites de capa e HUD | 4,5 MB |
 | Flash | ~1,44 MB | 6,5 MB |
 
-O `M5ModuleRCA` é construído com `psram_no_use` **de propósito**: a PSRAM é lenta
-demais para o prazo por linha de varredura do NTSC. Mover o framebuffer para lá
-liberaria 150 KB de SRAM e quebraria o vídeo.
+O `M5ModuleRCA` é construído com **`psram_half_use`**, e o painel roda em
+**RGB565** (`rca.setColorDepth(16)`). O quadro inteiro são 153.600 B, que não
+cabem na SRAM interna: metade das linhas vive na PSRAM atrás de um cache de
+linha, e o consumo de SRAM fica nos mesmos ~76.800 B de quando o painel era
+RGB332.
+
+Isso **não** é de graça, e o custo está medido no aparelho (`diag bench`, 240×160):
+
+| | RGB332 | RGB565 |
+|---|---|---|
+| cores no framebuffer | 74–98 | 894 |
+| teto | 256 | 65.536 |
+| blit do CVBS | 7,45 ms | 12,3 ms |
+| FPS sustentado | 31,1 | 23,5 |
+
+O padrão do `Panel_CVBS` é RGB332, de 256 cores — foi isso, e não a codificação
+do MJPEG, que deixava a imagem lavada. O blit ficou mais lento justamente porque
+metade das linhas passou para a PSRAM, que é lenta para o prazo da linha de
+varredura. A troca é legítima e depende do conteúdo, então existe em
+`CONFIGURAÇÕES → CORES`. **Não mova o framebuffer inteiro para a PSRAM**: aí sim
+o vídeo quebra.
 
 Consequências práticas:
 
@@ -153,7 +171,7 @@ os outros caminhos normalizam no chamador.
 ### 3.1 Mapa dos arquivos
 
 ```
-src/main.cpp          ~3.700 linhas. Máquina de estados da interface, player,
+src/main.cpp          ~4.650 linhas. Máquina de estados da interface, player,
                       radar, previsão, player de música, console de diagnóstico.
                       É onde quase tudo acontece.
 src/ConfigurationPortal.cpp   portal Wi-Fi em modo ponto de acesso
@@ -214,11 +232,20 @@ liberação em todos os caminhos.
 ```
 BOOT → HOME → { VIDEO_LIBRARY → VIDEO_PLAYBACK
                 MUSIC_BROWSER  → MUSIC_NOW_PLAYING
+                PHOTO_SHOW
+                RADIO
+                WEATHER
                 AIRCRAFT_RADAR
+                TEST_PATTERN
+                FILE_TRANSFER
                 SETTINGS → SETUP_PORTAL
-                SYSTEM_INFO
-                WEATHER }
+                SYSTEM_INFO }
               ERROR_SCREEN (de qualquer lugar)
+
+O menu inicial tem 11 itens em **duas colunas** de 6 e 5. A ordem dos rótulos em
+`drawHome()`, o destino em `homeTarget()` e a grade de toque em `homeHit()` têm
+de andar juntos: divergência entre os três já deixou o DESLIGAR inalcançável. Um
+`static_assert` prende a lista ao `HOME_ITEM_COUNT`.
 ```
 
 O enum está em `include/UiLogic.h`. O `loop()` despacha por `state`.
@@ -306,7 +333,7 @@ python3 -m venv .venv && .venv/bin/pip install platformio==6.1.19
 make -C sim                       # simulador de telas
 make -C sim cxx11                 # headers compartilhados em C++11
 make -C sim probes                # bancadas isoladas
-./sim/build/m5sim --png <dir>     # grava as 9 telas em PNG, headless
+./sim/build/m5sim --png <dir>     # grava as 16 telas em PNG, headless
 
 python3 tools/sync_schematik.py   # obrigatório após mudar fontes
 python3 tools/sync_schematik.py --check
