@@ -85,10 +85,16 @@ enum class Stage : uint8_t {
 // State, entao a integracao pode apontar para as strings de la.
 constexpr const char *kTitle = "TRANSFERIR ARQUIVOS";
 constexpr const char *kWarning = "RESTO DO APARELHO SUSPENSO";
+// Enumera o que o aparelho aceita, porque essa e a duvida de quem esta parado
+// na frente da TV com o computador aberto — "envie o arquivo no PC" nao dizia
+// QUAL arquivo, e agora sao tres categorias (videos/, music/, fotos/).
+//
 // Curto de proposito: com 21 caracteres a dica ainda cabe em corpo grande na
-// largura segura (21 x 12 = 252 px). Uma frase mais longa cairia para a fonte
-// fina e viraria um rodape ilegivel no meio da tela.
-constexpr const char *kHint = "ENVIE O ARQUIVO NO PC";
+// largura segura (21 x 12 = 252 px, contra os 272 de crt::SAFE_W). Uma frase
+// mais longa cairia para a fonte fina e viraria um rodape ilegivel no meio da
+// tela — 22 caracteres e o teto absoluto. ASCII sem acento: as fontes bitmap
+// nao tem glifo para acentuado (AGENTS 2.7).
+constexpr const char *kHint = "VIDEO, MUSICA E FOTOS";
 
 struct State {
   // O que a pessoa digita no navegador, ja pronto: "http://192.168.0.12".

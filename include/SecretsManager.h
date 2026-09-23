@@ -10,6 +10,7 @@ struct RadarConfig {
   double latitude = 0.0, longitude = 0.0;
   int rangeKm = 250, refreshSeconds = 5, volume = 75;
   bool vhsOsd = true;
+  bool color16 = true;
   String audioOutput = "rca";
 };
 class SecretsManager {

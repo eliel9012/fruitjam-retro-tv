@@ -13,12 +13,42 @@ enum UiState {
   MUSIC_BROWSER,
   MUSIC_NOW_PLAYING,
   FILE_TRANSFER,
+  PHOTO_SHOW,
+  RADIO,
+  TEST_PATTERN,
   ERROR_SCREEN
 };
+
+// Itens do menu inicial, em duas colunas. Uma constante so para desenho,
+// navegacao e toque: ja houve divergencia entre os tres e o resultado foi o
+// ultimo item ficar inalcancavel.
+constexpr int HOME_ITEM_COUNT = 11;
+constexpr int HOME_ROWS = 6; // 6 na coluna da esquerda, 5 na direita
 inline UiState homeTarget(int selection) {
-  const UiState targets[] = {VIDEO_LIBRARY,  MUSIC_BROWSER, AIRCRAFT_RADAR, SETTINGS,
-                             SYSTEM_INFO,    WEATHER,       FILE_TRANSFER};
-  return selection >= 0 && selection < 7 ? targets[selection] : HOME;
+  // A ultima posicao (DESLIGAR) nao tem tela: quem navega trata antes de
+  // chamar isto, e cair aqui devolve HOME.
+  const UiState targets[] = {VIDEO_LIBRARY, MUSIC_BROWSER,  PHOTO_SHOW,    RADIO,
+                             WEATHER,       AIRCRAFT_RADAR, TEST_PATTERN,  FILE_TRANSFER,
+                             SETTINGS,      SYSTEM_INFO};
+  const int n = (int)(sizeof(targets) / sizeof(targets[0]));
+  return selection >= 0 && selection < n ? targets[selection] : HOME;
+}
+
+// Coluna (0 ou 1) e linha de um item do menu inicial.
+inline int homeColumn(int index) { return index / HOME_ROWS; }
+inline int homeRow(int index) { return index % HOME_ROWS; }
+
+// Item sob um toque no menu inicial, ou -1 fora da area dos itens.
+// `x0`/`y0` sao o canto do primeiro item, `colW`/`step` a largura da coluna e a
+// altura da linha.
+inline int homeHit(int x, int y, int x0, int y0, int colW, int step) {
+  if (y < y0 || x < x0)
+    return -1;
+  const int col = (x - x0) / colW, row = (y - y0) / step;
+  if (col < 0 || col > 1 || row < 0 || row >= HOME_ROWS)
+    return -1;
+  const int index = col * HOME_ROWS + row;
+  return index < HOME_ITEM_COUNT ? index : -1;
 }
 inline int touchButton(int x, int y) {
   if (x < 0 || x >= 320 || y < 184 || y >= 240)

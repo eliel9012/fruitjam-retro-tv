@@ -13,6 +13,13 @@
 #include <M5ModuleRCA.h>
 
 #include "SafeArea.h"
+#include "RtcClock.h"
+#include "ChannelMode.h"
+#include "PhotoShow.h"
+#include "TestPattern.h"
+#include "RadioStream.h"
+#include "RadioScreen.h"
+#include "Subtitles.h"
 #include "VcrOsd.h"
 #include "WeatherIcons.h"
 #include "ScreenFx.h"
@@ -42,6 +49,12 @@ struct Settings {
   double lat = 0, lon = 0;
   int rangeKm = 250, refreshSeconds = 10, volume = 75;
   bool vhsOsd = true;
+  // Profundidade do framebuffer do CVBS. true = RGB565 (65536 cores, ~23,5
+  // fps), false = RGB332 (256 cores, ~31 fps). Medido no aparelho: o RGB332
+  // dispensa a conversao por pixel no blit e cabe todo em SRAM, entao roda
+  // mais rapido; o RGB565 ocupa 153600 bytes e metade das linhas vai para a
+  // PSRAM, o que deixa o blit mais lento mas multiplica a cor por 256.
+  bool color16 = true;
   AudioOutput audioOutput = AudioOutput::RCA;
 } settings;
 
@@ -161,8 +174,16 @@ static constexpr uint16_t RCA_ACCENT = 0x96BC;
 // Itens do menu inicial. Uma constante só: já houve divergência entre o
 // desenho, a navegação por botão e o mapeamento de toque, e o resultado foi o
 // último item (DESLIGAR) ficar inalcançável.
-static constexpr int HOME_COUNT = 8;
+// HOME_ITEM_COUNT e HOME_ROWS vivem em UiLogic.h, junto de homeTarget() e
+// homeHit(), para desenho, navegacao e toque nunca discordarem.
+static constexpr int HOME_COUNT = HOME_ITEM_COUNT;
 static constexpr int HOME_POWER_OFF = HOME_COUNT - 1;
+// Duas colunas: 11 itens em uma coluna so nao cabem. No LCD seriam
+// 40 + 11*18 = 238, invadindo a faixa de botoes em 184; no CVBS, 70 + 11*16 =
+// 246, muito alem da barra em 202. Com 6 linhas para em 148 e 166.
+static constexpr int HOME_LCD_COL_W = 148;
+static constexpr int HOME_LCD_X0 = 12;
+static constexpr int HOME_RCA_COL_W = 124;
 // Passo dos itens no LCD. Com 8 itens, 20 px faria o último cair sobre a faixa
 // de botões que começa em 184 e o toque em DESLIGAR teria 4 px úteis.
 static constexpr int HOME_LCD_Y0 = 40, HOME_LCD_STEP = 18;
@@ -192,6 +213,7 @@ const char *SECRETS_FILE = "/M5RETRO/config/secrets.json";
 const char *CA_FILE = "/M5RETRO/config/ca.pem";
 const char *CACHE_FILE = "/M5RETRO/cache/aircraft.json";
 const char *MUSIC_ROOT = "/M5RETRO/music";
+const char *PHOTOS = "/M5RETRO/fotos";
 
 // NTSC (525/59,94 Hz, preto em 7,5 IRE). O modo PAL_M do M5GFX monta a linha
 // com 908 amostras, mas 4x3,57561149 MHz x 63,5556 us dá 909,02 — a linha sai
@@ -292,6 +314,35 @@ bool networkConfigPresent = false;
 
 InputManager input;
 int homeSelection = 0, librarySelection = 0, radarSelection = -1, settingsSelection = 0, infoPage = 0;
+// Modo canal (reproducao continua) e temporizador de desligar. Aqui em cima
+// porque startProgram(), bem antes de scanLibrary(), ja precisa deles.
+channel::Channel tvChannel;
+sleeptimer::SleepTimer sleepTimer;
+// Tom de referencia de 1 kHz do padrao de barras. Atomico porque quem liga e o
+// loop (core 1) e quem consome e o audioTask (core 0).
+std::atomic<bool> toneActive{false};
+testpattern::Tone1k testTone;
+// 0 = barras SMPTE, 1 = cartaz de encerramento, 2 = chuvisco.
+int testPatternPage = 0;
+// Radio pela internet. O anel de rede vive na PSRAM (ver RadioStream.h); em
+// SRAM ficam so os descritores.
+radio::Stream radioStream;
+std::atomic<bool> radioActive{false};
+// Legendas .srt ao lado do video. A base de tempo e o relogio de AUDIO
+// (samplesPlayed/sampleRate), nao millis(): e o audio que manda na sincronia.
+subs::Subtitles subtitles;
+File srtFile;
+bool srtOpen = false;
+uint32_t radioLastDraw = 0;
+
+// Apresentacao de fotos. O catalogo guarda os nomes num pool continuo, com um
+// vetor de deslocamentos -- nada de String por foto. 128 nomes de ~20 chars
+// cabem em 2560 B; o teto de entradas e o que limita, nao o pool.
+// A decodificacao reaproveita o jpegBuffer do video (128 KB em PSRAM): nao ha
+// as duas coisas rodando ao mesmo tempo.
+static char photoPool[2560];
+static uint16_t photoOffsets[128];
+photo::Show photoShow;
 bool settingsEditing = false, radarDetails = false, radarDirty = false;
 uint32_t osdUntil = 0;
 SecretsManager secretsStore;
@@ -398,6 +449,7 @@ RadarConfig currentSettings() {
   r.refreshSeconds = settings.refreshSeconds;
   r.volume = settings.volume;
   r.vhsOsd = settings.vhsOsd;
+  r.color16 = settings.color16;
   r.audioOutput = settings.audioOutput == AudioOutput::INTERNAL ? "interno"
                   : settings.audioOutput == AudioOutput::MUTED  ? "mudo"
                                                                 : "rca";
@@ -410,6 +462,7 @@ void applySettings(const RadarConfig &r) {
   settings.refreshSeconds = r.refreshSeconds;
   settings.volume = r.volume;
   settings.vhsOsd = r.vhsOsd;
+  settings.color16 = r.color16;
   settings.audioOutput = r.audioOutput == "interno" ? AudioOutput::INTERNAL
                          : r.audioOutput == "mudo"  ? AudioOutput::MUTED
                                                     : AudioOutput::RCA;
@@ -456,7 +509,10 @@ void serviceWiFi() {
   if (network.connected()) {
     static bool clockRequested = false;
     if (!clockRequested) {
-      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+      // Era configTime(0, 0, ...), que monta TZ="UTC0DST0": o relogio da tela
+      // inicial mostrava UTC, 3 h adiantado. Isto pede os mesmos servidores com
+      // o fuso de Brasilia (UTC-3, sem horario de verao desde 2019).
+      rtcclock::configTimeBrazil("pool.ntp.org", "time.cloudflare.com");
       clockRequested = true;
     }
   }
@@ -473,6 +529,32 @@ void serviceWiFi() {
     apiStatus = "CONECTANDO WI-FI";
   else
     apiStatus = "SEM WI-FI";
+}
+
+// Troca a profundidade do framebuffer do CVBS conforme settings.color16.
+//
+// Panel_CVBS::setColorDepth faz deinit() e init(false) quando o painel ja esta
+// ativo (M5GFX 0.2.29, Panel_CVBS.inl:2277), ou seja realoca o framebuffer e o
+// sinal cai por um instante. Por isso so pode ser chamada com o video parado, e
+// quem chama precisa repintar a tela depois: o framebuffer novo vem em branco.
+//
+// Devolve true se a profundidade efetiva bate com a pedida. Se a alocacao do
+// RGB565 falhar por falta de PSRAM a biblioteca cai sozinha para 8 bits, e e
+// esse retorno que avisa.
+bool applyColorDepth() {
+  // getColorDepth devolve color_depth_t, nao um numero de bits: o byte baixo e
+  // que carrega a contagem (bit_mask = 0x00FF) e os bits altos marcam variantes
+  // como grayscale_8bit = 8|alternate = 0x1008. Comparar o enum cru com 8 ou 16
+  // funcionaria por acidente hoje, porque rgb332_1Byte = 8 e rgb565_2Byte = 16,
+  // mas erraria em qualquer variante. Mascara sempre.
+  const uint16_t desejada = settings.color16 ? 16 : 8;
+  const uint16_t atual =
+      (uint16_t)(rca.getColorDepth() & lgfx::v1::color_depth_t::bit_mask);
+  if (atual == desejada)
+    return true;
+  rca.setColorDepth(settings.color16 ? lgfx::v1::color_depth_t::rgb565_2Byte
+                                     : lgfx::v1::color_depth_t::rgb332_1Byte);
+  return (uint16_t)(rca.getColorDepth() & lgfx::v1::color_depth_t::bit_mask) == desejada;
 }
 
 void saveSettings() {
@@ -661,6 +743,45 @@ void audioTask(void *) {
     // the RCA DMA queue so a tap does not leave already-buffered PCM playing.
     // `!wavFile && !mp3Mode` (e não apenas `!wavFile`) porque, no MP3, o arquivo
     // aberto é `mp3File` (wavFile fica nulo) — senão o MP3 nunca tocaria.
+    // O tom e a terceira fonte de audio, ao lado do playback e da musica do
+    // Weather. Fica ANTES da condicao de ocioso porque nao vem do cartao: nao
+    // toma o sdMutex e nao pode cair no ramo que exige wavFile ou mp3Mode.
+    // Radio: como o tom, nao vem do cartao, entao nao toma o sdMutex nem passa
+    // pela condicao de ocioso que exige wavFile ou mp3Mode. readPcm devolve 0
+    // enquanto o anel nao tem pre-buffer; ai e so nao escrever nada e voltar,
+    // que o DMA repete o silencio em vez de estalar.
+    if (radioActive.load() && !paused) {
+      uint8_t *buf = buffers[bufferIndex];
+      const size_t amostras =
+          radioStream.readPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
+      if (!amostras) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
+      const size_t bytes = amostras * sizeof(int16_t);
+      size_t written = 0;
+      if (active == AudioOutput::RCA)
+        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
+      else if (active == AudioOutput::INTERNAL)
+        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
+      bufferIndex = (bufferIndex + 1) % 3;
+      continue;
+    }
+    if (toneActive.load() && !paused) {
+      uint8_t *buf = buffers[bufferIndex];
+      const size_t amostras =
+          testTone.fillPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
+      const size_t bytes = amostras * sizeof(int16_t);
+      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
+      size_t written = 0;
+      if (active == AudioOutput::RCA)
+        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
+      else if (active == AudioOutput::INTERNAL)
+        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
+      bufferIndex = (bufferIndex + 1) % 3;
+      continue;
+    }
     if ((!playing && !weatherAudio.load()) || paused || (!wavFile && !mp3Mode)) {
       if (!outputPaused && active == AudioOutput::RCA) {
         i2s_zero_dma_buffer(I2S_NUM_1);
@@ -1191,12 +1312,34 @@ bool startProgram(const String &dir) {
     return false;
   }
   videoFrameIndex = 1;
+  {
+    // Legenda opcional: video.mjpeg -> video.srt, na mesma pasta. Ausente e o
+    // caso normal e nao e erro.
+    char caminho[160];
+    const String base = dir + "/" + video;
+    subtitles.reset();
+    srtOpen = false;
+    if (subs::makeSrtPath(base.c_str(), caminho, sizeof(caminho)) && SD.exists(caminho)) {
+      srtFile = SD.open(caminho, FILE_READ);
+      srtOpen = (bool)srtFile;
+      Serial.printf("[M5RETRO] Legenda: %s\n", srtOpen ? caminho : "falhou ao abrir");
+    }
+  }
   drawPlaybackController();
   playing = true;
+  // Registro do canal DEPOIS de playing: startProgram() comeca chamando
+  // stopProgram(), entao registrar antes seria apagado. Pelo mesmo motivo
+  // stopProgram() nao limpa o canal -- cancelaria a corrente recem agendada.
+  tvChannel.started(librarySelection, millis());
   return true;
 }
 void stopProgram() {
   playing = false;
+  if (srtOpen) {
+    srtFile.close();
+    srtOpen = false;
+  }
+  subtitles.reset();
   // A música em loop do Weather Channel também segura o áudio: se ela continuar
   // ligada, a condição de ocioso do audioTask nunca vale e a espera abaixo não
   // termina nunca. Tem que cair ANTES do while, não depois.
@@ -1248,6 +1391,18 @@ void videoTick() {
       playbackFinished = true;
       playing = false;
     }
+  }
+  // Legendas por cima do quadro recem desenhado. A posicao vem do relogio de
+  // audio; a leitura do .srt e sequencial e precisa do mutex do cartao, como
+  // todo acesso ao SD.
+  if (srtOpen && playing) {
+    const uint32_t posMs =
+        sampleRate ? (uint32_t)((uint64_t)samplesPlayed.load() * 1000ULL / sampleRate) : 0;
+    if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      subtitles.update(srtFile, posMs);
+      xSemaphoreGive(sdMutex);
+    }
+    subtitles.draw(&rca, 0, 0, posMs);
   }
   // Ainda atrás do relógio depois de trabalhar: o loop não deve dormir 4 ms.
   videoBehind = playing && videoFrameIndex < target;
@@ -1497,6 +1652,20 @@ String libraryPaths[MAX_LIBRARY_ITEMS];
 int libraryCount = 0;
 bool libraryScanned = false;
 
+void scanLibrary(); // definida logo abaixo; channelPathAt() precisa dela antes
+
+// Modo canal e temporizador de desligar.
+//
+// O adaptador aponta para libraryPaths[i] de proposito, e NAO para
+// libraryProgramAt(), que devolve String por valor: um .c_str() naquele
+// temporario morreria no fim da expressao. libraryPaths[] vive ate o proximo
+// scanLibrary().
+static const char *channelPathAt(int i, void *) {
+  if (!libraryScanned)
+    scanLibrary();
+  return (i >= 0 && i < libraryCount) ? libraryPaths[i].c_str() : nullptr;
+}
+
 void scanLibrary() {
   libraryCount = 0;
   const String root = libraryRoot();
@@ -1516,6 +1685,7 @@ void scanLibrary() {
   d.close();
   libraryScanned = true;
   Serial.printf("[M5RETRO] Biblioteca: %d programa(s) em %s\n", libraryCount, root.c_str());
+  tvChannel.setCount(libraryCount);
 }
 
 int libraryProgramCount() {
@@ -2402,25 +2572,30 @@ static void drawHomeClock(bool limpar) {
 }
 
 void drawHome() {
-  // 8 itens: VIDEOS, MUSICA, TRAFEGO, CONFIGURACOES, SISTEMA, TEMPO,
-  // TRANSFERIR ARQUIVOS, DESLIGAR.
-  const char *items[] = {PTBR::VIDEOS,       PTBR::MUSICA,  PTBR::TRAFEGO,
-                         PTBR::CONFIGURACOES, PTBR::INFO_SISTEMA, PTBR::WEATHER,
-                         PTBR::TRANSFERENCIA, PTBR::DESLIGAR};
+  // 11 itens, na MESMA ordem de homeTarget() em UiLogic.h -- as duas listas
+  // andam juntas e trocar uma sem a outra manda o usuario para a tela errada.
+  // Coluna da esquerda: 0..5. Coluna da direita: 6..10.
+  const char *items[] = {PTBR::VIDEOS,  PTBR::MUSICA,        PTBR::FOTOS,
+                         PTBR::RADIO,   PTBR::WEATHER,       PTBR::TRAFEGO,
+                         PTBR::PADRAO_TESTE, PTBR::TRANSFERENCIA, PTBR::CONFIGURACOES,
+                         PTBR::INFO_SISTEMA, PTBR::DESLIGAR};
+  static_assert(sizeof(items) / sizeof(items[0]) == HOME_COUNT,
+                "rotulos do menu inicial fora de sincronia com HOME_COUNT");
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
   M5.Display.setTextSize(2);
   M5.Display.drawString(PTBR::APP, 12, 8);
   M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-  M5.Display.setTextSize(2);
+  M5.Display.setTextSize(1);
   for (int i = 0; i < HOME_COUNT; i++) {
-    int y = HOME_LCD_Y0 + i * HOME_LCD_STEP;
-    bool selected = i == homeSelection;
+    const int x = HOME_LCD_X0 + homeColumn(i) * HOME_LCD_COL_W;
+    const int y = HOME_LCD_Y0 + homeRow(i) * HOME_LCD_STEP;
+    const bool selected = i == homeSelection;
     if (selected)
-      M5.Display.fillRoundRect(12, y - 2, 296, 18, 4, RCA_ACCENT);
+      M5.Display.fillRoundRect(x, y - 2, HOME_LCD_COL_W - 8, 16, 3, RCA_ACCENT);
     M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
-    M5.Display.drawString(String(selected ? "> " : "  ") + items[i], 24, y);
+    M5.Display.drawString(String(selected ? ">" : " ") + items[i], x + 4, y);
   }
   rca.fillScreen(TFT_NAVY);
   rca.setTextDatum(top_left);
@@ -2430,11 +2605,12 @@ void drawHome() {
   rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
   rca.setTextSize(1);
   for (int i = 0; i < HOME_COUNT; i++) {
-    // Passo de 16 px: com 8 itens e o relógio ocupando uma linha, 20 px faria o
-    // último item invadir a barra de legendas em 202.
-    int y = CLOCK_Y + 20 + i * 16;
+    // 6 linhas de 16 px a partir de CLOCK_Y+20 = 70 terminam em 166, com folga
+    // ate a barra de legendas em 202.
+    const int x = SAFE_L + 4 + homeColumn(i) * HOME_RCA_COL_W;
+    const int y = CLOCK_Y + 20 + homeRow(i) * 16;
     rca.setTextColor(i == homeSelection ? RCA_ACCENT : TFT_WHITE, TFT_NAVY);
-    rca.drawString(String(i == homeSelection ? "> " : "  ") + items[i], SAFE_L + 4, y);
+    rca.drawString(String(i == homeSelection ? ">" : " ") + items[i], x, y);
   }
   drawHomeClock(false); // a tela acabou de ser preenchida; não precisa limpar
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
@@ -3138,7 +3314,8 @@ void stopWeather() {
 
 void drawSettings() {
   const char *names[] = {"VIDEO", "VOLUME", "ALCANCE RADAR", "ATUALIZACAO", PTBR::SAIDA_AUDIO,
-                         PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "CONFIGURAR REDE"};
+                         PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "CONFIGURAR REDE",
+                         "CORES", "MODO CANAL", "DESLIGAR EM"};
   String audio = settings.audioOutput == AudioOutput::RCA        ? PTBR::RCA
                  : settings.audioOutput == AudioOutput::INTERNAL ? PTBR::ALTO_FALANTE_INTERNO
                                                                  : PTBR::MUDO;
@@ -3152,7 +3329,12 @@ void drawSettings() {
                      ? (WiFi.status() == WL_CONNECTED ? PTBR::CONECTADO : PTBR::DESCONECTADO)
                  : settingsSelection == 7  ? apiStatus
                  : settingsSelection == 8  ? PTBR::DISPONIVEL
-                                            : "ABRIR";
+                 : settingsSelection == 9  ? String("ABRIR")
+                 : settingsSelection == 10
+                     ? (settings.color16 ? String("MILHARES") : String("256 CORES"))
+                 : settingsSelection == 11 ? String(tvChannel.modeLabel())
+                 : sleepTimer.active()     ? String(sleepTimer.minutes()) + " MIN"
+                                           : String("DESLIGADO");
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextSize(2);
@@ -3179,6 +3361,194 @@ void drawSettings() {
   drawControllerLabels(settingsEditing ? "-" : "ACIMA", settingsEditing ? "SALVAR" : "OK",
                        settingsEditing ? "+" : "ABAIXO");
 }
+// ---------------------------------------------------------------------------
+//  Apresentacao de fotos (/M5RETRO/fotos)
+// ---------------------------------------------------------------------------
+//
+// O formato que o aparelho exibe e estreito, e nao por capricho: o JPEGDEC
+// desta versao devolve JPEG_DECODE_ERROR em chroma 4:4:4 e, pior, aceita um
+// JPEG progressivo SEM erro desenhando so 40x30 (os coeficientes DC do
+// primeiro scan). O teto de 128 KB vem do jpegBuffer. tools/prepare_photos.py
+// resolve os tres na origem; aqui a politica so recusa com mensagem na tela.
+
+void drawPhotos() {
+  const uint32_t agora = millis();
+  if (photoShow.count() == 0) {
+    for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+      d->fillScreen(TFT_NAVY);
+      d->setTextDatum(top_left);
+      d->setTextSize(2);
+      d->setTextColor(TFT_WHITE, TFT_NAVY);
+      d->drawString(PTBR::FOTOS, SAFE_L, HEAD_Y);
+      d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+      d->setTextSize(1);
+      d->drawString(PTBR::SEM_FOTOS, SAFE_L + 6, BODY_Y + 40);
+      d->drawString("ENVIE PELO MENU TRANSFERIR ARQUIVOS", SAFE_L + 6, BODY_Y + 60);
+    }
+    drawControllerLabels(PTBR::VOLTAR, "", "");
+    return;
+  }
+  // A leitura do cartao tem de acontecer sob o mutex: o audioTask le o mesmo
+  // SPI. O decode em si e sobre o buffer ja em memoria, fora do mutex.
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  photoShow.load(SD, agora);
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+
+  // paint() ja limpa a tela, decodifica, poe a legenda e o rodape.
+  photoShow.paint(&rca, 0, 0);
+  // O LCD so recebe o texto: decodificar a mesma foto duas vezes dobraria o
+  // custo por quadro sem ganho, e a foto no CVBS e que interessa.
+  M5.Display.fillScreen(TFT_NAVY);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+  M5.Display.drawString(PTBR::FOTOS, 12, 8);
+  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
+  M5.Display.setTextSize(1);
+  char nome[48];
+  photoShow.displayName(nome, sizeof(nome));
+  M5.Display.drawString(nome, 12, 52);
+  M5.Display.drawString(String(photoShow.index() + 1) + " / " + String(photoShow.count()), 12, 70);
+  if (!photoShow.hasImage())
+    M5.Display.drawString(photoShow.statusText(), 12, 92);
+  drawControllerLabels(PTBR::ANTERIOR, "TEMPO", PTBR::PROXIMO);
+}
+
+void enterPhotos() {
+  stopProgram(); // nada de video ou musica disputando o cartao e o buffer
+  photoShow.attachStorage(photoPool, sizeof(photoPool), photoOffsets,
+                          sizeof(photoOffsets) / sizeof(photoOffsets[0]));
+  photoShow.attachBuffer(jpegBuffer, MAX_JPEG);
+  photoShow.attachDecoder(&jpeg);
+  photoShow.setFolder(PHOTOS);
+  const uint32_t agora = millis();
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
+  if (!SD.exists(PHOTOS))
+    SD.mkdir(PHOTOS);
+  const int n = photoShow.scan(SD, agora);
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
+  photoShow.afterScan(agora);
+  Serial.printf("[M5RETRO] Fotos: %d em %s (%d fora do pool)\n", n, PHOTOS,
+                photoShow.catalog().dropped());
+  state = PHOTO_SHOW;
+  drawPhotos();
+}
+
+// ---------------------------------------------------------------------------
+//  Padrao de teste: barras SMPTE + tom de 1 kHz
+// ---------------------------------------------------------------------------
+
+void drawTestPattern() {
+  // As barras usam o QUADRO INTEIRO de proposito: a graca e ver o quanto o tubo
+  // corta. So o texto respeita a area segura.
+  if (testPatternPage == 0)
+    testpattern::drawBars(&rca, 0, 0);
+  else if (testPatternPage == 1)
+    testpattern::drawSlate(&rca, 0, 0);
+  else
+    testpattern::drawSnow(&rca, 0, 0);
+  // O LCD nao recebe as barras: ele nao e o que se quer calibrar, e repetir o
+  // padrao la so confundiria a leitura.
+  M5.Display.fillScreen(TFT_NAVY);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+  M5.Display.drawString(PTBR::PADRAO_TESTE, 12, 8);
+  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString(testPatternPage == 0   ? "BARRAS SMPTE + TOM 1 kHz"
+                        : testPatternPage == 1 ? "ENCERRAMENTO"
+                                               : "CHUVISCO",
+                        12, 52);
+  M5.Display.drawString("AJUSTE BRILHO, CONTRASTE E COR NA TV", 12, 72);
+  M5.Display.drawString(toneActive.load() ? "TOM: LIGADO (-20 dBFS)" : "TOM: DESLIGADO", 12, 92);
+  drawControllerLabels(PTBR::VOLTAR, "PADRAO", "");
+}
+
+void enterTestPattern() {
+  stopProgram();
+  testPatternPage = 0;
+  testTone.reset();
+  testTone.setAmplitude(testpattern::AMP_MINUS20DB);
+  toneActive = true; // o audioTask passa a puxar do gerador
+  state = TEST_PATTERN;
+  drawTestPattern();
+}
+
+void stopTestPattern() {
+  toneActive = false;
+}
+
+void cycleTestPattern() {
+  testPatternPage = (testPatternPage + 1) % 3;
+  // Tom so com as barras: e o par "bars and tone". No chuvisco seria ruido em
+  // cima de ruido, e no cartaz de encerramento atrapalha.
+  toneActive = (testPatternPage == 0);
+  drawTestPattern();
+}
+
+// ---------------------------------------------------------------------------
+//  Radio pela internet
+// ---------------------------------------------------------------------------
+//
+// A tela e so o logotipo da emissora e um relogio grande em hora local, como
+// pedido. O logotipo vem de include/DiarioLogo.h; sem esse arquivo a tela cai
+// no nome da estacao em texto e continua correta.
+
+void drawRadioScreen(bool completo) {
+  radioui::State st;
+  time_t agora = time(nullptr);
+  struct tm tmv;
+  if (agora > 1704067200 && localtime_r(&agora, &tmv)) {
+    st.hour = (uint8_t)tmv.tm_hour;
+    st.minute = (uint8_t)tmv.tm_min;
+    st.second = (uint8_t)tmv.tm_sec;
+    st.day = (uint8_t)tmv.tm_mday;
+    st.month = (uint8_t)(tmv.tm_mon + 1);
+    st.year = (uint16_t)(tmv.tm_year + 1900);
+    st.weekday = (uint8_t)tmv.tm_wday;
+    st.timeValid = true;
+  }
+  char titulo[96];
+  radioStream.copyTitle(titulo, sizeof(titulo));
+  st.stationName = radioStream.stationName();
+  st.statusText = radioStream.stateLabel();
+  st.title = titulo;
+  if (completo)
+    radioui::drawBackground(&rca, 0, 0);
+  radioui::draw(&rca, 0, 0, st);
+}
+
+void enterRadio() {
+  stopProgram(); // o radio nao convive com o video: nao ha SRAM para os dois
+  if (!radioStream.begin(0)) {
+    setError(PTBR::SEM_SERVIDOR);
+    return;
+  }
+  radioActive = true;
+  radioLastDraw = 0;
+  state = RADIO;
+  M5.Display.fillScreen(TFT_NAVY);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+  M5.Display.drawString(PTBR::RADIO, 12, 8);
+  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString(radio::STATIONS[0].name, 12, 52);
+  drawControllerLabels(PTBR::VOLTAR, "", "");
+  drawRadioScreen(true);
+}
+
+void stopRadio() {
+  radioActive = false;
+  radioStream.end();
+}
+
 void drawInfo() {
   // Página 0: hardware; página 1: rede. Desenha tudo com datum top_left e
   // linhas separadas, truncadas, para nunca vazar do LCD (320x240, fonte ASCII).
@@ -3224,6 +3594,10 @@ void drawInfo() {
 void handleNavigation(NavAction a) {
   if (a == NavAction::NONE)
     return;
+  // Qualquer comando adia o desligamento automatico: ninguem quer a TV apagando
+  // no meio de um filme so porque o prazo venceu enquanto se assistia.
+  if (sleepTimer.active())
+    sleepTimer.restart(millis());
   osdUntil = millis() + 3000;
   // Qualquer botão físico durante o playback religa o backlight, caso o comando
   // "diag backlight" o tenha desligado para inspeção.
@@ -3247,6 +3621,9 @@ void handleNavigation(NavAction a) {
   }
   if (a == NavAction::HOME) {
     weatherAudio = false; // HOME também encerra a música do Weather Channel
+    // Sair de proposito cancela o modo canal: sem isto o proximo programa
+    // comecaria sozinho depois que o usuario ja saiu da reproducao.
+    tvChannel.stop();
     if (playing || wavFile)
       stopProgram();
     state = HOME;
@@ -3279,6 +3656,12 @@ void handleNavigation(NavAction a) {
         startWeather();
       else if (state == FILE_TRANSFER)
         startTransfer();
+      else if (state == PHOTO_SHOW)
+        enterPhotos();
+      else if (state == TEST_PATTERN)
+        enterTestPattern();
+      else if (state == RADIO)
+        enterRadio();
       else
         drawInfo();
       return;
@@ -3356,7 +3739,10 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (state == SETTINGS) {
-    constexpr int SETTINGS_COUNT = 10;
+    // 11 itens: o ultimo e CORES. Acrescentado no fim de proposito -- os
+    // indices desta tela sao literais espalhados pelo bloco abaixo, entao
+    // inserir no meio deslocaria todos eles.
+    constexpr int SETTINGS_COUNT = 13;
     if (a == NavAction::BACK) {
       if (settingsEditing)
         settingsEditing = false;
@@ -3407,8 +3793,59 @@ void handleNavigation(NavAction a) {
           return;
       } else if (settingsSelection == 5)
         settings.vhsOsd = !settings.vhsOsd;
+      else if (settingsSelection == 11)
+        tvChannel.cycleMode();
+      else if (settingsSelection == 12)
+        sleepTimer.cycle(millis());
+      else if (settingsSelection == 10 && !playing) {
+        // Realoca o framebuffer do CVBS, entao so com o video parado. Chegar
+        // aqui tocando nao deveria acontecer (esta tela nao reproduz), mas a
+        // troca derrubaria o sinal no meio do quadro, entao o ramo e guardado.
+        // A repintura vem do drawSettings() no fim do bloco: o framebuffer novo
+        // nasce em branco.
+        settings.color16 = !settings.color16;
+        if (!applyColorDepth()) {
+          // A PSRAM nao deu conta do RGB565 e a biblioteca caiu sozinha para 8
+          // bits. Guardar o que o aparelho esta realmente usando, nao o que foi
+          // pedido: senao a tela mentiria ate o proximo boot.
+          settings.color16 = false;
+        }
+      }
     }
     drawSettings();
+    return;
+  }
+  if (state == PHOTO_SHOW) {
+    if (a == NavAction::BACK) {
+      state = HOME;
+      drawHome();
+      return;
+    }
+    const uint32_t agora = millis();
+    if (a == NavAction::LEFT)
+      photoShow.advance(-1, agora);
+    else if (a == NavAction::RIGHT)
+      photoShow.advance(1, agora);
+    else if (a == NavAction::SELECT)
+      photoShow.cycleDwell(agora); // 3 / 5 / 10 / 30 s
+    drawPhotos();
+    return;
+  }
+  if (state == TEST_PATTERN) {
+    if (a == NavAction::BACK || a == NavAction::HOME) {
+      stopTestPattern();
+      state = HOME;
+      drawHome();
+    } else if (a == NavAction::SELECT)
+      cycleTestPattern();
+    return;
+  }
+  if (state == RADIO) {
+    if (a == NavAction::BACK || a == NavAction::HOME) {
+      stopRadio();
+      state = HOME;
+      drawHome();
+    }
     return;
   }
   if (state == WEATHER) {
@@ -3542,12 +3979,13 @@ void handleTouch() {
       button = touchButton(p.x, p.y);
     else {
       button = -1;
-      if (state == HOME && p.y >= HOME_LCD_Y0 &&
-          p.y < HOME_LCD_Y0 + HOME_COUNT * HOME_LCD_STEP) {
-        homeSelection = (p.y - HOME_LCD_Y0) / HOME_LCD_STEP;
-        if (homeSelection >= HOME_COUNT)
-          homeSelection = HOME_COUNT - 1;
-        input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
+      if (state == HOME) {
+        const int hit = homeHit(p.x, p.y, HOME_LCD_X0, HOME_LCD_Y0, HOME_LCD_COL_W,
+                                HOME_LCD_STEP);
+        if (hit >= 0) {
+          homeSelection = hit;
+          input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
+        }
       } else if (state == MUSIC_NOW_PLAYING && p.y >= 166 && p.y < 192 && p.x >= 16 && p.x < 304) {
         // Toque na região do progresso: alterna NORMAL -> SHUFFLE -> REPETIR -> NORMAL.
         if (musicRepeat) {
@@ -3885,6 +4323,14 @@ void setup() {
   cfg.internal_spk = true; // Configure Core2 pins and amplifier callback; playback starts later.
   cfg.external_spk = false;
   M5.begin(cfg);
+  // O Core2 tem um BM8563 com bateria que o firmware nunca usava: a hora vinha
+  // so do NTP, entao sem Wi-Fi o relogio da tela inicial ficava errado. Isto
+  // aplica o fuso e semeia o relogio do sistema com o chip, antes da rede e do
+  // cartao. Nao bloqueia: chip mudo apenas deixa a fonte em SEM HORA.
+  rtcclock::begin();
+  // Semente do modo aleatorio. millis() aqui e baixo e pouco variado; o relogio
+  // do RTC, ja lido acima, da uma semente diferente a cada ligada.
+  tvChannel.seed((uint32_t)time(nullptr) ^ (uint32_t)esp_random());
   if (psramFound())
     mbedtls_platform_set_calloc_free(tlsCalloc, heap_caps_free);
   if (M5.Speaker.isRunning())
@@ -3949,6 +4395,9 @@ void setup() {
   // Wi-Fi has not been configured and leaves serial evidence of the detected path.
   libraryProgramCount();
   dualText(PTBR::APP, PTBR::CARREGANDO_CONFIG);
+  // O painel subiu em 16 bits la em cima porque a preferencia mora no cartao e
+  // o cartao so foi montado agora. Se o usuario tinha escolhido 8 bits, a troca
+  // acontece aqui, uma vez, antes de qualquer video.
   if (!loadConfiguration()) {
     apiStatus = PTBR::CONFIG_REDE_AUSENTE;
     dualText(PTBR::CONFIG_REDE_AUSENTE, PTBR::EDITE_SECRETS);
@@ -3987,6 +4436,25 @@ void loop() {
   serviceDiagnostics();
   input.setAutoRepeat(state != VIDEO_PLAYBACK);
   input.update();
+  // Grava no BM8563 quando o NTP chega (e a cada 6 h). Limitado a 1 Hz e sem
+  // I2C fora deste ponto.
+  rtcclock::poll();
+  // Temporizador de desligar, como o dos videocassetes. timeReached() por
+  // dentro, entao a volta do millis() nao adia o desligamento por 49 dias.
+  // Relogio do radio: so os digitos que mudaram, uma vez por segundo. Repintar
+  // a tela inteira a cada segundo num CVBS de 23 fps pisca e gasta a toa.
+  if (state == RADIO) {
+    const uint32_t agora = millis();
+    if (!radioLastDraw || agora - radioLastDraw >= 250) {
+      radioLastDraw = agora;
+      drawRadioScreen(false);
+    }
+  }
+  if (sleepTimer.expired(millis())) {
+    sleepTimer.cancel();
+    Serial.println("[M5RETRO] temporizador venceu; desligando");
+    requestPowerOff();
+  }
   if (audioFailed && state != ERROR_SCREEN) {
     setError(PTBR::FALHA_AUDIO);
     return;
@@ -4034,6 +4502,19 @@ void loop() {
   }
   if (state == VIDEO_PLAYBACK) {
     videoTick();
+    // Vinheta entre programas do modo canal. drawBumper() so repinta o cartao
+    // inteiro na primeira chamada de cada vinheta; depois so a barra cresce,
+    // entao chamar a cada volta do loop nao pisca no CVBS.
+    if (tvChannel.bumperActive()) {
+      const uint32_t agora = millis();
+      tvChannel.drawBumper(&rca, 0, 0, nullptr, agora);
+      const int proximo = tvChannel.ready(agora);
+      if (proximo >= 0) {
+        librarySelection = proximo;
+        if (!startProgram(libraryProgramAt(proximo)) && !tvChannel.failed(millis()))
+          setError(PTBR::VIDEO_CORROMPIDO); // failed() ja tentou os seguintes
+      }
+    }
     drawPlaybackOsd();
     uiHudTick(millis()); // HUD a 1 Hz; a leitura do SD nunca espera este desenho
     if (playbackFinished) {
@@ -4043,7 +4524,11 @@ void loop() {
         setError(PTBR::AUDIO_INVALIDO);
       else if (videoReadError)
         setError(PTBR::VIDEO_CORROMPIDO);
-      else
+      else if (tvChannel.finished(millis())) {
+        // Modo canal ligado: fica em VIDEO_PLAYBACK exibindo a vinheta, e o
+        // bloco do loop abaixo inicia o programa seguinte quando ela acabar.
+        Serial.println("[M5RETRO] fim do programa; canal emenda o proximo");
+      } else
         drawLibrary();
       Serial.println("[M5RETRO] PLAY encerrado no fim do programa");
     }

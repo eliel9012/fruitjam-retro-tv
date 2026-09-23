@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-// FileTransfer.h — servidor HTTP embarcado para mandar video e musica do
+// FileTransfer.h — servidor HTTP embarcado para mandar video, musica e foto do
 // computador para o cartao microSD pela rede local.
 //
 // Substitui o vaivem do cartao no leitor: a tela dedicada mostra IP, usuario e
@@ -67,6 +67,22 @@
 //    navegador antigo que o descarte em silencio faria o servidor gravar um
 //    pedaco no inicio do arquivo. Com o cabecalho proprio esse buraco fecha.
 //
+// 8. Tres categorias, nao duas: videos/, music/ e fotos/. A categoria e o
+//    PRIMEIRO SEGMENTO do caminho, validado contra uma lista fechada — e a
+//    mesma trava que impede escrever em config/ ou fora do /M5RETRO. A pasta
+//    fotos/ e a unica com filtro de conteudo, por um motivo concreto: o
+//    slideshow le .jpg/.jpeg e o JPEGDEC do firmware nao abre tudo o que e
+//    JPEG valido. Entao a recusa acontece em tres alturas, da mais barata para
+//    a mais cara:
+//      a) extensao, no `sanitizePath` — nem chega a abrir socket de arquivo;
+//      b) tamanho, no `startBody` — antes de gravar o primeiro byte, porque uma
+//         foto de celular tem de 500 KB a 5 MB e o teto e 128 KB;
+//      c) cabecalho JPEG, no `completeBody` — antes do rename, lendo de volta
+//         o `.part` ja fechado. Progressivo e 4:4:4 sao os dois casos que o
+//         decodificador erra em silencio (ver `inspectJpegHeader`).
+//    Nenhuma delas afrouxa nada: sao filtros A MAIS sobre o caminho que ja
+//    passou pela validacao inteira.
+//
 // ---------------------------------------------------------------------------
 // Disciplina do cartao
 // ---------------------------------------------------------------------------
@@ -117,11 +133,23 @@ enum {
 // O FAT32 nao guarda arquivo de 4 GiB ou mais; tudo aqui e limitado por isso.
 static const uint64_t MAX_FILE = 0xFFFFFFFFull;
 
-// Prefixo obrigatorio. As duas unicas pastas que aceitam envio sao
-// /M5RETRO/videos/ e /M5RETRO/music/ — o resto do cartao (config, secrets,
-// cache) fica fora do alcance de quem tem a senha da sessao.
+// Prefixo obrigatorio. As tres unicas pastas que aceitam envio sao
+// /M5RETRO/videos/, /M5RETRO/music/ e /M5RETRO/fotos/ — o resto do cartao
+// (config, secrets, cache) fica fora do alcance de quem tem a senha da sessao.
 static const char CARD_ROOT[] = "/M5RETRO/";
 static const char PART_SUFFIX[] = ".part";
+
+// Pasta de fotos, ja com o prefixo do cartao. A tela de slideshow le daqui, e
+// `isPhotoPath` usa esta string para reconhecer a categoria depois que o
+// caminho ja foi sanitizado — sem reanalisar a entrada crua uma segunda vez.
+static const char FOTOS_DIR[] = "/M5RETRO/fotos/";
+
+// Teto de tamanho de uma foto. ESPELHA `MAX_JPEG` em src/main.cpp (128 KiB de
+// PSRAM para o buffer de decodificacao): acima disso o aparelho nunca conseguira
+// abrir o arquivo, entao recusar no envio e mais honesto do que gravar 3 MB no
+// cartao para o slideshow pular depois em silencio. Se o MAX_JPEG de la mudar,
+// este valor tem de mudar junto — sao dois arquivos que nao se enxergam.
+static const uint64_t MAX_PHOTO = 128u * 1024u;
 
 enum class PathError : uint8_t {
   OK,
@@ -130,8 +158,9 @@ enum class PathError : uint8_t {
   ESCAPA,     // segmento "." ou ".."
   CARACTERE,  // controle, nao-ASCII, escape % quebrado ou caractere proibido no FAT
   LONGO,      // estourou PATH_CAP ou MAX_SEGMENT
-  RAIZ,       // primeiro segmento nao e "videos" nem "music"
-  INCOMPLETO  // so "videos" ou "music", sem nome de arquivo
+  RAIZ,       // primeiro segmento nao e "videos", "music" nem "fotos"
+  INCOMPLETO, // so a pasta raiz, sem nome de arquivo
+  EXTENSAO    // extensao que a categoria nao aceita (hoje so fotos/ filtra)
 };
 
 // Texto curto e ASCII para mandar ao navegador e mostrar no LCD.
@@ -150,9 +179,11 @@ inline const char *pathErrorText(PathError error) {
   case PathError::LONGO:
     return "caminho longo demais";
   case PathError::RAIZ:
-    return "use videos/ ou music/";
+    return "use videos/, music/ ou fotos/";
   case PathError::INCOMPLETO:
     return "falta o nome do arquivo";
+  case PathError::EXTENSAO:
+    return "fotos aceita so .jpg ou .jpeg";
   }
   return "caminho invalido";
 }
@@ -164,6 +195,12 @@ inline size_t boundedLen(const char *text, size_t cap) {
   while (n < cap && text[n])
     ++n;
   return n;
+}
+
+// Fica aqui em cima, e nao junto do parser de cabecalho, porque a validacao de
+// caminho tambem precisa dela para comparar extensao sem sensibilidade a caixa.
+inline char lowerAscii(char c) {
+  return (c >= 'A' && c <= 'Z') ? char(c + 32) : c;
 }
 
 inline int hexDigit(char c) {
@@ -210,15 +247,55 @@ inline bool forbiddenInName(char c) {
   return strchr("\\:*?\"<>|", c) != NULL;
 }
 
+// Sufixo sem sensibilidade a caixa. `len > suffixLen` de proposito: um arquivo
+// chamado so ".jpg" nao tem nome, e o FAT o esconderia.
+inline bool endsWithNoCase(const char *seg, size_t len, const char *suffix, size_t suffixLen) {
+  if (len <= suffixLen)
+    return false;
+  for (size_t i = 0; i < suffixLen; ++i)
+    if (lowerAscii(seg[len - suffixLen + i]) != suffix[i])
+      return false;
+  return true;
+}
+
+// Nome aceito na pasta de fotos. So JPEG, porque e o unico formato que o
+// JPEGDEC do firmware abre; PNG, HEIC ou .exe ali so ocupariam cartao e
+// apareceriam como item quebrado no slideshow. Camera e celular gravam ".JPG"
+// tanto quanto ".jpg", entao a comparacao ignora a caixa.
+inline bool isPhotoName(const char *seg, size_t len) {
+  return endsWithNoCase(seg, len, ".jpg", 4) || endsWithNoCase(seg, len, ".jpeg", 5);
+}
+
+// Um caminho JA SANITIZADO cai na pasta de fotos? Fica separado de
+// `sanitizePath` para nao mexer na assinatura que os testes nativos e o
+// servidor ja usam — quem precisa da categoria depois (o teto de tamanho, a
+// conferencia do cabecalho JPEG) pergunta aqui.
+inline bool isPhotoPath(const char *cardPath) {
+  return cardPath && strncmp(cardPath, FOTOS_DIR, sizeof(FOTOS_DIR) - 1) == 0;
+}
+
+// Cabe no teto de decodificacao do aparelho? Puro para ser testavel sem rede.
+// Zero nao e tratado aqui: um arquivo vazio cai na conferencia do cabecalho,
+// que devolve um motivo mais exato ("arquivo nao e jpeg").
+inline bool fitsPhotoBudget(uint64_t totalBytes) {
+  return totalBytes <= MAX_PHOTO;
+}
+
 // Transforma o que veio depois de "/upload/" num caminho absoluto no cartao.
 // Entrada NAO CONFIAVEL: tudo o que nao for explicitamente permitido e negado.
 //
-// Aceita: videos/<...>/<arquivo> e music/<...>/<arquivo>
+// Aceita: videos/<...>/<arquivo>, music/<...>/<arquivo> e fotos/<...>/<arquivo>
 // Nega  : caminho absoluto, "." e "..", barra dupla ou final, byte de controle,
 //         qualquer coisa fora do ASCII imprimivel, caractere proibido no FAT,
 //         ponto ou espaco no fim de um segmento (o FAT os descarta em silencio,
 //         e "video.mjpeg." viraria "video.mjpeg" sem o chamador saber),
-//         e qualquer primeiro segmento que nao seja videos ou music.
+//         qualquer primeiro segmento que nao seja videos, music ou fotos, e —
+//         so em fotos/ — qualquer arquivo que nao termine em .jpg ou .jpeg.
+//
+// A checagem de extensao vale para a categoria inteira, inclusive em subpasta
+// (fotos/viagem/praia.jpg), e acontece DEPOIS da mesma varredura de caracteres
+// e de ".." que as outras categorias — a categoria nova nao ganha atalho nenhum
+// na validacao de caminho.
 //
 // `out` precisa ter PATH_CAP bytes; a folga do ".part" ja esta reservada.
 inline PathError sanitizePath(const char *raw, char *out, size_t cap) {
@@ -237,6 +314,7 @@ inline PathError sanitizePath(const char *raw, char *out, size_t cap) {
     return PathError::ABSOLUTO;
 
   size_t start = 0, segments = 0;
+  bool photoRoot = false;
   for (size_t i = 0; i <= size_t(decodedLen); ++i) {
     const char c = decoded[i];
     if (c != '/' && c != '\0') {
@@ -261,8 +339,13 @@ inline PathError sanitizePath(const char *raw, char *out, size_t cap) {
     if (segments == 0) {
       const bool videos = len == 6 && memcmp(decoded, "videos", 6) == 0;
       const bool music = len == 5 && memcmp(decoded, "music", 5) == 0;
-      if (!videos && !music)
+      photoRoot = len == 5 && memcmp(decoded, "fotos", 5) == 0;
+      if (!videos && !music && !photoRoot)
         return PathError::RAIZ;
+    } else if (c == '\0' && photoRoot && !isPhotoName(decoded + start, len)) {
+      // Ultimo segmento: e o nome do arquivo. So aqui a extensao importa — uma
+      // subpasta chamada "verao" continua valendo dentro de fotos/.
+      return PathError::EXTENSAO;
     }
     ++segments;
     start = i + 1;
@@ -377,10 +460,6 @@ inline int base64Decode(const char *src, size_t len, uint8_t *out, size_t cap) {
 
 inline bool isSpace(char c) {
   return c == ' ' || c == '\t';
-}
-
-inline char lowerAscii(char c) {
-  return (c >= 'A' && c <= 'Z') ? char(c + 32) : c;
 }
 
 inline bool matchesToken(const char *text, const char *lowerToken, size_t len) {
@@ -498,6 +577,98 @@ inline bool fitsOnCard(uint64_t freeBytes, uint64_t needed, uint64_t reserve) {
   return freeBytes >= required;
 }
 
+// ---------------------------------------------------------------------------
+// Conferencia do cabecalho JPEG
+// ---------------------------------------------------------------------------
+// O JPEGDEC do firmware nao abre tudo o que e JPEG valido, e os dois casos que
+// ele erra erram CALADOS — e por isso que a checagem vale a pena aqui, onde
+// ainda da para devolver um texto ao navegador:
+//
+//   * progressivo (SOF2/SOF6/SOF10): `decode()` devolve SUCCESS e desenha so
+//     40x30 pixels, os coeficientes DC da primeira varredura. A maioria dos
+//     exportadores web emite progressivo por padrao, entao isto e comum.
+//   * 4:4:4 (SOF com o Y em 1x1): `decode()` devolve JPEG_DECODE_ERROR.
+//
+// Isto olha SO o cabecalho, ate o SOS: nao decodifica nada e nao aloca nada.
+// Quando os bytes oferecidos acabam antes do SOF a resposta e INDETERMINADO, e
+// a regra do chamador e **nao acusar sem prova** — um arquivo de EXIF gigante
+// passa e o slideshow que se defenda, o que e melhor do que recusar uma foto
+// boa.
+enum class JpegVerdict : uint8_t {
+  OK,            // baseline, subamostragem que o decodificador aceita
+  INDETERMINADO, // o SOF nao apareceu nos bytes oferecidos
+  NAO_E_JPEG,    // nem comeca com SOI
+  PROGRESSIVO,   // SOF2/SOF6/SOF10
+  CHROMA_444     // SOF de 3 componentes com o Y em 1x1
+};
+
+inline JpegVerdict inspectJpegHeader(const uint8_t *data, size_t len) {
+  // Menos de dois bytes nao pode ser JPEG — inclusive o arquivo vazio, que e a
+  // unica prova negativa que este tamanho permite.
+  if (!data || len < 2)
+    return JpegVerdict::NAO_E_JPEG;
+  if (data[0] != 0xFF || data[1] != 0xD8)
+    return JpegVerdict::NAO_E_JPEG;
+
+  size_t i = 2;
+  while (i + 3 < len) {
+    if (data[i] != 0xFF)
+      return JpegVerdict::INDETERMINADO; // fora de sincronia: nao da para acusar
+    const uint8_t marker = data[i + 1];
+    if (marker == 0xFF) { // preenchimento entre marcadores e legal
+      ++i;
+      continue;
+    }
+    // Marcadores sem payload: TEM, RSTn, SOI, EOI.
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD9)) {
+      i += 2;
+      continue;
+    }
+    if (marker == 0xC2 || marker == 0xC6 || marker == 0xCA)
+      return JpegVerdict::PROGRESSIVO;
+    if (marker == 0xC0 || marker == 0xC1) {
+      // Payload do SOF: precisao(1) altura(2) largura(2) componentes(1) e
+      // depois 3 bytes por componente — id, amostragem, tabela de quantizacao.
+      const size_t sof = i + 4;
+      if (sof + 5 >= len)
+        return JpegVerdict::INDETERMINADO;
+      if (data[sof + 5] == 3) { // Y/Cb/Cr
+        if (sof + 7 >= len)
+          return JpegVerdict::INDETERMINADO;
+        const uint8_t sampling = data[sof + 7]; // do primeiro componente (Y)
+        if ((sampling >> 4) == 1 && (sampling & 0x0F) == 1)
+          return JpegVerdict::CHROMA_444;
+      }
+      return JpegVerdict::OK;
+    }
+    if (marker == 0xDA) // SOS: acabou o cabecalho sem SOF reconhecido
+      return JpegVerdict::INDETERMINADO;
+    const size_t seg = (size_t(data[i + 2]) << 8) | size_t(data[i + 3]);
+    if (seg < 2)
+      return JpegVerdict::INDETERMINADO; // comprimento impossivel
+    i += 2 + seg;
+  }
+  return JpegVerdict::INDETERMINADO;
+}
+
+// Texto do motivo, ou NULL quando a foto pode ser instalada. Curto porque a
+// mesma string vai para o corpo HTTP e para a faixa de estado da TV, onde
+// cabem ~44 caracteres antes de o texto ser truncado.
+inline const char *jpegRejectText(JpegVerdict verdict) {
+  switch (verdict) {
+  case JpegVerdict::NAO_E_JPEG:
+    return "arquivo nao e jpeg";
+  case JpegVerdict::PROGRESSIVO:
+    return "jpeg progressivo: salve como baseline";
+  case JpegVerdict::CHROMA_444:
+    return "jpeg 4:4:4: salve com 4:2:0";
+  case JpegVerdict::OK:
+  case JpegVerdict::INDETERMINADO:
+    break;
+  }
+  return NULL;
+}
+
 // Instalacao atomica: o `.part` completo vira o arquivo final num rename, que
 // no FAT e uma troca de entrada de diretorio. Ou o arquivo esta inteiro, ou
 // nao existe.
@@ -567,12 +738,18 @@ enum class TransferStatus : uint8_t {
 // Envia com fetch+PUT (ver decisao 4) e manda o meta.json por ultimo (decisao
 // 6), para que a pasta so pareca um programa valido quando o video ja estiver
 // inteiro no cartao.
+//
+// O `<input type=file multiple>` e o laco sequencial ja atendem o caso de mandar
+// 40 fotos de uma vez: e UM PUT POR ARQUIVO, um de cada vez (`await` dentro do
+// laco), que e exatamente o que o servidor aceita — uma conexao por vez, porque
+// o cartao e um recurso serial. Nao houve nada a acrescentar aqui para fotos
+// alem da opcao no seletor.
 static const char TRANSFER_PAGE[] =
     "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">"
     "<title>M5 RETRO TV</title><style>body{font:15px system-ui;margin:2em auto;max-width:32em;padding:0 1em}"
     "input,select,button{font:inherit;padding:.4em}#l div{margin:.3em 0;font-family:monospace}</style>"
     "<h2>M5 RETRO TV - enviar para o cartao</h2>"
-    "<p>Destino <select id=k><option>videos<option>music</select> "
+    "<p>Destino <select id=k><option>videos<option>music<option>fotos</select> "
     "pasta <input id=p size=14 placeholder=meu-filme></p>"
     "<p><input type=file id=f multiple></p><button onclick=go()>Enviar</button><div id=l></div>"
     "<script>async function go(){var a=[].slice.call(f.files);"
@@ -1041,6 +1218,15 @@ inline void FileTransfer::startBody() {
     respond(413, "Payload Too Large", "text/plain", "o FAT32 nao guarda arquivo de 4 GiB");
     return;
   }
+  // Foto acima do teto de decodificacao nunca sera exibida (MAX_PHOTO espelha o
+  // MAX_JPEG de src/main.cpp). Recusar ANTES de abrir o `.part` evita gravar
+  // megabytes que so seriam descartados — e o caso comum, porque uma foto de
+  // celular tem de 500 KB a 5 MB.
+  if (isPhotoPath(_path) && !fitsPhotoBudget(expected)) {
+    respond(413, "Payload Too Large", "text/plain",
+            "foto acima de 128 KB: reduza para 320x240");
+    return;
+  }
 
   if (!sdTake(SD_WAIT_MS)) {
     respond(503, "Service Unavailable", "text/plain", "cartao ocupado");
@@ -1152,6 +1338,7 @@ inline bool FileTransfer::pumpBody() {
 inline void FileTransfer::completeBody() {
   uint32_t onCard = 0;
   bool installed = false;
+  const char *rejected = NULL;
   if (sdTake(SD_WAIT_MS)) {
     _file.flush();
     onCard = uint32_t(_file.size());
@@ -1159,12 +1346,40 @@ inline void FileTransfer::completeBody() {
     _file = File();
     // So renomeia se o cartao tem exatamente o que foi prometido. Renomear um
     // arquivo curto e o unico jeito de o player receber um video pela metade.
-    if (uint64_t(onCard) == _total)
-      installed = installFile(SD, _part, _path);
+    if (uint64_t(onCard) == _total) {
+      // Foto: confere o cabecalho ANTES do rename. A leitura e do `.part` ja
+      // fechado, e nao do fluxo: um cabecalho JPEG pode ficar depois de um EXIF
+      // de dezenas de KB e nao cabe num unico pedaco do socket, enquanto aqui o
+      // arquivo inteiro esta no cartao e um `read` de BLOCK bytes ve tudo o que
+      // interessa. Reusa `_buffer` (PSRAM, ja alocado) — nenhum buffer novo.
+      if (isPhotoPath(_path)) {
+        size_t head = 0;
+        File probe = SD.open(_part, FILE_READ);
+        if (probe) {
+          const int n = probe.read(_buffer, BLOCK);
+          if (n > 0)
+            head = size_t(n);
+          probe.close();
+        }
+        rejected = jpegRejectText(inspectJpegHeader(_buffer, head));
+        // Some com o `.part` recusado: deixa-lo ali faria a proxima tentativa
+        // "retomar" um arquivo que o aparelho ja disse que nao abre.
+        if (rejected)
+          SD.remove(_part);
+      }
+      if (!rejected)
+        installed = installFile(SD, _part, _path);
+    }
     sdGive();
   }
   _phase = Phase::OCIOSA;
 
+  if (rejected) {
+    _status = TransferStatus::FALHA;
+    _error = rejected; // literal em flash: sobrevive a saida desta funcao
+    respond(415, "Unsupported Media Type", "text/plain", rejected);
+    return;
+  }
   if (!installed) {
     _status = TransferStatus::FALHA;
     _error = uint64_t(onCard) == _total ? "rename falhou" : "arquivo incompleto no cartao";

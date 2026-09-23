@@ -73,4 +73,11 @@ constexpr const char *OSD_ESTILO_VHS = "OSD VHS";
 constexpr const char *ATIVADO = "ATIVADO";
 constexpr const char *DESATIVADO = "DESATIVADO";
 constexpr const char *TEMPO = "TEMPO";
+constexpr const char *FOTOS = "FOTOS";
+constexpr const char *RADIO = "RADIO";
+constexpr const char *PADRAO_TESTE = "PADRAO DE TESTE";
+constexpr const char *SEM_FOTOS = "SEM FOTOS NO CARTAO";
+constexpr const char *NO_AR = "NO AR";
+constexpr const char *CONECTANDO = "CONECTANDO";
+constexpr const char *SEM_SINAL = "SEM SINAL";
 } // namespace PTBR
