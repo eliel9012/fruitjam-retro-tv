@@ -63,7 +63,7 @@ $(BUILD)/probe_%: probes/%.cpp $(M5GFX_OBJ) $(SHARED_HDRS) | $(BUILD)
 # Todo header novo entra nesta lista.
 CXX11_HDRS := VcrFont.h VcrOsd.h WeatherIcons.h ScreenFx.h SafeArea.h TransferScreen.h \
               ChannelMode.h TestPattern.h Subtitles.h PhotoShow.h RtcClock.h \
-              RadioStream.h RadioScreen.h DiarioLogo.h
+              RadioStream.h RadioScreen.h DiarioLogo.h BurnIn.h VhsFx.h
 
 cxx11: check
 	@for h in $(CXX11_HDRS); do \

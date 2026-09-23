@@ -45,6 +45,7 @@ bool SecretsManager::load(SecretsConfig &s, RadarConfig &r) {
       r.volume = constrain(d["volume"] | 75, 0, 100);
       r.vhsOsd = d["vhs_osd"] | true;
       r.color16 = d["cores_16bits"] | true;
+      r.vhsWear = constrain(d["fita_vhs"] | 2, 0, 3);
       r.audioOutput = String(d["audio_output"] | "rca");
       if (!isfinite(r.latitude) || r.latitude < -90 || r.latitude > 90)
         r.latitude = 0;
@@ -90,6 +91,7 @@ bool SecretsManager::saveSettings(const RadarConfig &r) {
   d["volume"] = r.volume;
   d["vhs_osd"] = r.vhsOsd;
   d["cores_16bits"] = r.color16;
+  d["fita_vhs"] = r.vhsWear;
   d["audio_output"] = r.audioOutput;
   String data;
   serializeJsonPretty(d, data);

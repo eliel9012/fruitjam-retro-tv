@@ -20,6 +20,8 @@
 #include "RadioStream.h"
 #include "RadioScreen.h"
 #include "Subtitles.h"
+#include "BurnIn.h"
+#include "VhsFx.h"
 #include "VcrOsd.h"
 #include "WeatherIcons.h"
 #include "ScreenFx.h"
@@ -55,6 +57,7 @@ struct Settings {
   // mais rapido; o RGB565 ocupa 153600 bytes e metade das linhas vai para a
   // PSRAM, o que deixa o blit mais lento mas multiplica a cor por 256.
   bool color16 = true;
+  vhs::Wear vhsWear = vhs::Wear::Gasta;
   AudioOutput audioOutput = AudioOutput::RCA;
 } settings;
 
@@ -318,6 +321,12 @@ int homeSelection = 0, librarySelection = 0, radarSelection = -1, settingsSelect
 // porque startProgram(), bem antes de scanLibrary(), ja precisa deles.
 channel::Channel tvChannel;
 sleeptimer::SleepTimer sleepTimer;
+// Protecao contra queima do tubo. Fosforo de CRT com menu e relogio parados por
+// horas marca de verdade, e isso nao volta atras.
+burnin::Manager idleMgr;
+// Artefatos de fita sobre a reproducao. 972 B de SRAM (tabela de deslocamento
+// por linha + um buffer de uma linha). Global, nunca na pilha de tarefa.
+vhs::Filter vhsFilter;
 // Tom de referencia de 1 kHz do padrao de barras. Atomico porque quem liga e o
 // loop (core 1) e quem consome e o audioTask (core 0).
 std::atomic<bool> toneActive{false};
@@ -450,6 +459,7 @@ RadarConfig currentSettings() {
   r.volume = settings.volume;
   r.vhsOsd = settings.vhsOsd;
   r.color16 = settings.color16;
+  r.vhsWear = (int)settings.vhsWear;
   r.audioOutput = settings.audioOutput == AudioOutput::INTERNAL ? "interno"
                   : settings.audioOutput == AudioOutput::MUTED  ? "mudo"
                                                                 : "rca";
@@ -463,6 +473,7 @@ void applySettings(const RadarConfig &r) {
   settings.volume = r.volume;
   settings.vhsOsd = r.vhsOsd;
   settings.color16 = r.color16;
+  settings.vhsWear = (vhs::Wear)constrain(r.vhsWear, 0, 3);
   settings.audioOutput = r.audioOutput == "interno" ? AudioOutput::INTERNAL
                          : r.audioOutput == "mudo"  ? AudioOutput::MUTED
                                                     : AudioOutput::RCA;
@@ -917,8 +928,11 @@ int jpegDraw(JPEGDRAW *draw) {
   // Saída de vídeo SOMENTE na RCA (composta). Nenhum pixel de frame é espelhado
   // no LCD: isso libera a banda do barramento SPI compartilhado com o microSD.
   const int64_t t0 = benchActive ? esp_timer_get_time() : 0;
-  rca.pushImage(draw->x + (CRT_W - videoWidth) / 2, draw->y + (CRT_H - videoHeight) / 2, draw->iWidth,
-                draw->iHeight, reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
+  // O filtro de fita fica DENTRO do medicao do bench de proposito: o custo dele
+  // e custo de blit, e esconder isso faria o diag bench mentir.
+  vhsFilter.pushBlock(&rca, draw->x + (CRT_W - videoWidth) / 2,
+                      draw->y + (CRT_H - videoHeight) / 2, draw->iWidth, draw->iHeight,
+                      draw->pPixels);
   if (benchActive) {
     benchBlitUs += uint64_t(esp_timer_get_time() - t0);
     ++benchBlitCalls;
@@ -973,8 +987,14 @@ bool readAndShowOneFrame(bool render) {
     rca.fillScreen(TFT_BLACK);
   }
   jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  // Sorteia os artefatos deste quadro antes de decodificar: o pushBlock consulta
+  // a tabela de deslocamento por linha enquanto os blocos chegam.
+  vhsFilter.beginFrame(millis(), (CRT_W - videoWidth) / 2, (CRT_H - videoHeight) / 2, videoWidth,
+                       videoHeight);
   const bool decoded = jpeg.decode(0, 0, 0);
   jpeg.close();
+  if (decoded)
+    vhsFilter.drawOverlay(&rca); // faixa de troca de cabeca e banda de tracking
   if (!decoded) {
     jpegErrors++;
     videoReadError = true;
@@ -1331,6 +1351,8 @@ bool startProgram(const String &dir) {
   // stopProgram(), entao registrar antes seria apagado. Pelo mesmo motivo
   // stopProgram() nao limpa o canal -- cancelaria a corrente recem agendada.
   tvChannel.started(librarySelection, millis());
+  vhsFilter.configure(vhs::presetFor(settings.vhsWear));
+  vhsFilter.begin(0xC0FFEE);
   return true;
 }
 void stopProgram() {
@@ -3341,7 +3363,7 @@ void stopWeather() {
 void drawSettings() {
   const char *names[] = {"VIDEO", "VOLUME", "ALCANCE RADAR", "ATUALIZACAO", PTBR::SAIDA_AUDIO,
                          PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "CONFIGURAR REDE",
-                         "CORES", "MODO CANAL", "DESLIGAR EM"};
+                         "CORES", "MODO CANAL", "DESLIGAR EM", "FITA VHS"};
   String audio = settings.audioOutput == AudioOutput::RCA        ? PTBR::RCA
                  : settings.audioOutput == AudioOutput::INTERNAL ? PTBR::ALTO_FALANTE_INTERNO
                                                                  : PTBR::MUDO;
@@ -3359,8 +3381,10 @@ void drawSettings() {
                  : settingsSelection == 10
                      ? (settings.color16 ? String("MILHARES") : String("256 CORES"))
                  : settingsSelection == 11 ? String(tvChannel.modeLabel())
-                 : sleepTimer.active()     ? String(sleepTimer.minutes()) + " MIN"
-                                           : String("DESLIGADO");
+                 : settingsSelection == 12
+                     ? (sleepTimer.active() ? String(sleepTimer.minutes()) + " MIN"
+                                            : String("DESLIGADO"))
+                                           : String(vhs::wearLabel(settings.vhsWear));
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextSize(2);
@@ -3618,6 +3642,10 @@ void drawInfo() {
 }
 
 void handleNavigation(NavAction a) {
+  // Conta como atividade antes de qualquer coisa: mesmo uma acao que esta tela
+  // vai ignorar significa que tem gente na frente do aparelho.
+  if (a != NavAction::NONE)
+    idleMgr.notifyActivity(millis());
   if (a == NavAction::NONE)
     return;
   // Qualquer comando adia o desligamento automatico: ninguem quer a TV apagando
@@ -3768,7 +3796,7 @@ void handleNavigation(NavAction a) {
     // 11 itens: o ultimo e CORES. Acrescentado no fim de proposito -- os
     // indices desta tela sao literais espalhados pelo bloco abaixo, entao
     // inserir no meio deslocaria todos eles.
-    constexpr int SETTINGS_COUNT = 13;
+    constexpr int SETTINGS_COUNT = 14;
     if (a == NavAction::BACK) {
       if (settingsEditing)
         settingsEditing = false;
@@ -3823,6 +3851,13 @@ void handleNavigation(NavAction a) {
         tvChannel.cycleMode();
       else if (settingsSelection == 12)
         sleepTimer.cycle(millis());
+      else if (settingsSelection == 13) {
+        settings.vhsWear = d > 0 ? vhs::nextWear(settings.vhsWear) : vhs::prevWear(settings.vhsWear);
+        // Se ja esta tocando, o filtro tem de saber agora: sem isto a mudanca so
+        // valeria no proximo programa.
+        if (playing)
+          vhsFilter.configure(vhs::presetFor(settings.vhsWear));
+      }
       else if (settingsSelection == 10 && !playing) {
         // Realoca o framebuffer do CVBS, entao so com o video parado. Chegar
         // aqui tocando nao deveria acontecer (esta tela nao reproduz), mas a
@@ -3958,6 +3993,8 @@ void togglePlayerAudio() {
     drawPlaybackController();
 }
 void handleTouch() {
+  if (M5.Touch.getCount())
+    idleMgr.notifyActivity(millis());
   static bool down = false;
   static int8_t button = -1;
   static uint32_t downAt = 0;
@@ -4451,9 +4488,33 @@ void setup() {
   // Offline playback must not be hidden behind network setup. The portal stays
   // available from CONFIGURACOES when the owner wants to add Wi-Fi later.
   bootReady = true;
+  idleMgr.reset(millis());
   state = HOME;
   drawHome();
 }
+// Repinta a tela corrente do zero. Usada quando o gerente anti-queima sai de
+// ESCURO ou APAGADO: nesses estagios o conteudo foi escurecido ou apagado, e
+// nao existe um "desfazer" -- tem de desenhar de novo.
+static void redrawCurrentScreen() {
+  switch (state) {
+  case HOME: drawHome(); break;
+  case VIDEO_LIBRARY: drawLibrary(); break;
+  case AIRCRAFT_RADAR: drawRadar(); break;
+  case SETTINGS: drawSettings(); break;
+  case SYSTEM_INFO: drawInfo(); break;
+  case MUSIC_BROWSER: drawMusicBrowser(); break;
+  case MUSIC_NOW_PLAYING: drawMusicNowPlaying(); break;
+  case FILE_TRANSFER: drawTransferFrame(); break;
+  case PHOTO_SHOW: drawPhotos(); break;
+  case RADIO: drawRadioScreen(true); break;
+  case TEST_PATTERN: drawTestPattern(); break;
+  // WEATHER repinta sozinha no proprio ritmo; VIDEO_PLAYBACK e TEST_PATTERN
+  // nunca chegam aqui porque o gerente nao escala nelas. SETUP_PORTAL e
+  // ERROR_SCREEN sao transitorias.
+  default: break;
+  }
+}
+
 void loop() {
   M5.update();
   servicePowerButton();
@@ -4569,7 +4630,26 @@ void loop() {
   if (state == FILE_TRANSFER) {
     transferTick();
   }
-  if (state == HOME && millis() - lastClockDraw >= 1000)
+  // Protecao do tubo. A reproducao de video e o padrao de teste se defendem
+  // sozinhos -- imagem em movimento nao queima fosforo -- entao o gerente so
+  // escala nas telas paradas.
+  const bool telaParada = state != VIDEO_PLAYBACK && state != TEST_PATTERN;
+  const burnin::Stage estagio = telaParada ? idleMgr.tick(millis()) : burnin::STAGE_ACTIVE;
+  if (!telaParada)
+    idleMgr.notifyActivity(millis());
+  if (idleMgr.takeRepaint())
+    redrawCurrentScreen();
+  if (estagio == burnin::STAGE_BLANK) {
+    // Protetor de tela: um bloco andando no preto. Apaga onde estava e pinta
+    // onde esta, 192 px de cada, a cada 200 ms -- barato o bastante para ficar
+    // horas ligado.
+    if (idleMgr.takeSaverStep()) {
+      rca.fillRect(idleMgr.saverPrevX(), idleMgr.saverPrevY(), burnin::SAVER_W, burnin::SAVER_H,
+                   (uint16_t)TFT_BLACK);
+      rca.fillRect(idleMgr.saverX(), idleMgr.saverY(), burnin::SAVER_W, burnin::SAVER_H,
+                   burnin::SAVER_COLOR);
+    }
+  } else if (state == HOME && millis() - lastClockDraw >= 1000)
     drawHomeClock(true);
   pollAircraft();
   if (state == AIRCRAFT_RADAR && radarDirty) {

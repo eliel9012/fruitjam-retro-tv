@@ -11,6 +11,7 @@ struct RadarConfig {
   int rangeKm = 250, refreshSeconds = 5, volume = 75;
   bool vhsOsd = true;
   bool color16 = true;
+  int vhsWear = 2; // 0 desligado, 1 nova, 2 gasta, 3 ruim
   String audioOutput = "rca";
 };
 class SecretsManager {
