@@ -40,6 +40,20 @@ são mockups. Regenere com `./sim/build/m5sim --png docs/screens`.*
 |---|---|---|---|
 | ![Music](docs/screens/music.png) | ![Music Playing](docs/screens/music_playing.png) | ![Portal](docs/screens/portal.png) | ![Error](docs/screens/error.png) |
 
+| Photos · Fotos | Radio · Rádio | Test pattern · Padrão de teste |
+|---|---|---|
+| ![Photos](docs/screens/photos.png) | ![Radio](docs/screens/radio.png) | ![Test pattern](docs/screens/test_pattern.png) |
+
+The test pattern and radio renders call the firmware's own `TestPattern.h` and
+`RadioScreen.h`, so they are the real output, pixel for pixel. The photo render
+is the only partial one: the simulator does not link JPEGDEC, so the frame and
+caption are real and the picture behind them is a synthetic gradient.
+
+*Os renders do padrão de teste e do rádio chamam o `TestPattern.h` e o
+`RadioScreen.h` do próprio firmware, então são a saída real, pixel a pixel. O
+das fotos é o único parcial: o simulador não linka o JPEGDEC, então a moldura e
+a legenda são reais e a imagem atrás delas é um degradê sintético.*
+
 ---
 
 # English
@@ -54,6 +68,8 @@ são mockups. Regenere com `./sim/build/m5sim --png docs/screens`.*
   a clone of *The Weather Channel Local Forecast* (Open-Meteo + ticker + smooth
   jazz on loop). See `weather/README.md`.
 - `sim/`: SDL screen simulator. Runs the same M5GFX rasterizer on the desktop.
+- `tools/`: `prepare_video.py` converts a film into MJPEG+WAV, `prepare_photos.py`
+  converts photos into the only JPEG shape the device can decode.
 - `AGENTS.md`: firmware architecture, non-negotiable hardware constraints and the
   traps that have already bitten. Start there before changing code.
 
@@ -151,6 +167,98 @@ screen, and accents are normalised to ASCII by `include/Ascii.h`. Album art come
 from `cover.jpg`/`folder.jpg` in the album folder or from the `APIC` frame
 embedded in the MP3. Ready-made test files are in `test-music/` (with accents and
 artwork) — copy them to `/M5RETRO/music/`.
+
+## Photos
+
+`/M5RETRO/fotos`, `.jpg`/`.jpeg`, auto-advancing with a configurable dwell (3 /
+5 / 10 / 30 s). Convert before copying:
+
+```bash
+python3 tools/prepare_photos.py ~/Pictures/trip ~/Downloads/M5RETRO-photos
+```
+
+The target is **320×240 baseline JPEG, 4:2:0, `-q:v 5`**, about 8 KB each. That
+is not a preference, it is the only thing the device can display, and all three
+limits were measured with the firmware's own JPEGDEC:
+
+- **4:4:4 chroma does not decode.** `JPEG_DECODE_ERROR`. A q2 file rendered 0×0
+  pixels; a q5 file rendered a 320×80 strip and then failed.
+- **Progressive JPEG fails silently — the dangerous one.** `decode()` returns
+  success and `getLastError()` returns 0, but it draws 40×30 pixels: the DC
+  coefficients of the first scan only (`jpeg.inl:4961`). This is what most web
+  exporters emit by default, and there is no error to catch. The converter
+  checks the SOF marker of every file it writes.
+- **128 KB ceiling**, from `MAX_JPEG` and the PSRAM decode buffer. A phone photo
+  is 0.5–5 MB and simply does not fit.
+
+Quality barely affects colour: q2 gives 1249 colours after RGB565, q10 gives
+1302, and the file is 2.5× larger. The JPEG is not what limits colour here.
+
+Photos also upload over Wi-Fi through **TRANSFERIR ARQUIVOS**, which rejects
+oversized files with a message instead of accepting them and failing on screen.
+
+## Internet radio
+
+A fixed station table (`RadioStream.h`), currently one entry. Plain HTTP with
+`WiFiClient` — not `WiFiClientSecure`, which would cost tens of KB of SRAM this
+device does not have. `Icy-MetaData: 1` is sent and the inline metadata blocks
+are removed from the byte stream at exactly `icy-metaint`, or the MP3 decoder
+chokes; `StreamTitle` is parsed out for the on-screen ticker. The ring buffer
+lives in PSRAM (64 KB ≈ 5.5 s at 96 kbps), the socket is read on core 0, and
+decoding reuses the same libhelix decoder as the local music player.
+
+The screen is deliberately bare: the station logo, a large clock in local time,
+the date, and the connection state. Only the digits that changed are repainted
+each tick — a full repaint every second on a 23 fps composite output flickers.
+
+Video is stopped while the radio plays. There is not enough SRAM for Wi-Fi, a
+socket, the decoder and MJPEG playback at once.
+
+`include/DiarioLogo.h` is the station's own published artwork, rasterised from
+the SVG on their site to 256×52 RGB565 and shown as station identification while
+their stream plays. Without that header the screen falls back to the station
+name as text and stays correct.
+
+## Channel mode and sleep timer
+
+**CONFIGURAÇÕES → MODO CANAL**: `DESLIGADO` keeps the current behaviour (stop at
+the end), `EM ORDEM` plays the next programme, `ALEATORIO` plays a shuffled
+permutation with no repeats until the list is exhausted. Between programmes a
+short "A SEGUIR" card names what is coming. This is what makes the device feel
+like a channel rather than a file player.
+
+**CONFIGURAÇÕES → DESLIGAR EM**: 15 / 30 / 60 / 90 / 120 minutes, the classic
+VCR sleep timer. Any button press restarts the countdown, so it will not power
+off in the middle of a film you are watching.
+
+## Subtitles
+
+A `.srt` next to the video (`video.mjpeg` → `video.srt`) is rendered as line-21
+style closed captions: white on a black box, inside the safe area and above the
+button bar. Parsing is forward-only and streaming — at most the current and next
+cue are held, so a long subtitle file costs nothing. The timebase is the **audio
+clock** (`samplesPlayed`/`sampleRate`), not `millis()`: audio is what drives
+sync. Accented Portuguese degrades to ASCII, because the bitmap fonts have no
+accents.
+
+## Test pattern
+
+Full-frame SMPTE colour bars — the one screen that deliberately uses the whole
+320×240, so you can see exactly how much the CRT crops — plus a 1 kHz reference
+tone at −20 dBFS. Press OK to cycle bars → sign-off slate → snow. The tone plays
+only with the bars, which is the classic "bars and tone" pair.
+
+## Real-time clock
+
+The Core2 has a battery-backed BM8563 that this firmware never used: the time
+came only from NTP, so after a power cycle without Wi-Fi the home clock was
+wrong. It is now seeded from the chip at boot and disciplined back to it after
+each NTP sync.
+
+This also fixed a plain bug: `configTime(0, 0, ...)` builds `TZ=UTC0DST0`, so the
+home clock was showing **UTC, three hours ahead of Brasília**. The timezone is
+now `<-03>3` — UTC−3 with no DST rule, matching Brazil since 2019. **SISTEMA**
+shows whether the time came from the RTC, from NTP, or not at all.
 
 ## Controls
 
@@ -342,6 +450,14 @@ Nine times the colour for 24% of the frame rate. At the converter's 240x160 and
 15 fps default that leaves 57% of headroom, so the trade is free; at 320x240 and
 30 fps the device was already skipping frames and skips more.
 
+Because the right answer depends on the content, **CONFIGURAÇÕES → CORES** now
+switches between them: `MILHARES` (RGB565) and `256 CORES` (RGB332, more fps).
+The choice is saved on the card and reapplied at boot, right after the card is
+mounted — the panel comes up in RGB565 because the preference lives on the card
+and the card is not mounted yet at that point. Switching reallocates the
+framebuffer (`Panel_CVBS::setColorDepth` does `deinit()` then `init(false)`), so
+it is only allowed with video stopped, and the signal drops for an instant.
+
 ### Memory budget
 
 The scarce resource is **not PSRAM** — it is internal SRAM. The composite video
@@ -379,6 +495,9 @@ test plan. `PINOUT.md` describes the connections the code uses.
   "The Weather Channel Local Forecast" (Open-Meteo + ticker + smooth jazz em loop).
   Consulte `weather/README.md`.
 - `sim/`: simulador SDL das telas. Roda o mesmo rasterizador M5GFX no desktop.
+- `tools/`: `prepare_video.py` converte um filme em MJPEG+WAV e
+  `prepare_photos.py` converte fotos para o único formato de JPEG que o aparelho
+  consegue decodificar.
 - `AGENTS.md`: arquitetura do firmware, restrições de hardware que não são
   negociáveis e as armadilhas já conhecidas. É o ponto de partida para quem for
   mexer no código.
@@ -475,6 +594,100 @@ aparecem na tela, e os acentos são normalizados para ASCII por `include/Ascii.h
 A capa vem de `cover.jpg`/`folder.jpg` na pasta do álbum ou do frame `APIC`
 embutido no MP3. Arquivos de teste prontos estão em `test-music/` (com acentos e
 capa) — copie para `/M5RETRO/music/`.
+
+## Fotos
+
+`/M5RETRO/fotos`, `.jpg`/`.jpeg`, avançando sozinhas com tempo configurável
+(3 / 5 / 10 / 30 s). Converta antes de copiar:
+
+```bash
+python3 tools/prepare_photos.py ~/Pictures/viagem ~/Downloads/M5RETRO-fotos
+```
+
+O alvo é **JPEG baseline 320×240, 4:2:0, `-q:v 5`**, cerca de 8 KB cada. Não é
+preferência: é a única coisa que o aparelho exibe, e os três limites foram
+medidos com o próprio JPEGDEC do firmware:
+
+- **Croma 4:4:4 não decodifica.** `JPEG_DECODE_ERROR`. Um arquivo em q2
+  renderizou 0×0 pixels; um em q5 renderizou uma faixa de 320×80 e falhou.
+- **JPEG progressivo falha em silêncio — esse é o perigoso.** O `decode()`
+  devolve sucesso e o `getLastError()` devolve 0, mas desenha 40×30 pixels: só
+  os coeficientes DC do primeiro scan (`jpeg.inl:4961`). É o que a maioria dos
+  exportadores web produz por padrão, e não há erro para capturar. O conversor
+  confere o marcador SOF de todo arquivo que escreve.
+- **Teto de 128 KB**, vindo do `MAX_JPEG` e do buffer de decodificação na PSRAM.
+  Foto de celular tem 0,5 a 5 MB e simplesmente não cabe.
+
+A qualidade quase não muda a cor: q2 dá 1249 cores depois do RGB565, q10 dá 1302
+e o arquivo fica 2,5× maior. Não é o JPEG que limita a cor aqui.
+
+As fotos também sobem por Wi-Fi pelo menu **TRANSFERIR ARQUIVOS**, que recusa
+arquivo grande demais com mensagem, em vez de aceitar e falhar na tela.
+
+## Rádio pela internet
+
+Tabela fixa de estações (`RadioStream.h`), hoje com uma entrada. HTTP puro com
+`WiFiClient` — e não `WiFiClientSecure`, que custaria dezenas de KB de SRAM que
+este aparelho não tem. Manda `Icy-MetaData: 1` e retira os blocos de metadado do
+fluxo exatamente a cada `icy-metaint`, senão o decodificador de MP3 engasga; o
+`StreamTitle` é extraído para o letreiro. O anel fica na PSRAM (64 KB ≈ 5,5 s a
+96 kbps), o socket é lido no core 0 e a decodificação reaproveita o mesmo
+libhelix do player de música local.
+
+A tela é propositalmente vazia: o logotipo da emissora, um relógio grande em
+hora local, a data e o estado da conexão. Só os dígitos que mudaram são
+repintados a cada passada — repintar a tela inteira a cada segundo numa saída
+composta de 23 fps pisca.
+
+O vídeo fica parado enquanto o rádio toca. Não há SRAM para Wi-Fi, socket,
+decodificador e reprodução de MJPEG ao mesmo tempo.
+
+O `include/DiarioLogo.h` é a arte publicada pela própria emissora, rasterizada
+do SVG do site para 256×52 em RGB565 e exibida como identificação enquanto o
+stream dela toca. Sem esse header a tela cai no nome da estação em texto e
+continua correta.
+
+## Modo canal e temporizador
+
+**CONFIGURAÇÕES → MODO CANAL**: `DESLIGADO` mantém o comportamento de sempre
+(para no fim), `EM ORDEM` emenda o programa seguinte, `ALEATORIO` toca uma
+permutação embaralhada sem repetir ninguém antes de esgotar a lista. Entre um
+programa e outro entra uma vinheta curta de "A SEGUIR" com o próximo título. É
+isso que faz o aparelho parecer um canal em vez de um abridor de arquivos.
+
+**CONFIGURAÇÕES → DESLIGAR EM**: 15 / 30 / 60 / 90 / 120 minutos, o sleep timer
+clássico de videocassete. Qualquer botão reinicia a contagem, então ele não
+apaga no meio do filme que você está assistindo.
+
+## Legendas
+
+Um `.srt` ao lado do vídeo (`video.mjpeg` → `video.srt`) aparece no estilo do
+closed caption de linha 21: branco sobre caixa preta, dentro da área segura e
+acima da faixa de botões. A leitura é sequencial e em fluxo — no máximo a legenda
+corrente e a seguinte ficam na memória, então um arquivo longo não custa nada. A
+base de tempo é o **relógio de áudio** (`samplesPlayed`/`sampleRate`), não o
+`millis()`: é o áudio que manda na sincronia. Acento em português vira ASCII,
+porque as fontes bitmap não têm acento.
+
+## Padrão de teste
+
+Barras SMPTE ocupando o quadro inteiro — a única tela que usa os 320×240 de
+propósito, justamente para se ver o quanto o tubo corta — mais um tom de
+referência de 1 kHz a −20 dBFS. OK alterna barras → cartaz de encerramento →
+chuvisco. O tom só toca com as barras, que é o par clássico "bars and tone".
+
+## Relógio de tempo real
+
+O Core2 tem um BM8563 com bateria que este firmware nunca usou: a hora vinha só
+do NTP, então depois de desligar da tomada sem Wi-Fi o relógio da tela inicial
+ficava errado. Agora ele é semeado pelo chip no boot e devolvido a ele a cada
+sincronismo de NTP.
+
+Isso também corrigiu um bug simples: `configTime(0, 0, ...)` monta
+`TZ=UTC0DST0`, então o relógio mostrava **UTC, três horas adiantado em relação a
+Brasília**. O fuso agora é `<-03>3` — UTC−3 sem regra de horário de verão, como
+o Brasil desde 2019. A tela **SISTEMA** mostra se a hora veio do RTC, do NTP ou
+de lugar nenhum.
 
 ## Controles
 
@@ -663,6 +876,14 @@ o consumo de SRAM interna continua nos mesmos 76.800 bytes. A troca, medida com
 Nove vezes mais cor por 24% da taxa de quadros. No padrão de 240x160 a 15 fps do
 conversor sobram 57% de folga, então a troca sai de graça; em 320x240 a 30 fps o
 aparelho já descartava quadros e passa a descartar mais.
+
+Como a resposta certa depende do conteúdo, **CONFIGURAÇÕES → CORES** agora
+alterna os dois: `MILHARES` (RGB565) e `256 CORES` (RGB332, mais fps). A escolha
+é gravada no cartão e reaplicada no boot, logo depois de montar o cartão — o
+painel sobe em RGB565 porque a preferência mora no cartão e o cartão ainda não
+está montado naquele ponto. A troca realoca o framebuffer (o
+`Panel_CVBS::setColorDepth` faz `deinit()` e `init(false)`), então só é
+permitida com o vídeo parado, e o sinal cai por um instante.
 
 ### Orçamento de memória
 

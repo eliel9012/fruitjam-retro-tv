@@ -24,8 +24,16 @@
 #include <string>
 
 #include "SafeArea.h"
+
+// Mesmo acento do firmware (RCA_ACCENT em src/main.cpp). NAO usar ACCENT:
+// ciano saturado provoca dot crawl na saida composta, e foi a causa do glitch
+// que aparecia so no item selecionado do menu. Contraste por luminancia, nao
+// por saturacao.
+static constexpr uint16_t ACCENT = 0x96BC;
 #include "VcrOsd.h"
 #include "WeatherIcons.h"
+#include "TestPattern.h"
+#include "RadioScreen.h"
 
 using namespace crt;
 
@@ -61,7 +69,7 @@ static void header(const char *title) {
   rca.setTextSize(2);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString(title, SAFE_L, HEAD_Y);
-  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, ACCENT);
   rca.setTextSize(1);
 }
 
@@ -69,7 +77,7 @@ static void controllerLabels(const char *left, const char *center, const char *r
   rca.fillRect(0, BAR_Y, W, BAR_H, TFT_NAVY);
   rca.setTextDatum(middle_center);
   rca.setTextSize(1);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString(std::string("[ ").append(left).append(" ]  [ ").append(center)
                      .append(" ]  [ ").append(right).append(" ]").c_str(),
                  W / 2, BAR_Y + BAR_H / 2);
@@ -79,14 +87,22 @@ static void controllerLabels(const char *left, const char *center, const char *r
 //  Telas
 // ---------------------------------------------------------------------------
 static void screenHome() {
-  const char *items[] = {"VIDEOS",  "MUSICA", "TRAFEGO AEREO", "CONFIGURACOES",
-                         "SISTEMA", "TEMPO",  "DESLIGAR"};
+  // Mesma ordem e mesmo layout de drawHome() no firmware: 11 itens em duas
+  // colunas de 6 e 5. Em coluna unica terminariam em 246 px, alem da barra.
+  const char *items[] = {"VIDEOS",          "MUSICA",  "FOTOS",
+                         "RADIO",           "TEMPO",   "TRAFEGO AEREO",
+                         "PADRAO DE TESTE", "TRANSFERIR ARQUIVOS", "CONFIGURACOES",
+                         "SISTEMA",         "DESLIGAR"};
   rca.fillScreen(TFT_NAVY);
   header("M5 RETRO TV");
-  for (int i = 0; i < 7; ++i) {
-    rca.setTextColor(i == 0 ? TFT_CYAN : TFT_WHITE, TFT_NAVY);
-    rca.drawString((std::string(i == 0 ? "> " : "  ") + items[i]).c_str(), SAFE_L + 4,
-                   BODY_Y + i * 20);
+  rca.setTextSize(1);
+  rca.setTextColor(TFT_WHITE, TFT_NAVY);
+  rca.drawString("QUA 23 SET   14:32:07", SAFE_L, crt::HEAD_RULE_Y + 4);
+  for (int i = 0; i < 11; ++i) {
+    const int x = SAFE_L + 4 + (i / 6) * 124;
+    const int y = crt::HEAD_RULE_Y + 24 + (i % 6) * 16;
+    rca.setTextColor(i == 0 ? ACCENT : TFT_WHITE, TFT_NAVY);
+    rca.drawString((std::string(i == 0 ? ">" : " ") + items[i]).c_str(), x, y);
   }
   controllerLabels("ACIMA", "OK", "ABAIXO");
 }
@@ -98,8 +114,8 @@ static void screenLibrary() {
   for (int row = 0; row < 4; ++row) {
     const int y = BODY_Y + 14 + row * 32;
     const bool sel = (row == 0);
-    rca.fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, sel ? TFT_CYAN : TFT_NAVY);
-    rca.setTextColor(sel ? TFT_NAVY : TFT_WHITE, sel ? TFT_CYAN : TFT_NAVY);
+    rca.fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, sel ? ACCENT : TFT_NAVY);
+    rca.setTextColor(sel ? TFT_NAVY : TFT_WHITE, sel ? ACCENT : TFT_NAVY);
     rca.drawString((std::string(sel ? "> " : "  ") + progs[row]).c_str(), SAFE_L + 8, y + 6);
   }
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -138,12 +154,12 @@ static void screenRadar() {
   rca.drawString("TRAFEGO AEREO", SAFE_L, SAFE_T + 15);
 
   const int cx = 96, cy = 118, R = 58;
-  rca.drawCircle(cx, cy, R, TFT_CYAN);
+  rca.drawCircle(cx, cy, R, ACCENT);
   rca.drawCircle(cx, cy, R / 2, TFT_DARKCYAN);
   rca.drawFastHLine(cx - R, cy, 2 * R, TFT_DARKCYAN);
   rca.drawFastVLine(cx, cy - R, 2 * R, TFT_DARKCYAN);
   rca.setTextDatum(middle_center);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("N", cx, cy - R - 8);
   rca.drawString("S", cx, cy + R + 8);
   rca.drawString("W", cx - R - 8, cy);
@@ -154,13 +170,13 @@ static void screenRadar() {
   const int PX = SAFE_L + 144;
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString("TAM3476", PX, SAFE_T + 18);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("ALT FL370", PX, SAFE_T + 40);
   rca.drawString("VEL 452 KT", PX, SAFE_T + 58);
   rca.drawString("DIST 68 km  PROA 214", PX, SAFE_T + 76);
   rca.setTextColor(TFT_DARKCYAN, TFT_NAVY);
   rca.drawString("120 km de alcance", PX, SAFE_T + 142);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("ATUALIZADO 12:04", PX, SAFE_T + 158);
   controllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
 }
@@ -201,10 +217,10 @@ static void weatherHeader(const char *title) {
   rca.setTextSize(1);
   rca.setTextColor(TFT_YELLOW);
   rca.drawString(title, W / 2, SAFE_T);
-  rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, ACCENT);
   // Igual ao firmware: a régua do ticker vive no cabeçalho, senão some na
   // primeira transição.
-  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, ACCENT);
 }
 
 // Página 1 da previsão: três dias em colunas, com ícone por dia.
@@ -221,7 +237,7 @@ static void screenForecast() {
     rca.setFont(&fonts::Font2);
     rca.setTextSize(1);
     rca.setTextDatum(top_center);
-    rca.setTextColor(TFT_CYAN);
+    rca.setTextColor(ACCENT);
     rca.drawString(dias[i], cx, SAFE_T + 42);
     wx::drawWeatherIcon(&rca, cx, SAFE_T + 96, 56, wx::iconFromWmo(codigo[i]));
     rca.setTextColor(TFT_YELLOW);
@@ -232,7 +248,7 @@ static void screenForecast() {
     rca.drawString(buf, cx, SAFE_T + 148);
   }
   rca.setFont(&fonts::Font2);
-  rca.setTextColor(TFT_CYAN);
+  rca.setTextColor(ACCENT);
   rca.drawString("MAXIMA / MINIMA EM GRAUS C", W / 2, SAFE_T + 166);
   weatherTicker(0);
 }
@@ -257,7 +273,7 @@ static void screenWeather(uint32_t ms, int tickerOffset) {
   rca.setTextColor(TFT_WHITE);
   rca.drawString("UMIDADE  62%", W / 2, SAFE_T + 140);
   rca.drawString("VENTO  12 KM/H  SO", W / 2, SAFE_T + 158);
-  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
+  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, ACCENT);
 
   weatherTicker(tickerOffset);
 }
@@ -269,7 +285,7 @@ static void weatherTicker(int tickerOffset) {
   rca.fillRect(0, TICKER_Y, W, TICKER_H, TFT_BLACK);
   rca.setClipRect(0, TICKER_Y, W, TICKER_H);
   rca.setTextDatum(top_left);
-  rca.setTextColor(TFT_CYAN, TFT_BLACK);
+  rca.setTextColor(ACCENT, TFT_BLACK);
   const int payloadW = rca.textWidth(payload);
   for (int x = -tickerOffset; x < W; x += payloadW)
     rca.drawString(payload, x, TICKER_Y);
@@ -280,7 +296,7 @@ static void weatherTicker(int tickerOffset) {
 static void screenSettings() {
   rca.fillScreen(TFT_NAVY);
   header("CONFIGURACOES");
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("> VIDEO", SAFE_L, BODY_Y + 26);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString("NTSC", SAFE_L + 10, BODY_Y + 58);
@@ -291,7 +307,7 @@ static void screenInfo() {
   rca.fillScreen(TFT_NAVY);
   header("SISTEMA");
   const int y0 = BODY_Y;
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("MEMORIA LIVRE", SAFE_L, y0);
   rca.drawString("PSRAM LIVRE", SAFE_L, y0 + 26);
   rca.drawString("VERSAO", SAFE_L, y0 + 52);
@@ -316,9 +332,9 @@ static void screenMusicPlaying() {
   rca.drawString("1979", metaX, coverY + 70);
   rca.setTextColor(TFT_DARKCYAN, TFT_NAVY);
   rca.drawString("3/12 192K", SAFE_R - 96, HEAD_RULE_Y + 6);
-  rca.drawRect(SAFE_L, 160, SAFE_W, 6, TFT_CYAN);
+  rca.drawRect(SAFE_L, 160, SAFE_W, 6, ACCENT);
   rca.fillRect(SAFE_L + 1, 161, 120, 4, TFT_YELLOW);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("PLAY 01:48 / 04:05  SHUFFLE", SAFE_L, 174);
   controllerLabels("ANTERIOR", "PAUSAR", "PROXIMO");
 }
@@ -329,13 +345,13 @@ static void screenInfoNetwork() {
   rca.fillScreen(TFT_NAVY);
   header("SISTEMA");
   const int y0 = BODY_Y;
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("STATUS DA REDE", SAFE_L, y0);
   rca.drawString("SINAL", SAFE_L, y0 + 26);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString("CONECTADO", SAFE_L + 144, y0);
   rca.drawString("-58 dBm", SAFE_L + 144, y0 + 26);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.drawString("ENDERECO IP", SAFE_L, y0 + 52);
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.drawString("192.168.0.42", SAFE_L + 144, y0 + 52);
@@ -355,8 +371,8 @@ static void screenMusicBrowser() {
   for (int row = 0; row < 4; ++row) {
     const int y = BODY_Y + 14 + row * 32;
     const bool sel = (row == 2);
-    rca.fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, sel ? TFT_CYAN : TFT_NAVY);
-    rca.setTextColor(sel ? TFT_NAVY : (pasta[row] ? TFT_CYAN : TFT_WHITE), sel ? TFT_CYAN : TFT_NAVY);
+    rca.fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, sel ? ACCENT : TFT_NAVY);
+    rca.setTextColor(sel ? TFT_NAVY : (pasta[row] ? ACCENT : TFT_WHITE), sel ? ACCENT : TFT_NAVY);
     rca.drawString((std::string(sel ? "> " : "  ") + itens[row]).c_str(), SAFE_L + 8, y + 6);
   }
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -371,7 +387,7 @@ static void screenPortal() {
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.setTextSize(2);
   rca.drawString("CONFIGURACAO", W / 2, 94);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.setTextSize(1);
   rca.drawString("WI-FI: M5RETRO-SETUP", W / 2, 130);
   rca.setTextDatum(top_left);
@@ -388,9 +404,48 @@ static void screenError() {
   rca.setTextColor(TFT_WHITE, TFT_NAVY);
   rca.setTextSize(2);
   rca.drawString("ERRO DO SISTEMA", W / 2, 94);
-  rca.setTextColor(TFT_CYAN, TFT_NAVY);
+  rca.setTextColor(ACCENT, TFT_NAVY);
   rca.setTextSize(1);
   rca.drawString("CARTAO SD NAO ENCONTRADO", W / 2, 130);
+}
+
+// As duas telas abaixo chamam os MODULOS DE VERDADE, nao uma reimplementacao:
+// foi uma copia divergente da disposicao que custou o tools/render_screens.py.
+// O que sair aqui e literalmente o que o firmware desenha.
+static void screenTestPattern() {
+  testpattern::drawBars(&rca, 0, 0);
+}
+
+static void screenRadio() {
+  radioui::State st;
+  st.hour = 14; st.minute = 32; st.second = 7;
+  st.day = 23; st.month = 9; st.year = 2026;
+  st.weekday = 3; // quarta
+  st.timeValid = true;
+  st.stationName = "DIARIO FM";
+  st.statusText = "NO AR";
+  st.title = "";
+  radioui::drawBackground(&rca, 0, 0);
+  radioui::draw(&rca, 0, 0, st);
+}
+
+// A apresentacao de fotos precisa do JPEGDEC, que o simulador nao linka: aqui
+// so a moldura (legenda, contador e rodape) e real, e a "foto" e um degrade
+// sintetico ocupando o lugar dela.
+static void screenPhotos() {
+  rca.fillScreen(TFT_BLACK);
+  for (int y = 0; y < crt::H; ++y) {
+    const int v = 255 * y / crt::H;
+    rca.drawFastHLine(0, y, crt::W, rca.color565(v / 3, v / 2, 200 - v / 2));
+  }
+  rca.setTextDatum(top_left);
+  rca.setTextSize(1);
+  rca.fillRect(SAFE_L, crt::SAFE_B - 34, SAFE_W, 16, TFT_BLACK);
+  rca.setTextColor(TFT_WHITE, TFT_BLACK);
+  rca.drawString("PADOVA_1988.JPG", SAFE_L + 2, crt::SAFE_B - 32);
+  rca.setTextColor(ACCENT, TFT_BLACK);
+  rca.drawString("7 / 42", crt::SAFE_R - 40, crt::SAFE_B - 32);
+  controllerLabels("ANTERIOR", "TEMPO", "PROXIMO");
 }
 
 // ---------------------------------------------------------------------------
@@ -398,8 +453,9 @@ static const char *SCREEN_NAMES[] = {"INICIO",        "BIBLIOTECA", "PLAYER",
                                      "RADAR",         "PREVISAO",   "PREVISAO3DIAS",
                                      "CONFIGURACOES", "SISTEMA",    "SISTEMA_REDE",
                                      "MUSICA",        "MUSICA_TOCANDO", "PORTAL",
+                                     "FOTOS",         "RADIO",      "PADRAO_TESTE",
                                      "ERRO"};
-constexpr int SCREEN_COUNT = 13;
+constexpr int SCREEN_COUNT = 16;
 
 static void drawCurrent(uint32_t ms, int tickerOffset) {
   switch (screenIndex) {
@@ -415,6 +471,9 @@ static void drawCurrent(uint32_t ms, int tickerOffset) {
   case 9: screenMusicBrowser(); break;
   case 10: screenMusicPlaying(); break;
   case 11: screenPortal(); break;
+  case 12: screenPhotos(); break;
+  case 13: screenRadio(); break;
+  case 14: screenTestPattern(); break;
   default: screenError(); break;
   }
   drawGuide();
