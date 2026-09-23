@@ -2495,9 +2495,35 @@ void drawTransferFrame() {
   drawBackButton();
 }
 
+// Controle remoto pelo navegador. Chamado da tarefa do servidor HTTP, entao so
+// enfileira: quem desenha e o loop, e desenhar daqui seria desenhar de outro
+// contexto em cima do que o loop esta pintando.
+static bool webCommand(const char *acao, void *) {
+  struct Mapa {
+    const char *nome;
+    NavAction acao;
+  };
+  static const Mapa MAPA[] = {
+      {"acima", NavAction::LEFT},  {"abaixo", NavAction::RIGHT},
+      {"ok", NavAction::SELECT},   {"voltar", NavAction::BACK},
+      {"inicio", NavAction::HOME},
+  };
+  for (const Mapa &m : MAPA) {
+    if (!strcmp(acao, m.nome)) {
+      input.inject(m.acao, InputSource::WEB);
+      Serial.printf("[M5RETRO] controle web: %s\n", acao);
+      return true;
+    }
+  }
+  return false;
+}
+
 void startTransfer() {
   stopProgram();  // encerra vídeo E a música em loop do Weather
   stopWeather();
+  // Liga /controle e /cmd no mesmo servidor. Sem esta chamada as duas rotas
+  // respondem 404 e o servidor se comporta como antes.
+  fileTransfer.setCommandHandler(webCommand, nullptr);
   if (!network.connected()) {
     setError(PTBR::SEM_WIFI);
     return;

@@ -298,6 +298,33 @@ inline bool fitsPhotoBudget(uint64_t totalBytes) {
 // na validacao de caminho.
 //
 // `out` precisa ter PATH_CAP bytes; a folga do ".part" ja esta reservada.
+// Valida a acao do controle remoto vinda da URL: so letras minusculas, curta,
+// terminada. Fica aqui, na metade sem rede, porque e logica que erra em
+// silencio e por isso precisa de teste -- a mesma razao que separou o
+// sanitizePath. Devolve false e esvazia `out` para qualquer coisa fora disso.
+inline bool sanitizeAction(const char *raw, char *out, size_t cap) {
+  if (!out || cap == 0)
+    return false;
+  out[0] = '\0';
+  if (!raw || !*raw)
+    return false;
+  // Valida ANTES de escrever. Escrevendo durante a varredura, um "ok/" deixava
+  // "ok" em `out` ao recusar, e quem ignorasse o retorno veria uma acao
+  // plausivel montada a partir de uma entrada invalida.
+  size_t n = 0;
+  for (; raw[n]; ++n) {
+    if (raw[n] < 'a' || raw[n] > 'z')
+      return false; // inclusive '/', '.', '%', espaco e maiuscula
+    if (n >= cap - 1)
+      return false; // longa demais: recusa, nao trunca
+  }
+  if (!n)
+    return false;
+  memcpy(out, raw, n);
+  out[n] = '\0';
+  return true;
+}
+
 inline PathError sanitizePath(const char *raw, char *out, size_t cap) {
   if (!raw || !out || cap < sizeof(CARD_ROOT) + PART_SUFFIX_LEN + 2)
     return PathError::LONGO;
@@ -744,6 +771,41 @@ enum class TransferStatus : uint8_t {
 // laco), que e exatamente o que o servidor aceita — uma conexao por vez, porque
 // o cartao e um recurso serial. Nao houve nada a acrescentar aqui para fotos
 // alem da opcao no seletor.
+// Quem trata um comando do controle remoto. A acao chega como texto curto
+// ("ok", "acima", ...) e quem implementa traduz para NavAction -- este header
+// nao conhece a maquina de telas. false = acao desconhecida, vira 400.
+typedef bool (*CommandFn)(const char *acao, void *user);
+
+// Pagina do controle remoto. Os botoes mandam fetch() e nao recarregam: o
+// aparelho tem uma conexao de cada vez e um recarregamento inteiro por toque
+// atrasaria o comando seguinte. Sem imagem, sem fonte externa, sem script de
+// fora: a pagina sai inteira do flash e funciona sem internet, que e o caso de
+// quem esta na mesma Wi-Fi do aparelho.
+static const char CONTROL_PAGE[] =
+    "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>M5 RETRO TV - controle</title><style>"
+    "body{font:15px system-ui;margin:0;padding:1em;background:#101828;color:#e8edf7;"
+    "display:flex;flex-direction:column;align-items:center;gap:1em}"
+    "h2{font-size:1.1em;letter-spacing:.08em;margin:.2em 0 0;color:#96bcff}"
+    "#p{display:grid;grid-template-columns:repeat(3,4.6em);gap:.6em}"
+    "button{font:inherit;height:4.6em;border:0;border-radius:.6em;background:#24324c;"
+    "color:#e8edf7;cursor:pointer;-webkit-tap-highlight-color:transparent}"
+    "button:active{background:#96bcff;color:#101828}"
+    "button.w{grid-column:span 3;height:3em}"
+    "#s{font:13px monospace;color:#8fa3c4;min-height:1.2em}"
+    "</style><h2>M5 RETRO TV</h2><div id=p>"
+    "<button class=w onclick=c('acima')>ACIMA</button>"
+    "<button onclick=c('voltar')>VOLTAR</button>"
+    "<button onclick=c('ok')>OK</button>"
+    "<button onclick=c('inicio')>INICIO</button>"
+    "<button class=w onclick=c('abaixo')>ABAIXO</button>"
+    "</div><div id=s></div><script>"
+    "async function c(a){var s=document.getElementById('s');s.textContent=a;"
+    "try{var r=await fetch('/cmd/'+a,{method:'PUT'});"
+    "s.textContent=r.ok?a+' ok':a+' falhou ('+r.status+')'}"
+    "catch(e){s.textContent='sem conexao'}}"
+    "</script>";
+
 static const char TRANSFER_PAGE[] =
     "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">"
     "<title>M5 RETRO TV</title><style>body{font:15px system-ui;margin:2em auto;max-width:32em;padding:0 1em}"
@@ -810,7 +872,7 @@ public:
 private:
   enum class Phase : uint8_t { OCIOSA, CABECALHO, CORPO };
   enum class Method : uint8_t { OUTRO, GET, HEAD, PUT };
-  enum class Route : uint8_t { DESCONHECIDA, RAIZ, UPLOAD };
+  enum class Route : uint8_t { DESCONHECIDA, RAIZ, UPLOAD, CONTROLE, COMANDO };
 
   WiFiServer _server{80};
   WiFiClient _client;
@@ -872,9 +934,25 @@ private:
 
   void respond(int code, const char *reason, const char *type, const char *body, const char *extra = NULL);
   void respondPage(bool bodyToo);
+  void respondControl(bool bodyToo);
   void respondResume();
   void makePassword();
   uint32_t partSize();
+
+  // Quem trata o comando do controle remoto. Ponteiro de funcao de proposito:
+  // este header nao conhece NavAction nem a maquina de telas, e nao deve
+  // conhecer. Devolve false para comando desconhecido, o que vira 400.
+  CommandFn _cmd = NULL;
+  void *_cmdUser = NULL;
+  char _acao[16] = {0};
+
+public:
+  // Liga o controle remoto. Sem isto as rotas /controle e /cmd respondem 404,
+  // e o servidor se comporta exatamente como antes.
+  void setCommandHandler(CommandFn fn, void *user) {
+    _cmd = fn;
+    _cmdUser = user;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -1078,6 +1156,15 @@ inline void FileTransfer::parseRequestLine() {
     _route = Route::RAIZ;
     return;
   }
+  if (strcmp(target, "/controle") == 0) {
+    _route = Route::CONTROLE;
+    return;
+  }
+  if (strncmp(target, "/cmd/", 5) == 0) {
+    _route = Route::COMANDO;
+    sanitizeAction(target + 5, _acao, sizeof(_acao));
+    return;
+  }
   if (strncmp(target, "/upload/", 8) == 0) {
     _route = Route::UPLOAD;
     _pathError = sanitizePath(target + 8, _path, sizeof(_path));
@@ -1164,6 +1251,34 @@ inline void FileTransfer::finishHeaders() {
       respondPage(_method == Method::GET);
     else
       respond(405, "Method Not Allowed", "text/plain", "use GET /");
+    return;
+  }
+  if (_route == Route::CONTROLE) {
+    if (!_cmd) {
+      respond(404, "Not Found", "text/plain", "controle remoto desligado");
+      return;
+    }
+    if (_method == Method::GET || _method == Method::HEAD)
+      respondControl(_method == Method::GET);
+    else
+      respond(405, "Method Not Allowed", "text/plain", "use GET /controle");
+    return;
+  }
+  if (_route == Route::COMANDO) {
+    if (!_cmd) {
+      respond(404, "Not Found", "text/plain", "controle remoto desligado");
+      return;
+    }
+    // PUT, e nao GET: o comando muda o estado do aparelho. Um GET seria
+    // disparado por qualquer pre-busca do navegador.
+    if (_method != Method::PUT) {
+      respond(405, "Method Not Allowed", "text/plain", "use PUT /cmd/<acao>");
+      return;
+    }
+    if (!_acao[0] || !_cmd(_acao, _cmdUser))
+      respond(400, "Bad Request", "text/plain", "acao desconhecida");
+    else
+      respond(200, "OK", "text/plain", "ok");
     return;
   }
   if (_route != Route::UPLOAD) {
@@ -1413,6 +1528,23 @@ inline void FileTransfer::respond(int code, const char *reason, const char *type
       _client.write((const uint8_t *)head, size_t(n) < sizeof(head) ? size_t(n) : sizeof(head) - 1);
     if (len)
       _client.write((const uint8_t *)body, len);
+    _client.flush();
+  }
+  closeConnection(false);
+}
+
+inline void FileTransfer::respondControl(bool bodyToo) {
+  if (_client) {
+    const size_t len = sizeof(CONTROL_PAGE) - 1;
+    char head[160];
+    const int n = snprintf(head, sizeof(head),
+                           "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n"
+                           "Content-Length: %u\r\n\r\n",
+                           (unsigned)len);
+    if (n > 0)
+      _client.write((const uint8_t *)head, size_t(n));
+    if (bodyToo)
+      _client.write((const uint8_t *)CONTROL_PAGE, len);
     _client.flush();
   }
   closeConnection(false);

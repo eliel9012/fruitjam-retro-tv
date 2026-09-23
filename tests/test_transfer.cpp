@@ -344,6 +344,33 @@ void testEnsureParents() {
   assert(!ensureParents(card, "", scratch, sizeof(scratch)));
 }
 
+// Acao do controle remoto. O que chega aqui veio da URL, entao o que interessa
+// e o que e RECUSADO: uma acao que passasse com '/' ou '%' viraria caminho, e
+// uma truncada silenciosamente poderia virar outra acao valida.
+void testControlAction() {
+  char a[16];
+  assert(sanitizeAction("ok", a, sizeof(a)) && !strcmp(a, "ok"));
+  assert(sanitizeAction("acima", a, sizeof(a)) && !strcmp(a, "acima"));
+  assert(sanitizeAction("inicio", a, sizeof(a)) && !strcmp(a, "inicio"));
+
+  // Recusados, e em todos os casos `out` sai vazio.
+  const char *ruins[] = {"",        "OK",      "ok/",     "ok ",    "ok\t",
+                         "../ok",   "ok%2f",   "ok1",     "o k",    "ok.",
+                         "ok-play", "ok\n"};
+  for (const char *r : ruins) {
+    assert(!sanitizeAction(r, a, sizeof(a)));
+    assert(a[0] == '\0');
+  }
+  assert(!sanitizeAction(nullptr, a, sizeof(a)) && a[0] == '\0');
+
+  // Longa demais recusa em vez de truncar: truncar "abaixomuito" para "abaixo"
+  // executaria um comando que ninguem pediu.
+  char curto[4];
+  assert(sanitizeAction("ok", curto, sizeof(curto)) && !strcmp(curto, "ok"));
+  assert(!sanitizeAction("abaixo", curto, sizeof(curto)) && curto[0] == '\0');
+  assert(!sanitizeAction("ok", a, 0));
+}
+
 int main() {
   testPathValidation();
   testSecretCompare();
@@ -352,5 +379,7 @@ int main() {
   testFreeSpace();
   testAtomicInstall();
   testEnsureParents();
-  std::cout << "PASS: caminho, senha em tempo constante, Basic, Range, espaco, instalacao atomica\n";
+  testControlAction();
+  std::cout << "PASS: caminho, senha em tempo constante, Basic, Range, espaco, instalacao "
+               "atomica, acao do controle\n";
 }

@@ -16,7 +16,10 @@ enum class NavAction : uint8_t {
   SEEK_BACKWARD,
   SEEK_FORWARD
 };
-enum class InputSource : uint8_t { LCD_BUTTON, BOTTOM_TOUCH };
+// WEB: comando vindo do controle remoto pelo navegador. Entra pela mesma fila
+// dos botoes de proposito -- assim nao existe um segundo caminho de navegacao
+// capaz de divergir do fisico.
+enum class InputSource : uint8_t { LCD_BUTTON, BOTTOM_TOUCH, WEB };
 
 // Merges Core2 BtnA/BtnB/BtnC and the LCD control bar into one action queue.
 class InputManager {
