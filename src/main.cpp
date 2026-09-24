@@ -351,6 +351,9 @@ subs::Subtitles subtitles;
 File srtFile;
 bool srtOpen = false;
 uint32_t radioLastDraw = 0;
+// Cache da repintura parcial da tela do radio. Sem ele, cada passada redesenha
+// a tela inteira.
+radioui::Cache radioCache;
 
 // Apresentacao de fotos. O catalogo guarda os nomes num pool continuo, com um
 // vetor de deslocamentos -- nada de String por foto. 128 nomes de ~20 chars
@@ -765,45 +768,10 @@ void audioTask(void *) {
     // O tom e a terceira fonte de audio, ao lado do playback e da musica do
     // Weather. Fica ANTES da condicao de ocioso porque nao vem do cartao: nao
     // toma o sdMutex e nao pode cair no ramo que exige wavFile ou mp3Mode.
-    // Radio: como o tom, nao vem do cartao, entao nao toma o sdMutex nem passa
-    // pela condicao de ocioso que exige wavFile ou mp3Mode. readPcm devolve 0
-    // enquanto o anel nao tem pre-buffer; ai e so nao escrever nada e voltar,
-    // que o DMA repete o silencio em vez de estalar.
-    if (radioActive.load() && !paused) {
-      uint8_t *buf = buffers[bufferIndex];
-      const size_t amostras =
-          radioStream.readPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
-      if (!amostras) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
-      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
-      const size_t bytes = amostras * sizeof(int16_t);
-      size_t written = 0;
-      if (active == AudioOutput::RCA)
-        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
-      else if (active == AudioOutput::INTERNAL)
-        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
-      bufferIndex = (bufferIndex + 1) % 3;
-      continue;
-    }
-    if (toneActive.load() && !paused) {
-      uint8_t *buf = buffers[bufferIndex];
-      const size_t amostras =
-          testTone.fillPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
-      const size_t bytes = amostras * sizeof(int16_t);
-      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
-      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
-      size_t written = 0;
-      if (active == AudioOutput::RCA)
-        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
-      else if (active == AudioOutput::INTERNAL)
-        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
-      bufferIndex = (bufferIndex + 1) % 3;
-      continue;
-    }
-    if ((!playing && !weatherAudio.load()) || paused || (!wavFile && !mp3Mode)) {
+    // Radio e tom nao vem do cartao e por isso nao satisfazem `wavFile ||
+    // mp3Mode`: sem excluir os dois aqui, a saida era PAUSADA embaixo deles.
+    const bool fonteViva = radioActive.load() || toneActive.load();
+    if (!fonteViva && ((!playing && !weatherAudio.load()) || paused || (!wavFile && !mp3Mode))) {
       if (!outputPaused && active == AudioOutput::RCA) {
         i2s_zero_dma_buffer(I2S_NUM_1);
         i2s_stop(I2S_NUM_1);
@@ -832,6 +800,90 @@ void audioTask(void *) {
       }
       outputPaused = false;
       pcmDueUs = 0;
+    }
+    // Radio e tom entram AQUI, depois do bloco acima, e nao antes. Chegando a
+    // essas telas vindo de ocioso, outputPaused esta true e o DMA do I2S foi
+    // zerado e parado; rodando antes, o `continue` pulava a reativacao e a
+    // escrita ia para um driver parado. Era esse o "sem som" no radio e no tom
+    // de 1 kHz do padrao de teste.
+    // Radio: como o tom, nao vem do cartao, entao nao toma o sdMutex nem passa
+    // pela condicao de ocioso que exige wavFile ou mp3Mode. readPcm devolve 0
+    // enquanto o anel nao tem pre-buffer; ai e so nao escrever nada e voltar,
+    // que o DMA repete o silencio em vez de estalar.
+    if (radioActive.load() && !paused) {
+      uint8_t *buf = buffers[bufferIndex];
+      const size_t amostras =
+          radioStream.readPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
+      if (!amostras) {
+        // Anel vazio: nada foi entregue, entao nao ha o que pacear. Rebasear o
+        // relogio e essencial -- dormindo 10 ms sem mexer no pcmDueUs, o
+        // deficit se acumula, cruza os 50 ms e conta um underrun a cada ~260
+        // ms. Foram 308 em 80 s medidos assim, quase todos falsos.
+        pcmDueUs = 0;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
+      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
+      const size_t bytes = amostras * sizeof(int16_t);
+      size_t written = 0;
+      if (active == AudioOutput::RCA)
+        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
+      else if (active == AudioOutput::INTERNAL)
+        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
+      // Ritmo pelo relogio de amostras, igual ao caminho de WAV/MP3 abaixo.
+      // SEM isto o laco gira o mais rapido que consegue a prioridade 4 no core
+      // 0, mata de fome o IDLE0 e a tarefa de copia de linha do CVBS, e o cao
+      // de guarda reinicia o aparelho -- foi exatamente o que aconteceu:
+      // "task_wdt: IDLE0 (CPU 0)" logo depois de "Radio: no ar".
+      {
+        const uint32_t quadros = amostras / 2; // valores int16 estereo -> quadros
+        if (!pcmDueUs)
+          pcmDueUs = esp_timer_get_time();
+        pcmDueUs += ((int64_t)quadros * 1000000LL) / 22050;
+        const int64_t faltaUs = pcmDueUs - esp_timer_get_time();
+        if (faltaUs > 0)
+          vTaskDelay(pdMS_TO_TICKS((faltaUs + 999) / 1000));
+        else if (faltaUs < -50000) {
+          pcmDueUs = esp_timer_get_time();
+          audioUnderruns++;
+        }
+      }
+      bufferIndex = (bufferIndex + 1) % 3;
+      continue;
+    }
+    if (toneActive.load() && !paused) {
+      uint8_t *buf = buffers[bufferIndex];
+      const size_t amostras =
+          testTone.fillPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
+      const size_t bytes = amostras * sizeof(int16_t);
+      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
+      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
+      size_t written = 0;
+      if (active == AudioOutput::RCA)
+        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
+      else if (active == AudioOutput::INTERNAL)
+        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
+      // Ritmo pelo relogio de amostras, igual ao caminho de WAV/MP3 abaixo.
+      // SEM isto o laco gira o mais rapido que consegue a prioridade 4 no core
+      // 0, mata de fome o IDLE0 e a tarefa de copia de linha do CVBS, e o cao
+      // de guarda reinicia o aparelho -- foi exatamente o que aconteceu:
+      // "task_wdt: IDLE0 (CPU 0)" logo depois de "Radio: no ar".
+      {
+        const uint32_t quadros = amostras / 2; // valores int16 estereo -> quadros
+        if (!pcmDueUs)
+          pcmDueUs = esp_timer_get_time();
+        pcmDueUs += ((int64_t)quadros * 1000000LL) / 22050;
+        const int64_t faltaUs = pcmDueUs - esp_timer_get_time();
+        if (faltaUs > 0)
+          vTaskDelay(pdMS_TO_TICKS((faltaUs + 999) / 1000));
+        else if (faltaUs < -50000) {
+          pcmDueUs = esp_timer_get_time();
+          audioUnderruns++;
+        }
+      }
+      bufferIndex = (bufferIndex + 1) % 3;
+      continue;
     }
     uint8_t *buf = buffers[bufferIndex];
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -3595,9 +3647,13 @@ void drawRadioScreen(bool completo) {
   st.stationName = radioStream.stationName();
   st.statusText = radioStream.stateLabel();
   st.title = titulo;
+  // tick() repinta SO o que mudou e devolve 0 quando nada mudou -- nesse caso
+  // nao escreve um pixel. A draw() daqui de cima chama drawBackground() toda
+  // vez, ou seja tela cheia: usada a cada 250 ms ela pisca o tubo inteiro.
+  // Zerar o cache faz o proprio tick() fazer a primeira pintura completa.
   if (completo)
-    radioui::drawBackground(&rca, 0, 0);
-  radioui::draw(&rca, 0, 0, st);
+    radioui::cacheReset(radioCache);
+  radioui::tick(&rca, 0, 0, st, radioCache, millis());
 }
 
 void enterRadio() {
@@ -3645,10 +3701,17 @@ void drawInfo() {
       d->drawString("MEMORIA LIVRE", SAFE_L, y0);
       d->drawString("PSRAM LIVRE", SAFE_L, y0 + 26);
       d->drawString("VERSAO", SAFE_L, y0 + 52);
+      d->drawString("FONTE DA HORA", SAFE_L, y0 + 78);
       d->setTextColor(TFT_WHITE, TFT_NAVY);
       d->drawString(String(ESP.getFreeHeap()) + " bytes", SAFE_L + 116, y0);
       d->drawString(String(ESP.getFreePsram()) + " bytes", SAFE_L + 116, y0 + 26);
       d->drawString("core2", SAFE_L + 116, y0 + 52);
+      // RTC / NTP / SEM HORA. Sem isto nao ha como saber, olhando o aparelho,
+      // se o relogio sobreviveu a falta de Wi-Fi ou se esta chutando.
+      String fonte = rtcclock::sourceLabel();
+      if (rtcclock::batteryLow())
+        fonte += " (BAT)";
+      d->drawString(fonte, SAFE_L + 116, y0 + 78);
     } else {
       d->drawString(PTBR::STATUS_REDE, SAFE_L, y0);
       d->drawString(PTBR::SINAL, SAFE_L, y0 + 26);
@@ -4245,6 +4308,29 @@ void serviceDiagnostics() {
       provisionDevice(command.substring(10));
       memset(line, 0, sizeof(line));
       continue;
+    }
+    if (command == "diag radio") {
+      Serial.printf("[RADIO] ativo=%d estado=%s anel=%u%% taxa=%d canais=%d bitrate=%d "
+                    "recebidos=%lu reconexoes=%lu underruns=%lu\n",
+                    (int)radioActive.load(), radioStream.stateLabel(),
+                    (unsigned)radioStream.bufferPercent(), radioStream.sourceRate(),
+                    radioStream.sourceChannels(), radioStream.bitrateKbps(),
+                    (unsigned long)radioStream.bytesReceived(),
+                    (unsigned long)radioStream.reconnects(), (unsigned long)audioUnderruns);
+      return;
+    }
+    if (command == "diag time") {
+      const time_t agora = time(nullptr);
+      struct tm local, utc;
+      localtime_r(&agora, &local);
+      gmtime_r(&agora, &utc);
+      char sl[32], su[32];
+      strftime(sl, sizeof(sl), "%Y-%m-%d %H:%M:%S", &local);
+      strftime(su, sizeof(su), "%Y-%m-%d %H:%M:%S", &utc);
+      Serial.printf("[HORA] local=%s  utc=%s  fonte=%s  TZ=%s  offset=%lds  bateria_fraca=%d\n", sl,
+                    su, rtcclock::sourceLabel(), rtcclock::timezoneString(),
+                    rtcclock::utcOffsetSeconds(), (int)rtcclock::batteryLow());
+      return;
     }
     if (command == "diag fb") {
       Serial.printf("[FB] profundidade=%d bits  %dx%d  bytes=%d\n",
