@@ -708,10 +708,18 @@ public:
     size_t produced = 0;
     if (running_ && dec_ && conn_.load() == (uint8_t)Conn::OnAir)
       produced = decodeInto(dst, samples);
+    // Zera a cauda so por higiene (o chamador nao vai escrever ali), e devolve
+    // o que REALMENTE foi produzido -- nao `samples`.
+    //
+    // Devolver o total pedido fazia o chamador pacear um bloco inteiro mesmo
+    // quando o decodificador tinha entregue um pedaco, e a diferenca ia para o
+    // I2S como SILENCIO no meio do som. Era isso que se ouvia como arrasto. Um
+    // retorno honesto deixa o chamador escrever menos e esperar menos, e faz o
+    // ramo `if (!amostras)` dele finalmente existir.
     for (size_t i = produced; i < samples; ++i)
       dst[i] = 0;
     pcmBusy_.store(false);
-    return samples;
+    return produced;
   }
 
   // -- leitura de estado (qualquer core) ------------------------------------
@@ -752,7 +760,7 @@ private:
   void resetDecoder() {
     mp3InLen_ = 0;
     mp3PcmCount_ = 0;
-    mp3Phase_ = 0.0;
+    phaseQ16_ = 0;
     mp3Rate_ = 44100;
     mp3Chans_ = 2;
   }
@@ -781,9 +789,12 @@ private:
           MP3FrameInfo info;
           MP3GetLastFrameInfo(dec_, &info);
           mp3PcmCount_ = (size_t)info.outputSamps;
-          mp3Phase_ = 0.0;
+          phaseQ16_ = 0;
           mp3Rate_ = info.samprate; // taxa REAL do fluxo, não presumida
           mp3Chans_ = info.nChans;
+          // O passo so muda quando o cabecalho do frame muda, entao sai do laco
+          // interno -- era uma divisao dupla POR AMOSTRA. 44100 -> 22050 da 2.0.
+          stepQ16_ = (uint32_t)(((uint64_t)mp3Rate_ << 16) / (uint32_t)OUT_RATE);
           if (info.bitrate > 0)
             bitrate_ = info.bitrate / 1000;
         } else if (consumed == 0) {
@@ -801,21 +812,32 @@ private:
         }
       }
       const int ch = mp3Chans_;
-      const double ratio = (double)mp3Rate_ / (double)OUT_RATE;
       const int framesIn = (int)(mp3PcmCount_ / ch);
-      const int idx = (int)mp3Phase_;
+      const int idx = (int)(phaseQ16_ >> 16);
       if (idx >= framesIn - 1) {
         mp3PcmCount_ = 0;
         continue;
       }
-      const float frac = (float)(mp3Phase_ - idx);
-      for (int c = 0; c < 2; ++c) {
-        const int sc = (ch == 1) ? 0 : c;
-        const int16_t a = mp3Pcm_[idx * ch + sc];
-        const int16_t b = mp3Pcm_[(idx + 1) * ch + sc];
-        dst[produced++] = (int16_t)(a + (b - a) * frac);
+      const int32_t frac = (int32_t)(phaseQ16_ & 0xFFFFu);
+      const int16_t *p0 = mp3Pcm_ + (size_t)idx * ch;
+      const int16_t *p1 = p0 + ch;
+      // MONO: mistura os dois canais ANTES de interpolar e escreve o mesmo
+      // valor nas duas saidas -- uma interpolacao em vez de duas. Misturar
+      // antes ou depois da o mesmo resultado, porque a interpolacao e linear.
+      int32_t a, b;
+      if (ch == 1) {
+        a = p0[0];
+        b = p1[0];
+      } else {
+        a = ((int32_t)p0[0] + (int32_t)p0[1]) / 2;
+        b = ((int32_t)p1[0] + (int32_t)p1[1]) / 2;
       }
-      mp3Phase_ += ratio;
+      // / 65536 e nao >> 16: (b - a) tem sinal, e o deslocamento arredondaria
+      // para -infinito injetando DC (armadilha 12 do AGENTS.md).
+      const int16_t v = (int16_t)(a + (b - a) * frac / 65536);
+      dst[produced++] = v;
+      dst[produced++] = v;
+      phaseQ16_ += stepQ16_;
     }
     return produced;
   }
@@ -982,7 +1004,12 @@ private:
   HMP3Decoder dec_ = nullptr;
   size_t mp3InLen_ = 0, mp3PcmCount_ = 0;
   int mp3Rate_ = 44100, mp3Chans_ = 2, bitrate_ = 0;
-  double mp3Phase_ = 0.0;
+  // Fase e passo do reamostrador em Q16. Eram `double`: o ESP32 nao tem FPU de
+  // precisao dupla, e o laco fazia uma DIVISAO dupla por amostra de saida
+  // (22.050 por segundo), emulada em software. Era isso que nao cabia nos
+  // 11,6 ms de cada volta do audioTask.
+  uint32_t phaseQ16_ = 0;
+  uint32_t stepQ16_ = 1u << 16;
 
   HeaderParser header_;
   MetaSplitter splitter_;
