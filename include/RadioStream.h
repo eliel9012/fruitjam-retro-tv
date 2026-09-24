@@ -614,6 +614,14 @@ public:
 
   // Aloca a PSRAM, inicializa o libhelix e cria a tarefa de rede no core 0.
   // Não bloqueia esperando a conexão: a tela mostra CONECTANDO enquanto isso.
+  // Empresta buffers de trabalho em SRAM para o decodificador. `in` precisa de
+  // MP3_IN_BYTES bytes e `pcm` de MP3_PCM_SHORTS int16. Chamar ANTES de
+  // begin(). Sem isto os dois caem na PSRAM e o audio arrasta.
+  void useWorkBuffers(uint8_t *in, size_t inCap, int16_t *pcm, size_t pcmShorts) {
+    extIn_ = (in && inCap >= MP3_IN_BYTES) ? in : nullptr;
+    extPcm_ = (pcm && pcmShorts >= MP3_PCM_SHORTS) ? pcm : nullptr;
+  }
+
   bool begin(int stationIndex) {
     if (running_)
       return true;
@@ -624,16 +632,34 @@ public:
       conn_.store((uint8_t)Conn::NoMemory);
       return false;
     }
-    // Um bloco só de PSRAM para os três buffers: um caminho de falha.
-    psram_ = (uint8_t *)heap_caps_malloc(PSRAM_BYTES, MALLOC_CAP_SPIRAM);
+    // O ANEL pode ficar na PSRAM: e escrito e lido em blocos grandes, e o
+    // custo por byte da PSRAM se dilui na cópia. Os buffers de TRABALHO do
+    // decodificador, nao: o libhelix le o fluxo de bits byte a byte da entrada
+    // e escreve 4.608 B de PCM por quadro, e na PSRAM (varias vezes mais lenta,
+    // atras de cache) ele nao acompanha 44100 Hz estereo. Era essa a causa do
+    // audio arrastado -- o player de MP3 local toca liso com o MESMO decoder
+    // justamente porque os buffers dele sao estaticos em SRAM.
+    //
+    // Quem chama empresta os buffers do player local por useWorkBuffers(): os
+    // dois nunca tocam ao mesmo tempo, entao custa zero de SRAM nova. Sem esse
+    // emprestimo, cai na PSRAM e volta a arrastar.
+    const bool trabalhoExterno = extIn_ && extPcm_;
+    const size_t bytes = trabalhoExterno ? RING_BYTES : PSRAM_BYTES;
+    psram_ = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
     if (!psram_) {
       conn_.store((uint8_t)Conn::NoMemory);
       Serial.println("[M5RETRO] Radio: sem PSRAM para o buffer");
       return false;
     }
     ring_.attach(psram_, RING_BYTES);
-    mp3In_ = psram_ + RING_BYTES;
-    mp3Pcm_ = (int16_t *)(psram_ + RING_BYTES + MP3_IN_BYTES);
+    if (trabalhoExterno) {
+      mp3In_ = extIn_;
+      mp3Pcm_ = extPcm_;
+    } else {
+      mp3In_ = psram_ + RING_BYTES;
+      mp3Pcm_ = (int16_t *)(psram_ + RING_BYTES + MP3_IN_BYTES);
+      Serial.println("[M5RETRO] Radio: buffers de trabalho na PSRAM (vai arrastar)");
+    }
     // O allocador do libhelix (AllocatorExt) já tenta ps_malloc primeiro, então
     // os ~25 KB de estado do decodificador também caem na PSRAM.
     dec_ = MP3InitDecoder();
@@ -1008,6 +1034,10 @@ private:
   // precisao dupla, e o laco fazia uma DIVISAO dupla por amostra de saida
   // (22.050 por segundo), emulada em software. Era isso que nao cabia nos
   // 11,6 ms de cada volta do audioTask.
+  // Buffers de trabalho emprestados pelo chamador (SRAM). Nao sao liberados
+  // aqui: o dono e quem emprestou.
+  uint8_t *extIn_ = nullptr;
+  int16_t *extPcm_ = nullptr;
   uint32_t phaseQ16_ = 0;
   uint32_t stepQ16_ = 1u << 16;
 

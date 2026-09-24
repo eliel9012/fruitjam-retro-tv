@@ -334,6 +334,11 @@ vhs::Filter vhsFilter;
 // defeito invisivel por um audivel. 1.152 B de SRAM no total.
 audioscope::Tap audioTap;
 audioscope::Scope audioScope;
+// Instrumentacao do radio. Tres hipoteses minhas sobre o arrasto falharam
+// seguidas; estes contadores medem em vez de deduzir. Quadros entregues por
+// segundo contra os 22050 exigidos da o fator de arrasto direto.
+std::atomic<uint32_t> radioPcmUs{0}, radioPcmCalls{0}, radioPcmMaxUs{0};
+std::atomic<uint32_t> radioWriteUs{0}, radioFramesOut{0}, radioSince{0};
 bool musicScopeOn = true;
 // Tom de referencia de 1 kHz do padrao de barras. Atomico porque quem liga e o
 // loop (core 1) e quem consome e o audioTask (core 0).
@@ -351,6 +356,7 @@ subs::Subtitles subtitles;
 File srtFile;
 bool srtOpen = false;
 uint32_t radioLastDraw = 0;
+bool radioDepthSaved = true;
 // Cache da repintura parcial da tela do radio. Sem ele, cada passada redesenha
 // a tela inteira.
 radioui::Cache radioCache;
@@ -818,25 +824,40 @@ void audioTask(void *) {
     // que o DMA repete o silencio em vez de estalar.
     if (radioActive.load() && !paused) {
       uint8_t *buf = buffers[bufferIndex];
+      const int64_t tDec = esp_timer_get_time();
       const size_t amostras =
           radioStream.readPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
+      {
+        const uint32_t us = (uint32_t)(esp_timer_get_time() - tDec);
+        radioPcmUs.fetch_add(us);
+        radioPcmCalls.fetch_add(1);
+        if (us > radioPcmMaxUs.load())
+          radioPcmMaxUs.store(us);
+        radioFramesOut.fetch_add(amostras / 2);
+      }
       if (!amostras) {
         // Anel vazio: nada foi entregue, entao nao ha o que pacear. Rebasear o
         // relogio e essencial -- dormindo 10 ms sem mexer no pcmDueUs, o
         // deficit se acumula, cruza os 50 ms e conta um underrun a cada ~260
         // ms. Foram 308 em 80 s medidos assim, quase todos falsos.
         pcmDueUs = 0;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // 1 tick (a granularidade minima do FreeRTOS) e nao 10 ms: cada espera
+        // dessas e tempo em que nada sai para o I2S. Faltavam ~1.100 quadros/s
+        // para os 22050, ou 50 ms por segundo -- cinco esperas de 10 ms. Com o
+        // anel quase sempre cheio, a proxima tentativa ja tem dado.
+        vTaskDelay(1);
         continue;
       }
       playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
       audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
       const size_t bytes = amostras * sizeof(int16_t);
       size_t written = 0;
+      const int64_t tW = esp_timer_get_time();
       if (active == AudioOutput::RCA)
         i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
       else if (active == AudioOutput::INTERNAL)
         M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
+      radioWriteUs.fetch_add((uint32_t)(esp_timer_get_time() - tW));
       // Ritmo pelo relogio de amostras, igual ao caminho de WAV/MP3 abaixo.
       // SEM isto o laco gira o mais rapido que consegue a prioridade 4 no core
       // 0, mata de fome o IDLE0 e a tarefa de copia de linha do CVBS, e o cao
@@ -3683,6 +3704,13 @@ void drawRadioScreen(bool completo) {
 
 void enterRadio() {
   stopProgram(); // o radio nao convive com o video: nao ha SRAM para os dois
+  mp3End();      // garante que o player local soltou os buffers abaixo
+  // Empresta ao radio os buffers de trabalho do player de MP3 local. Eles sao
+  // estaticos em SRAM e ficam parados enquanto o radio toca (os dois nunca
+  // tocam juntos), entao o decodificador ganha memoria rapida a custo zero.
+  // Na PSRAM o libhelix nao acompanha 44100 Hz estereo e o audio arrasta.
+  radioStream.useWorkBuffers(mp3In, sizeof(mp3In), mp3FramePcm,
+                             sizeof(mp3FramePcm) / sizeof(mp3FramePcm[0]));
   if (!radioStream.begin(0)) {
     setError(PTBR::SEM_SERVIDOR);
     return;
@@ -3691,6 +3719,17 @@ void enterRadio() {
   radioLastDraw = 0;
   audioTap.clear();
   audioscope::reset(audioScope);
+  radioPcmUs = 0; radioPcmCalls = 0; radioPcmMaxUs = 0;
+  radioWriteUs = 0; radioFramesOut = 0; radioSince = millis();
+  // EXPERIMENTO: o decode de MP3 roda no core 0 disputando com a task_memcpy,
+  // que so existe porque o psram_half_use mantem metade das linhas na PSRAM.
+  // Em RGB332 o quadro inteiro cabe na SRAM e essa tarefa some. A tela do radio
+  // e um relogio parado, entao nao perde nada em cor.
+  radioDepthSaved = settings.color16;
+  if (settings.color16) {
+    settings.color16 = false;
+    applyColorDepth();
+  }
   state = RADIO;
   M5.Display.fillScreen(TFT_NAVY);
   M5.Display.setTextDatum(top_left);
@@ -3707,6 +3746,10 @@ void enterRadio() {
 void stopRadio() {
   radioActive = false;
   radioStream.end();
+  if (radioDepthSaved && !settings.color16) {
+    settings.color16 = true;
+    applyColorDepth();
+  }
 }
 
 void drawInfo() {
@@ -4358,6 +4401,16 @@ void serviceDiagnostics() {
       return;
     }
     if (command == "diag radio") {
+      {
+        const uint32_t ch = radioPcmCalls.load(), fr = radioFramesOut.load();
+        const uint32_t dt = millis() - radioSince.load();
+        const unsigned long fps = dt ? (unsigned long)((uint64_t)fr * 1000 / dt) : 0;
+        Serial.printf("[PERF] chamadas=%lu decode_medio=%luus max=%luus i2s_medio=%luus  "
+                      "quadros/s=%lu (precisa 22050)\n",
+                      (unsigned long)ch, (unsigned long)(ch ? radioPcmUs.load() / ch : 0),
+                      (unsigned long)radioPcmMaxUs.load(),
+                      (unsigned long)(ch ? radioWriteUs.load() / ch : 0), fps);
+      }
       Serial.printf("[RADIO] ativo=%d estado=%s anel=%u%% taxa=%d canais=%d bitrate=%d "
                     "recebidos=%lu reconexoes=%lu underruns=%lu\n",
                     (int)radioActive.load(), radioStream.stateLabel(),
