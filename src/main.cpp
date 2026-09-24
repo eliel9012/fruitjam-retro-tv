@@ -360,8 +360,14 @@ radioui::Cache radioCache;
 // cabem em 2560 B; o teto de entradas e o que limita, nao o pool.
 // A decodificacao reaproveita o jpegBuffer do video (128 KB em PSRAM): nao ha
 // as duas coisas rodando ao mesmo tempo.
-static char photoPool[2560];
-static uint16_t photoOffsets[128];
+// Catalogo de fotos na PSRAM, nao na SRAM. Sao 2.816 B que so servem enquanto
+// se navega fotos, e em .bss eles encolhiam a heap -- o que importa para criar
+// tarefa nao e o total livre e sim o maior bloco CONTIGUO de 8 bits, e ele
+// estava em 8.180 B contra os 8.192 da pilha da WEATHER_HTTP. Doze bytes.
+static constexpr size_t PHOTO_POOL_BYTES = 2560;
+static constexpr size_t PHOTO_MAX_ENTRIES = 128;
+static char *photoPool = nullptr;
+static uint16_t *photoOffsets = nullptr;
 photo::Show photoShow;
 bool settingsEditing = false, radarDetails = false, radarDirty = false;
 uint32_t osdUntil = 0;
@@ -2920,8 +2926,14 @@ static const char *weekdayPt(int wd) {
 // Substituiu o wttr.in: o j1 de Franca devolve ~39 KB e não cabia no buffer de
 // 24 KB, então o JSON chegava truncado e toda consulta caía em "ERRO NA
 // CONSULTA". A resposta do Open-Meteo abaixo tem ~800 bytes.
+// HTTP simples, nao HTTPS, de proposito: e previsao publica, sem credencial e
+// sem nada a proteger, e o mbedTLS custa dezenas de KB de heap que este
+// aparelho nao tem. Medido: com TLS o GET devolvia -1 (conexao) porque o maior
+// bloco contiguo de 8 bits chegava a 148 B durante a consulta. O radio ja usa
+// WiFiClient puro pela mesma razao; a previsao estava fora de linha com isso.
+// A resposta e byte a byte a mesma: 816 bytes.
 static const char *WEATHER_URL =
-    "https://api.open-meteo.com/v1/forecast?latitude=-20.5386&longitude=-47.4008"
+    "http://api.open-meteo.com/v1/forecast?latitude=-20.5386&longitude=-47.4008"
     "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,"
     "wind_direction_10m&daily=weather_code,temperature_2m_max,temperature_2m_min"
     "&timezone=America%2FSao_Paulo&forecast_days=3";
@@ -2999,8 +3011,7 @@ static bool weatherParse(JsonDocument &doc, WeatherData &out) {
 }
 
 static bool weatherFetch(WeatherData &out) {
-  WiFiClientSecure client;
-  client.setInsecure(); // sem CA (economiza RAM)
+  WiFiClient client; // sem TLS: ver a nota no WEATHER_URL
   HTTPClient http;
   http.useHTTP10(true);
   http.setConnectTimeout(5000);
@@ -3113,6 +3124,13 @@ void pollWeather() {
                               nullptr, 1) != pdPASS) {
     weatherBusy.store(false);
     weatherStatus.store("SEM MEMORIA");
+    Serial.printf("[WEATHER] criacao da tarefa falhou: livre=%u interno=%u maior_interno=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                             MALLOC_CAP_8BIT));
+  } else {
+    Serial.println("[WEATHER] tarefa criada");
   }
 }
 
@@ -3547,8 +3565,15 @@ void drawPhotos() {
 
 void enterPhotos() {
   stopProgram(); // nada de video ou musica disputando o cartao e o buffer
-  photoShow.attachStorage(photoPool, sizeof(photoPool), photoOffsets,
-                          sizeof(photoOffsets) / sizeof(photoOffsets[0]));
+  if (!photoPool)
+    photoPool = (char *)ps_malloc(PHOTO_POOL_BYTES);
+  if (!photoOffsets)
+    photoOffsets = (uint16_t *)ps_malloc(PHOTO_MAX_ENTRIES * sizeof(uint16_t));
+  if (!photoPool || !photoOffsets) {
+    setError(PTBR::MEMORIA_INSUFICIENTE);
+    return;
+  }
+  photoShow.attachStorage(photoPool, PHOTO_POOL_BYTES, photoOffsets, PHOTO_MAX_ENTRIES);
   photoShow.attachBuffer(jpegBuffer, MAX_JPEG);
   photoShow.attachDecoder(&jpeg);
   photoShow.setFolder(PHOTOS);
@@ -3767,6 +3792,14 @@ void handleNavigation(NavAction a) {
   }
   if (a == NavAction::HOME) {
     weatherAudio = false; // HOME também encerra a música do Weather Channel
+    // Este ramo retorna ANTES dos ramos por estado, entao o stopRadio() que
+    // mora no ramo do RADIO nunca rodava ao sair pelo HOME: a tarefa RADIO_ICY
+    // ficava viva com sua pilha de 8 KB, o socket aberto e radioActive em true.
+    // Justamente 8 KB e o que a WEATHER_HTTP precisa, e a previsao passava a
+    // dizer SEM MEMORIA depois de uma visita ao radio.
+    if (radioActive.load())
+      stopRadio();
+    stopTestPattern(); // idem para o tom de 1 kHz
     // Sair de proposito cancela o modo canal: sem isto o proximo programa
     // comecaria sozinho depois que o usuario ja saiu da reproducao.
     tvChannel.stop();
@@ -4308,6 +4341,21 @@ void serviceDiagnostics() {
       provisionDevice(command.substring(10));
       memset(line, 0, sizeof(line));
       continue;
+    }
+    if (command == "diag mem") {
+      // O que decide a criacao de uma tarefa nao e o total livre: e o MAIOR
+      // BLOCO CONTIGUO. A pilha de 8192 B da WEATHER_HTTP precisa sair inteira
+      // de um bloco so, e heap fragmentado com 34 KB livres pode nao ter 8 KB
+      // seguidos.
+      Serial.printf("[MEM] livre=%u minimo=%u maior_bloco=%u  interno_livre=%u "
+                    "interno_maior=%u  psram=%u  previsao=%s\n",
+                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                               MALLOC_CAP_8BIT),
+                    (unsigned)ESP.getFreePsram(), weatherStatus.load());
+      return;
     }
     if (command == "diag radio") {
       Serial.printf("[RADIO] ativo=%d estado=%s anel=%u%% taxa=%d canais=%d bitrate=%d "
