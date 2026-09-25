@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-//  ScreenFx — transições entre telas da saída composta (RCA) do M5 RETRO TV.
+//  ScreenFx — transições entre telas da saída de vídeo do Retro TV.
 //
 //  Vocabulário do Weather Star 4000 (o gerador de caracteres que o The Weather
 //  Channel usava nos anos 80): esmaecimento para preto, esmaecimento a partir
@@ -10,8 +10,9 @@
 //  ---------------------------------------------------------------------------
 //  Por que dithering ordenado e não mistura alfa
 //  ---------------------------------------------------------------------------
-//  O quadro CVBS é RGB332 (1 byte/pixel) e já ocupa 76.800 bytes da SRAM
-//  interna. Não sobra espaço para dois sprites de tela cheia, então não há como
+//  O quadro é RGB565 (2 bytes/pixel) e já ocupa 153.600 bytes da SRAM interna
+//  (no Fruit Jam é o próprio framebuffer do DVI; no Core2 original era o quadro
+//  CVBS). Não sobra espaço para dois quadros inteiros na SRAM, então não há como
 //  interpolar origem e destino pixel a pixel. A saída é decidir POR PIXEL quem
 //  aparece, usando uma matriz de Bayer 8x8: a cada nível 0..63 um sexagésimo
 //  quarto dos pixels troca de lado. O olho (e principalmente um tubo, que já
@@ -19,7 +20,7 @@
 //  granulado é exatamente a textura da época.
 //
 //  Propriedade que interessa ao orçamento: um esmaecimento completo escreve
-//  cada pixel da tela UMA única vez (76.800 escritas no total), distribuídas ao
+//  cada pixel da tela UMA única vez (76.800 pixels no total), distribuídas ao
 //  longo da duração. Cada nível custa W*H/64 = 1.200 escritas.
 //
 //  ---------------------------------------------------------------------------
@@ -29,17 +30,36 @@
 //  destino é redesenhado por região (recorte via setClipRect).
 //
 //  fadeIn e crossfade são a exceção: revelar o destino pixel a pixel exige uma
-//  cópia dele em algum lugar legível. Aqui isso é um LGFX_Sprite 320x240 a 8
-//  bits (76.800 bytes) que O CHAMADOR fornece — ScreenFx nunca aloca. No Core2
-//  esse sprite só cabe na PSRAM (setPsram(true)), e o custo tem duas partes:
+//  cópia dele em algum lugar legível. Aqui isso é um LGFX_Sprite 320x240 que O
+//  CHAMADOR fornece — ScreenFx nunca aloca.
 //
-//    * pintar o destino DENTRO do sprite, uma vez, no início da transição.
-//      A PSRAM do Core2 é ~4x mais lenta que a SRAM em escrita sequencial, e
-//      esta é a parte cara: estimar 3 a 5x o tempo de um drawWeatherFrame()
-//      normal (dezenas de ms). É um soluço único, no começo — por isso ele
-//      acontece ANTES do primeiro passo visível, e não no meio.
-//    * ler 1.200 bytes por nível. Espalhados de 8 em 8, tocam ~2.400 linhas de
-//      cache por nível; na ordem de centenas de microssegundos. Irrelevante.
+//  Profundidade do sprite: **16 bits (RGB565), a mesma do painel.** O canal
+//  `tv` do Fruit Jam é sempre RGB565, e um sprite de outra profundidade é a
+//  armadilha 10 do AGENTS.md. Por compatibilidade com o upstream, um sprite de
+//  8 bits (RGB332) continua aceito — a cor é convertida pelo TIPO na escrita,
+//  então sai certa, só quantizada em 256 cores. Qualquer outra profundidade é
+//  recusada e degrada para corte seco.
+//
+//  Onde o sprite mora: 320x240x2 = 153.600 bytes, que SÓ cabem na PSRAM. No
+//  Fruit Jam o `setPsram(true)` do LGFX_Sprite NÃO resolve: a plataforma rp2040
+//  da LovyanGFX implementa heap_alloc_psram() como malloc() comum, e o sprite
+//  iria para a SRAM, ao lado do framebuffer. O chamador aloca com ps_malloc()
+//  (fj/Platform.h) e entrega o buffer pronto:
+//
+//    uint16_t *px = (uint16_t *)ps_malloc(320 * 240 * 2);
+//    static lgfx::LGFX_Sprite scratch;
+//    if (px) scratch.setBuffer(px, 320, 240, 16);
+//
+//  O custo tem duas partes:
+//
+//    * pintar o destino DENTRO do sprite, uma vez, no início da transição. A
+//      PSRAM é mais lenta que a SRAM (no Fruit Jam fica atrás de um cache de
+//      16 KB; escrita sequencial vai bem), e esta é a parte cara: um repinte
+//      de tela cheia fora da SRAM. É um soluço único, no começo — por isso ele
+//      acontece ANTES do primeiro passo visível, e não no meio. Não medido no
+//      Fruit Jam.
+//    * ler 1.200 pixels por nível. Espalhados de 8 em 8, cada um numa linha
+//      de cache diferente; na ordem de centenas de microssegundos. Irrelevante.
 //
 //  Se o sprite não vier (nullptr, ou sem buffer), fadeIn/crossfade degradam
 //  para corte seco / esmaecimento para preto + corte seco, e o método devolve
@@ -53,7 +73,7 @@
 //  rede. O tempo entra como parâmetro (nem millis() é chamado aqui dentro),
 //  o que também torna o arquivo testável no simulador de desktop.
 //
-//    crt::fx::Transition tx(&rca);
+//    crt::fx::Transition tx(&tv);
 //    tx.slide(millis(), crt::fx::screen(pintaAtual), crt::fx::screen(pintaExt),
 //             crt::fx::DIR_LEFT);
 //    ...
@@ -92,8 +112,9 @@
 //         de microssegundos) mais o texto de duas páginas — bem abaixo dos
 //         16,6 ms de um campo NTSC. Se apertar, aumente SLIDE_STEP.
 //
-//  Depende apenas do M5GFX e recebe o destino como lgfx::LovyanGFX*, então roda
-//  igual no painel CVBS do aparelho e no painel SDL do simulador.
+//  Depende apenas da LovyanGFX (fj/Gfx.h) e recebe o destino como
+//  lgfx::LovyanGFX*, então roda igual no canvas `tv` do aparelho e no painel SDL
+//  do simulador. Nada de Arduino, FreeRTOS nem alocação.
 // ============================================================================
 
 #include "fj/Gfx.h"
@@ -159,7 +180,7 @@ public:
   }
 
   // Esmaece a partir de uma cor sólida até `to`. Pinta `to` dentro de `scratch`
-  // (320x240, 8 bits) uma única vez e revela a partir dali.
+  // (320x240, 16 bits — ver o cabeçalho) uma única vez e revela a partir dali.
   // Devolve false se não houve sprite utilizável — nesse caso `to` é pintada
   // de uma vez só (corte seco) e a transição já nasce concluída.
   bool fadeIn(uint32_t now, const Screen &to, lgfx::LGFX_Sprite *scratch, uint32_t ms = 420,
@@ -326,11 +347,12 @@ private:
       return false;
     if (scratch->width() < dst_->width() || scratch->height() < dst_->height())
       return false;
-    // revealLevel() lê o sprite como RGB332. Num sprite de 16 bpp isso pegaria o
-    // byte baixo de um RGB565 e pintaria cor aleatória — e o LGFX_Sprite nasce em
-    // rgb565_2Byte, então esquecer o setColorDepth(8) é o erro provável. Recusar
-    // aqui degrada para corte seco, que é o contrato documentado.
-    if (scratch->getColorDepth() != lgfx::color_depth_t::rgb332_1Byte)
+    // revealLevel() lê o valor CRU do sprite e o reinterpreta pelo tipo de cor
+    // da profundidade dele. Só as duas profundidades que sabemos reinterpretar
+    // passam; outra (paleta, 24 bits) pintaria cor aleatória em silêncio.
+    // Recusar aqui degrada para corte seco, que é o contrato documentado.
+    const lgfx::color_depth_t depth = scratch->getColorDepth();
+    if (depth != lgfx::color_depth_t::rgb565_2Byte && depth != lgfx::color_depth_t::rgb332_1Byte)
       return false;
     scratch->clearClipRect();
     to.paint(scratch, 0, 0, to.user);
@@ -371,7 +393,18 @@ private:
     // mas quem tem de aparecer ali ainda é a cor sólida.
     const bool fromSprite = (kind_ == KIND_DISSOLVE) && (src_ != nullptr);
     dst_->startWrite();
-    if (fromSprite) {
+    if (fromSprite && src_->getColorDepth() == lgfx::color_depth_t::rgb565_2Byte) {
+      // O LGFX_Sprite de 16 bits guarda RGB565 com os bytes trocados (herança
+      // do SPI) e readPixelValue devolve esse valor cru. Desfeita a troca, é
+      // RGB565 comum; passá-lo sem desfazer trocaria vermelho com parte do
+      // verde. Com o destino também em 16 bits, a cópia é exata (conferido
+      // pixel a pixel em sim/probes/screen_fx.cpp).
+      for (int y = my; y < h; y += 8)
+        for (int x = mx; x < w; x += 8) {
+          const uint16_t raw = (uint16_t)src_->readPixelValue(x, y);
+          dst_->writePixel(x, y, lgfx::rgb565_t((uint16_t)((raw << 8) | (raw >> 8))));
+        }
+    } else if (fromSprite) {
       for (int y = my; y < h; y += 8)
         for (int x = mx; x < w; x += 8)
           dst_->writePixel(x, y, lgfx::rgb332_t((uint8_t)src_->readPixelValue(x, y)));

@@ -22,8 +22,8 @@
 //  include/TestPattern.h, um `touch sim/probes/test_pattern.cpp` antes do make.
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cstdarg>
 #include <cmath>
@@ -38,7 +38,7 @@
 namespace tp = testpattern;
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 static int failures = 0;
 
 static void fail(const char *fmt, ...) {
@@ -53,7 +53,7 @@ static void fail(const char *fmt, ...) {
 
 static void savePng(const char *name) {
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, crt::W, crt::H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, crt::W, crt::H);
   if (!png) {
     fail("nao gerou %s", name);
     return;
@@ -68,7 +68,7 @@ static void savePng(const char *name) {
 }
 
 static void expectPixel(const char *what, int x, int y, uint16_t want) {
-  const uint16_t got = (uint16_t)rca.readPixel(x, y);
+  const uint16_t got = (uint16_t)tv.readPixel(x, y);
   if (got != want)
     fail("%s em (%d,%d): 0x%04X, esperado 0x%04X", what, x, y, got, want);
 }
@@ -78,7 +78,7 @@ static void expectPixel(const char *what, int x, int y, uint16_t want) {
 // ---------------------------------------------------------------------------
 static void checkBars() {
   printf("\n[barras SMPTE]\n");
-  tp::drawBars(&rca, 0, 0);
+  tp::drawBars(&tv, 0, 0);
   savePng("probe_test_pattern_bars.png");
 
   const uint16_t top[7] = {tp::GRAY75, tp::YELLOW75, tp::CYAN75,  tp::GREEN75,
@@ -107,7 +107,7 @@ static void checkBars() {
   // Bordas verticais das barras, varrendo uma linha do topo.
   int edges[16], n = 0;
   for (int x = 1; x < crt::W; ++x)
-    if (rca.readPixel(x, 80) != rca.readPixel(x - 1, 80) && n < 16)
+    if (tv.readPixel(x, 80) != tv.readPixel(x - 1, 80) && n < 16)
       edges[n++] = x;
   printf("  bordas das barras:");
   for (int i = 0; i < n; ++i)
@@ -124,7 +124,7 @@ static void checkBars() {
   // Proporcoes 67 / 8 / 25 lidas na coluna da primeira barra.
   int t1 = -1, t2 = -1;
   for (int y = 1; y < crt::H; ++y) {
-    if (rca.readPixel(10, y) != rca.readPixel(10, y - 1)) {
+    if (tv.readPixel(10, y) != tv.readPixel(10, y - 1)) {
       if (t1 < 0)
         t1 = y;
       else if (t2 < 0)
@@ -143,7 +143,7 @@ static void checkBars() {
   int minX = crt::W, minY = crt::H, maxX = -1, maxY = -1;
   for (int y = tp::BOT_Y; y < crt::H; ++y) {
     for (int x = tp::LABEL_X; x < tp::LABEL_X + tp::LABEL_W; ++x) {
-      if ((uint16_t)rca.readPixel(x, y) == tp::BLACK)
+      if ((uint16_t)tv.readPixel(x, y) == tp::BLACK)
         continue;
       if (x < minX) minX = x;
       if (y < minY) minY = y;
@@ -161,11 +161,11 @@ static void checkBars() {
   }
 
   // Carta limpa, sem rotulo: a regiao acima tem de ficar toda preta.
-  tp::drawBarsLabeled(&rca, 0, 0, nullptr, nullptr);
+  tp::drawBarsLabeled(&tv, 0, 0, nullptr, nullptr);
   savePng("probe_test_pattern_bars_limpa.png");
   for (int y = tp::BOT_Y; y < crt::H; ++y)
     for (int x = tp::LABEL_X; x < tp::LABEL_X + tp::LABEL_W; ++x)
-      if ((uint16_t)rca.readPixel(x, y) != tp::BLACK) {
+      if ((uint16_t)tv.readPixel(x, y) != tp::BLACK) {
         fail("carta sem rotulo ainda tem tinta em (%d,%d)", x, y);
         y = crt::H;
         break;
@@ -179,7 +179,7 @@ static void checkNoSignal() {
   printf("\n[sem sinal]\n");
 
   tp::sharedSnow().reset();
-  tp::drawSnow(&rca, 0, 0);
+  tp::drawSnow(&tv, 0, 0);
   savePng("probe_test_pattern_snow.png");
   // Chuvisco tem de ser ruido, nao um campo chapado.
   long sum = 0;
@@ -187,7 +187,7 @@ static void checkNoSignal() {
   uint8_t seen[64] = {0};
   for (int y = 0; y < crt::H; y += 8)
     for (int x = 0; x < crt::W; x += 8) {
-      const uint16_t v = (uint16_t)rca.readPixel(x, y);
+      const uint16_t v = (uint16_t)tv.readPixel(x, y);
       const int lum = (v >> 11) & 0x1F;
       sum += lum;
       if (!seen[lum]) {
@@ -203,22 +203,22 @@ static void checkNoSignal() {
     fail("media do chuvisco fora do centro: %.1f", mean);
 
   // Dois quadros seguidos precisam diferir (senao a tela fica congelada).
-  const uint16_t before = (uint16_t)rca.readPixel(0, 0);
+  const uint16_t before = (uint16_t)tv.readPixel(0, 0);
   int changed = 0;
-  tp::drawSnow(&rca, 0, 0);
+  tp::drawSnow(&tv, 0, 0);
   for (int y = 0; y < crt::H; y += 8)
     for (int x = 0; x < crt::W; x += 8)
-      if ((uint16_t)rca.readPixel(x, y) != before)
+      if ((uint16_t)tv.readPixel(x, y) != before)
         ++changed;
   if (!changed)
     fail("segundo quadro de chuvisco identico ao primeiro");
 
-  tp::drawSlate(&rca, 0, 0);
+  tp::drawSlate(&tv, 0, 0);
   savePng("probe_test_pattern_slate.png");
   int minX = crt::W, minY = crt::H, maxX = -1, maxY = -1;
   for (int y = 0; y < crt::H; ++y)
     for (int x = 0; x < crt::W; ++x) {
-      if ((uint16_t)rca.readPixel(x, y) == tp::BLACK)
+      if ((uint16_t)tv.readPixel(x, y) == tp::BLACK)
         continue;
       if (x < minX) minX = x;
       if (y < minY) minY = y;
@@ -232,10 +232,10 @@ static void checkNoSignal() {
   else if (minX < crt::SAFE_L || maxX >= crt::SAFE_R || minY < crt::SAFE_T || maxY >= crt::SAFE_B)
     fail("cartaz escapou da area segura");
 
-  tp::drawSlateText(&rca, 0, 0, "FIM DA TRANSMISSAO", "SEM CARTAO SD");
+  tp::drawSlateText(&tv, 0, 0, "FIM DA TRANSMISSAO", "SEM CARTAO SD");
   savePng("probe_test_pattern_slate_sd.png");
 
-  tp::drawNoSignal(&rca, 0, 0);
+  tp::drawNoSignal(&tv, 0, 0);
   savePng("probe_test_pattern_nosignal.png");
 }
 
@@ -341,10 +341,11 @@ static void checkTone() {
 
 int main(int, char **) {
   panel.setScaling(2, 2);
-  rca.setPanel(&panel);
-  if (!rca.init())
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init())
     return 1;
-  rca.setColorDepth(16); // RGB565, igual ao rca.setColorDepth(16) do main.cpp
+  tv.setColorDepth(16); // RGB565, igual ao tv.setColorDepth(16) do main.cpp
 
   checkBars();
   checkNoSignal();

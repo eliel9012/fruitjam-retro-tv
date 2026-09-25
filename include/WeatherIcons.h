@@ -19,7 +19,7 @@
 // "azul-claro de chuva" no 565 pode cair no mesmo nivel do cinza da nuvem.
 //
 // Uso:
-//   wx::drawWeatherIcon(&rca, cx, cy, 96, wx::iconFromWmo(code));
+//   wx::drawWeatherIcon(&tv, cx, cy, 96, wx::iconFromWmo(code));
 // ============================================================================
 
 #include "fj/Gfx.h"

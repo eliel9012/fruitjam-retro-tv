@@ -20,8 +20,7 @@
 //  Nao abre janela: desenha num LGFX_Sprite e le os pixels de volta.
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
 
 #include <cstdio>
 #include <cstring>

@@ -220,8 +220,10 @@ inline void extractYear(char *dst, size_t cap) {
       tmp[j++] = dst[i];
   tmp[j] = 0;
   size_t k = 0;
-  while (k + 1 < cap && tmp[k])
-    dst[k++] = tmp[k];
+  // Índice e incremento em comandos separados: `dst[k++] = tmp[k]` só é bem
+  // definido a partir do C++17, e este header também compila em C++11.
+  for (; k + 1 < cap && tmp[k]; ++k)
+    dst[k] = tmp[k];
   dst[k] = 0;
 }
 
@@ -264,8 +266,8 @@ template <class Stream> bool readV1(Stream &f, TrackMeta &out) {
     char y[8] = {0};
     copyAscii(y, sizeof(y), tag + 93, 4);
     size_t k = 0;
-    while (k + 1 < sizeof(out.year) && y[k])
-      out.year[k++] = y[k];
+    for (; k + 1 < sizeof(out.year) && y[k]; ++k) // ver extractYear(): C++11
+      out.year[k] = y[k];
     out.year[k] = 0;
   }
   // ID3v1.1: faixa em comment[28]==0 && comment[29]!=0

@@ -12,7 +12,10 @@
 //       cinza aceitos;
 //    4. navegação: avança, volta, dá a volta nas duas pontas;
 //    5. prazo com millis() dando a volta — o caso em que a comparação ingênua
-//       `now >= prazo` erra e a apresentação congelaria por 49 dias.
+//       `now >= prazo` erra e a apresentação congelaria por 49 dias;
+//    7. scan()/load() contra um cartão falso com a API do SD do arduino-pico
+//       (open(path, "r"), sem fs::FS): prova que os templates instanciam com
+//       um objeto que não herda de fs::FS, que é o caso do `SD` do Fruit Jam.
 //
 //  Grava ainda build/probe_photo_show.png com a tela desenhada sem foto (só a
 //  legenda e a faixa de botões), para conferir a área segura a olho.
@@ -20,8 +23,8 @@
 //    make -C sim probes && ./sim/build/probe_photo_show
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cstdio>
 #include <cstdlib>
@@ -296,7 +299,7 @@ static void testDeadline() {
 //  6. Desenho: legenda e faixa de botoes dentro da area segura
 // ---------------------------------------------------------------------------
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 static void testPaint() {
   printf("\n[6] desenho (sem JPEGDEC no desktop: sai a tela de recado)\n");
@@ -307,20 +310,21 @@ static void testPaint() {
   check(photo::ACCENT != 0x07FF, "o acento nao e ciano saturado (dot crawl)");
 
   panel.setScaling(2, 2);
-  rca.setPanel(&panel);
-  if (!rca.init()) {
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init()) {
     printf("  (sem video SDL: PNG nao gravado, o resto dos testes vale)\n");
     return;
   }
-  rca.setColorDepth(16); // o framebuffer da RCA agora e RGB565
+  tv.setColorDepth(16); // RGB565, igual ao canvas `tv` do Fruit Jam
 
   photo::Show s;
   feed(s, 87);
   s.setIndex(11, 0);
-  s.paint(&rca, 0, 0);
+  s.paint(&tv, 0, 0);
 
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, crt::W, crt::H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, crt::W, crt::H);
   if (png) {
     FILE *f = fopen("build/probe_photo_show.png", "wb");
     if (f) {
@@ -332,6 +336,73 @@ static void testPaint() {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  7. Cartão falso: só o formato da API que o arduino-pico expõe
+// ---------------------------------------------------------------------------
+struct FakeFile {
+  const char *const *names = nullptr; // entradas, se for diretório
+  int count = 0, next = 0;
+  const char *name_ = "";
+  size_t size_ = 0;
+  bool open_ = false, dir_ = false;
+  explicit operator bool() const { return open_; }
+  bool isDirectory() const { return dir_; }
+  const char *name() const { return name_; }
+  size_t size() const { return size_; }
+  size_t read(uint8_t *buf, size_t n) {
+    memset(buf, 0xAB, n);
+    return n;
+  }
+  void close() {}
+  FakeFile openNextFile() {
+    FakeFile f;
+    if (next < count) {
+      f.open_ = true;
+      f.name_ = names[next++];
+      f.size_ = 1234;
+    }
+    return f;
+  }
+};
+struct FakeSd { // como o SDClass do arduino-pico: NÃO herda de fs::FS
+  const char *const *names;
+  int count;
+  int opens = 0;
+  const char *lastMode = "";
+  FakeFile open(const char *path, const char *mode) {
+    ++opens;
+    lastMode = mode;
+    FakeFile f;
+    f.open_ = true;
+    if (!strcmp(path, "/M5RETRO/fotos")) {
+      f.dir_ = true;
+      f.names = names;
+      f.count = count;
+    } else {
+      f.name_ = path;
+      f.size_ = 1234;
+    }
+    return f;
+  }
+};
+static char pool3[512];
+static uint16_t offs3[64];
+
+static void testCard() {
+  printf("\n[7] scan()/load() com o SD do arduino-pico (template, sem fs::FS)\n");
+  static const char *const files[] = {"b.jpg", "notas.txt", "A.JPG"};
+  FakeSd sd = {files, 3};
+  photo::Show s;
+  s.attachStorage(pool3, sizeof(pool3), offs3, 64);
+  checkInt(s.scan(sd, 0), 2, "scan() cataloga so as fotos");
+  check(strcmp(sd.lastMode, "r") == 0, "abre a pasta com modo explicito \"r\" (FS::open do pico exige)");
+  check(strcmp(s.rawName(), "A.JPG") == 0, "e ordena sem diferenciar caixa");
+  static uint8_t buf[4096];
+  s.attachBuffer(buf, sizeof(buf));
+  s.load(sd, 0); // sem JPEGDEC no desktop o measure() recusa; o que importa e compilar e ler
+  check(strcmp(sd.lastMode, "r") == 0 && sd.opens == 2, "load() abre o arquivo com \"r\"");
+}
+
 int main(int, char **) {
   printf("probe_photo_show — include/PhotoShow.h\n");
   testCatalog();
@@ -339,6 +410,7 @@ int main(int, char **) {
   testSupport();
   testNavigation();
   testDeadline();
+  testCard();
   testPaint();
   printf("\n%s (%d falha%s)\n", failures ? "FALHOU" : "TUDO CERTO", failures,
          failures == 1 ? "" : "s");

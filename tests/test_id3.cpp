@@ -1,4 +1,5 @@
 #include "Id3.h"
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <iostream>

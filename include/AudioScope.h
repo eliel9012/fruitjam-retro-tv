@@ -207,14 +207,14 @@
 //     6 do AGENTS.md e justamente estado herdado da visita anterior. Ao entrar
 //     na tela, chame `reset()`.
 //
-// Dependencias: SafeArea.h, VcrFont.h (que traz M5GFX) e UiLogic.h. Nada de
+// Dependencias: SafeArea.h, VcrFont.h (que traz a LovyanGFX) e UiLogic.h. Nada de
 // Arduino, FreeRTOS, SD ou I2S: este header NAO toca no barramento de audio,
 // so recebe PCM de quem e dono dele.
 // ============================================================================
 
 #include "SafeArea.h"
 #include "UiLogic.h" // timeReached(): millis() da a volta em ~49 dias
-#include "VcrFont.h" // traz <M5GFX.h> e a fonte grossa 12x16
+#include "VcrFont.h" // traz fj/Gfx.h (LovyanGFX) e a fonte grossa 12x16
 
 #include <atomic>
 #include <stddef.h>

@@ -393,6 +393,19 @@ static void testDimESaver() {
   checkEq((burnin::dim565(branco) >> 5) & 0x3F, 23, "G do branco vai a 23/63");
   checkEq(burnin::dim565(branco) & 0x1F, 11, "B do branco vai a 11/31");
   check(burnin::dim565(acento) != 0x07FF, "o acento escurecido nao vira ciano saturado");
+
+  // dimFrame(): o buffer esta na ordem do LGFX_Sprite (bytes trocados). O
+  // resultado, desfeita a troca, tem de ser exatamente o dim565 da cor.
+  {
+    auto swap = [](uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); };
+    uint16_t quadro[4] = {swap(branco), 0x0000, swap(acento), swap(0xF800)};
+    burnin::dimFrame(quadro, 4);
+    checkEq(swap(quadro[0]), burnin::dim565(branco), "dimFrame: branco cru trocado = dim565");
+    checkEq(quadro[1], 0x0000, "dimFrame: preto continua preto");
+    checkEq(swap(quadro[2]), burnin::dim565(acento), "dimFrame: acento sem misturar canais");
+    checkEq(swap(quadro[3]), burnin::dim565(0xF800), "dimFrame: vermelho puro continua so vermelho");
+    burnin::dimFrame(nullptr, 4); // nao pode cair
+  }
   // Nenhuma cor pode virar ciano saturado (dot crawl do NTSC).
   bool ciano = false;
   for (uint32_t c = 0; c <= 0xFFFF; ++c)
@@ -442,8 +455,6 @@ static void testDimESaver() {
               burnin::SAVER_W * burnin::SAVER_H, burnin::SAVER_W * burnin::SAVER_H,
               (unsigned)burnin::SAVER_STEP_MS);
 
-  checkEq(m.outputLevel(), burnin::OUT_LEVEL_NORMAL,
-          "outputLevel fica no normal (USE_OUTPUT_LEVEL_DIM desligado)");
 }
 
 // ---------------------------------------------------------------------------

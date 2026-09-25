@@ -23,8 +23,8 @@
 //  include/ChannelMode.h, um `touch sim/probes/channel_mode.cpp` antes do make.
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,7 +34,7 @@
 #include "SafeArea.h"
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 static int failures = 0;
 
@@ -325,7 +325,7 @@ static void testSleepTimer() {
 
 static void savePng(const char *name) {
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, crt::W, crt::H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, crt::W, crt::H);
   if (!png) {
     printf("  falha ao gerar %s\n", name);
     ++failures;
@@ -341,14 +341,14 @@ static void savePng(const char *name) {
 }
 
 // "Conteudo" e todo pixel que nao ficou da cor de fundo; nenhum pode estar fora
-// da caixa segura. A referencia vem do framebuffer, nao do literal RGB565: o
-// painel esta em RGB332 e a cor volta quantizada do readPixel.
+// da caixa segura. A referencia vem do framebuffer, nao do literal RGB565, para
+// o teste valer em qualquer profundidade (era RGB332 no Core2).
 static void checkSafeArea(const char *what) {
-  const uint16_t bg = rca.readPixel(0, 0);
+  const uint16_t bg = tv.readPixel(0, 0);
   int minX = crt::W, minY = crt::H, maxX = -1, maxY = -1, outside = 0;
   for (int y = 0; y < crt::H; ++y)
     for (int x = 0; x < crt::W; ++x) {
-      if (rca.readPixel(x, y) == bg)
+      if (tv.readPixel(x, y) == bg)
         continue;
       if (x < minX)
         minX = x;
@@ -388,14 +388,14 @@ static void testDrawing() {
 
   // Titulo curto, no meio da vinheta.
   now += 1500;
-  rca.fillScreen(TFT_BLACK);
-  ch.drawBumper(&rca, 0, 0, 0, now);
+  tv.fillScreen(TFT_BLACK);
+  ch.drawBumper(&tv, 0, 0, 0, now);
   checkSafeArea("vinheta 50%");
   savePng("probe_channel_bumper_50.png");
 
   // Quase no fim: a barra so cresce, entao repintar nao apaga nada.
   now += 1200;
-  ch.drawBumper(&rca, 0, 0, 0, now);
+  ch.drawBumper(&tv, 0, 0, 0, now);
   checkSafeArea("vinheta 90% (repinte)");
   savePng("probe_channel_bumper_90.png");
 
@@ -407,31 +407,31 @@ static void testDrawing() {
   uint32_t t = 900;
   longCh.started(0, t);
   longCh.finished(t);
-  rca.fillScreen(TFT_BLACK);
-  longCh.drawBumper(&rca, 0, 0, "SESSAO DA TARDE COM UM TITULO ENORME", t + 500);
+  tv.fillScreen(TFT_BLACK);
+  longCh.drawBumper(&tv, 0, 0, "SESSAO DA TARDE COM UM TITULO ENORME", t + 500);
   checkSafeArea("vinheta titulo longo");
   savePng("probe_channel_bumper_longo.png");
 
   // Titulo acentuado em UTF-8 cru (como vem do cartao). Tem de sair EXATAMENTE
   // igual ao equivalente ja sem acento: se a normalizacao nao acontecesse, cada
   // letra acentuada seriam dois bytes sem glifo — dois buracos, nao um.
-  rca.fillScreen(TFT_BLACK);
+  tv.fillScreen(TFT_BLACK);
   longCh.invalidateBumperPaint();
-  longCh.drawBumper(&rca, 0, 0, "CINE MARAVILHA \xC3\x87\xC3\x83O", t + 500); // "CINE MARAVILHA CAO"
+  longCh.drawBumper(&tv, 0, 0, "CINE MARAVILHA \xC3\x87\xC3\x83O", t + 500); // "CINE MARAVILHA CAO"
   checkSafeArea("vinheta titulo acentuado");
   savePng("probe_channel_bumper_acento.png");
   uint32_t accented = 0;
   for (int y = 0; y < crt::H; ++y)
     for (int x = 0; x < crt::W; ++x)
-      accented = accented * 31u + rca.readPixel(x, y);
+      accented = accented * 31u + tv.readPixel(x, y);
 
-  rca.fillScreen(TFT_BLACK);
+  tv.fillScreen(TFT_BLACK);
   longCh.invalidateBumperPaint();
-  longCh.drawBumper(&rca, 0, 0, "CINE MARAVILHA CAO", t + 500);
+  longCh.drawBumper(&tv, 0, 0, "CINE MARAVILHA CAO", t + 500);
   uint32_t plain = 0;
   for (int y = 0; y < crt::H; ++y)
     for (int x = 0; x < crt::W; ++x)
-      plain = plain * 31u + rca.readPixel(x, y);
+      plain = plain * 31u + tv.readPixel(x, y);
   check(accented == plain, "titulo acentuado sai identico ao sem acento (normalizado)");
 
   // Titulo derivado do caminho: o header tira o ultimo segmento e normaliza.
@@ -445,25 +445,26 @@ static void testDrawing() {
   // Indicador SLEEP sozinho (o caso real e por cima do filme, sem tarja).
   sleeptimer::SleepTimer st;
   st.setMinutes(30, 1000);
-  rca.fillScreen(TFT_BLACK);
-  st.drawBadge(&rca, 0, 0, 1000);
+  tv.fillScreen(TFT_BLACK);
+  st.drawBadge(&tv, 0, 0, 1000);
   checkSafeArea("indicador SLEEP 30");
   savePng("probe_channel_sleep_badge.png");
 
   st.setMinutes(120, 1000);
-  rca.fillScreen(TFT_BLACK);
-  st.drawBadge(&rca, 0, 0, 1000);
+  tv.fillScreen(TFT_BLACK);
+  st.drawBadge(&tv, 0, 0, 1000);
   checkSafeArea("indicador SLEEP 120");
 }
 
 int main(int, char **) {
   panel.setScaling(2, 2);
-  rca.setPanel(&panel);
-  if (!rca.init()) {
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init()) {
     printf("falha ao iniciar o painel SDL\n");
     return 1;
   }
-  rca.setColorDepth(8); // RGB332, igual ao firmware na saida composta
+  tv.setColorDepth(16); // RGB565, igual ao canvas `tv` do Fruit Jam
 
   printf("tamanho do Channel: %zu bytes   SleepTimer: %zu bytes\n", sizeof(channel::Channel),
          sizeof(sleeptimer::SleepTimer));

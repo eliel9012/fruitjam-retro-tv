@@ -26,7 +26,7 @@
 // virariam dois espacos. Por isso tudo passa por ascii::normalizeUpper antes
 // de chegar a fonte: "Sao Joao" sai "SAO JOAO", nunca "S O JO O".
 //
-// Dependencias: M5GFX (incluido pela VcrFont), SafeArea.h, Ascii.h e
+// Dependencias: LovyanGFX (fj/Gfx.h, incluido pela VcrFont), SafeArea.h, Ascii.h e
 // VcrFont.h. Nada de Arduino, WiFi, SD ou FreeRTOS: o mesmo header compila no
 // firmware e no simulador SDL de desktop.
 //

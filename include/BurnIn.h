@@ -1,17 +1,23 @@
 #pragma once
 // ============================================================================
-//  BurnIn — gerente de ociosidade e mitigacao de queima de fosforo (burn-in)
-//  da saida composta (RCA) do M5 RETRO TV.
+//  BurnIn — gerente de ociosidade e mitigacao de marcacao de tela (burn-in)
+//  da saida de video do Retro TV.
 //
 //  ---------------------------------------------------------------------------
 //  Por que isto existe
 //  ---------------------------------------------------------------------------
-//  Este aparelho nao desenha numa LCD que voce apaga e volta ao normal: ele
-//  aciona um TUBO. O menu inicial, o relogio, a tela de informacoes e a
-//  previsao ficam paradas por horas, sempre com os MESMOS pixels acesos nas
-//  MESMAS posicoes. O fosforo envelhece onde e excitado; o que sobra e uma
-//  marca permanente do menu por cima de tudo que a TV mostrar depois. Nao da
-//  para desfazer. O firmware ate hoje nao fazia nada a respeito.
+//  No Core2 original a saida era composta, para um TUBO. No Fruit Jam e DVI,
+//  para o que estiver do outro lado do cabo: monitor LCD, TV de plasma, OLED,
+//  ou um tubo atras de um conversor HDMI->RCA. Nenhum deles gosta de imagem
+//  parada: o fosforo do tubo e o do plasma envelhecem onde sao excitados, o
+//  OLED perde brilho por pixel, e ate LCD pega retencao temporaria. O menu
+//  inicial, o relogio, a tela de informacoes e a previsao ficam paradas por
+//  horas, sempre com os MESMOS pixels acesos nas MESMAS posicoes.
+//
+//  Nao existe mais backlight nenhum para apagar (o Fruit Jam nao tem LCD
+//  proprio, e o setBacklight() do Core2 saiu no port), e o DVI nao carrega
+//  controle de brilho do monitor. Toda a protecao aqui e sobre o CONTEUDO do
+//  canvas `tv`: deslocar, escurecer, apagar.
 //
 //  A mitigacao classica de estudio/TV e escalonada, do mais discreto para o
 //  mais agressivo:
@@ -68,55 +74,38 @@
 //  mire em INNER_*.
 //
 //  ---------------------------------------------------------------------------
-//  3. O que existe DE VERDADE para escurecer a saida composta
+//  3. Como escurecer, ja que nao ha brilho para baixar
 //  ---------------------------------------------------------------------------
-//  Investigado no M5GFX 0.2.29 deste repositorio. O resultado importa porque a
-//  resposta ingenua ("usa setBrightness") esta errada:
+//  No Core2 havia duas saidas de fuga, ambas extintas no port: o backlight do
+//  LCD (M5.Display.setBrightness, que nunca tocou no composto) e o nivel de
+//  saida do Panel_CVBS (arriscado: encolhia o sincronismo junto). O DVI nao
+//  tem nenhuma das duas — o TMDS so leva pixels, e o monitor decide o brilho.
 //
-//  a) M5.Display.setBrightness() -> AXP192/Light_PWM. Mexe SO no backlight da
-//     LCD do Core2. O caminho CVBS nao passa por ali. Em src/main.cpp o
-//     setBacklight() ja faz isso pelo DCDC3. Irrelevante para o tubo.
+//  Sobra escurecer os proprios pixels, de dois jeitos:
 //
-//  b) lgfx::Panel_CVBS::setOutputLevel(uint8_t) EXISTE e e controle de
-//     luminancia de verdade (Panel_CVBS.inl:2380). Ele chama
-//     updateSignalLevel(), que recalcula WHITE/BLACK/BLANKING a partir de
-//     `48 * output_level` e reconstroi a paleta NO LUGAR. Nao realoca nada.
-//     O setup() atual usa rca.setOutputBoost(true), que e output_level = 200.
+//  a) dimFrame(): passa uma vez pelo framebuffer inteiro e escurece cada pixel
+//     no lugar (3/8 do valor). E o jeito simples: o chamador redesenha a tela
+//     normal e chama dimFrame() em seguida, sem mexer em pintor nenhum. Custa
+//     76.800 pixels lidos e escritos na SRAM, uma vez por repintura — nao
+//     medido no Fruit Jam, mas e da ordem de um fillScreen. Armadilha: o que
+//     for desenhado DEPOIS por cima (o relogio do menu, a cada segundo) sai no
+//     brilho normal. Quem redesenha pedaco de tela em STAGE_DIM tem de
+//     escurecer tambem, ou usar shade() nas cores.
 //
-//     DUAS armadilhas:
+//  b) shade()/dim565() nas cores de cada pintor. Exato e sem passada extra,
+//     mas exige tocar em cada tela. Fica disponivel para os redesenhos
+//     parciais do item (a).
 //
-//     b1) NAO chame M5ModuleRCA::setOutputLevel(). A versao do MODULO
-//         (M5ModuleRCA.h:232) passa por Panel_CVBS::config_detail(), que faz
-//         deinit() + init(false) — ou seja, libera e REALOCA o framebuffer de
-//         76.800 B e reinicia o DMA do I2S0. Com 28 a 38 KB de heap livre isso
-//         e um pedido de falha de alocacao, alem de apagar a imagem. O caminho
-//         barato e o do PAINEL:
-//           static_cast<lgfx::Panel_CVBS *>(rca.panel())->setOutputLevel(n);
-//
-//     b2) internal.SYNC_LEVEL e constante 0 (Panel_CVBS.inl:215) enquanto
-//         BLANKING_LEVEL escala junto com output_level. Logo a amplitude do
-//         SINCRONISMO encolhe na mesma proporcao do video. Cair muito abaixo
-//         do nivel configurado arrisca o separador de sincronismo da TV perder
-//         o engate: imagem rolando, nao imagem escura. Por isso
-//         OUT_LEVEL_DIM = 150 (-25% de 200) e um teto conservador, e por isso
-//         USE_OUTPUT_LEVEL_DIM nasce DESLIGADO.
-//
-//  c) Panel_CVBS::setChromaLevel(uint8_t) tambem existe, mesmo caminho barato.
-//     0 = preto e branco. Util e seguro (nao toca no sincronismo), mas nao
-//     escurece: so tira cor.
-//
-//  VEREDITO: existe controle de brilho real para o composto, mas ele e
-//  arriscado (b2) e nao e o caminho padrao aqui. O escurecimento deste modulo
-//  e REDESENHO EM CORES MAIS ESCURAS (dim565), que sempre funciona, custa um
-//  repinte e nao pode derrubar o sincronismo. O ajuste por output_level fica
-//  disponivel como constante documentada, para quem quiser testar no aparelho.
+//  O protetor de tela (STAGE_BLANK) e o mesmo de antes: preto e um bloco
+//  andando, desenhado pelo chamador no `tv`.
 //
 //  ---------------------------------------------------------------------------
 //  4. Custo
 //  ---------------------------------------------------------------------------
 //  sizeof(burnin::Manager) e da ordem de 40 bytes. Nenhuma alocacao, nenhum
 //  LGFX_Sprite (um sprite de 5 KB ja causou regressao de memoria aqui), nenhum
-//  float, nenhuma dependencia de M5GFX — so <stdint.h>, SafeArea.h e UiLogic.h.
+//  float, nenhuma dependencia grafica — so <stdint.h>, <stddef.h>, SafeArea.h
+//  e UiLogic.h. dimFrame() recebe o buffer cru, nao o canvas.
 //  O tick() e um punhado de comparacoes; o protetor de tela repinta dois
 //  retangulos de SAVER_W x SAVER_H a cada SAVER_STEP_MS.
 //
@@ -129,8 +118,9 @@
 //  R=0, G=189, B=247. dim565() recebe e devolve uint16_t de proposito —
 //  mantenha o uint16_t ate a chamada de desenho.
 //
-//  E: nunca ciano saturado (TFT_CYAN / 0x07FF) no composto — o dot crawl da
-//  crominancia do NTSC faz aquilo cintilar. O acento seguro do projeto e
+//  E: nunca ciano saturado (TFT_CYAN / 0x07FF) — no composto o dot crawl da
+//  crominancia do NTSC faz aquilo cintilar, e o mesmo firmware ainda pode
+//  chegar a um tubo por um conversor HDMI->RCA. O acento seguro do projeto e
 //  0x96BC, que e o SAVER_COLOR daqui.
 //
 //  ---------------------------------------------------------------------------
@@ -138,17 +128,22 @@
 //  ---------------------------------------------------------------------------
 //    static burnin::Manager idle;
 //
-//    // toda acao do usuario (handleNavigation, handleTouch, comando do diag)
+//    // toda acao do usuario (handleNavigation, comando do diag)
 //    idle.notifyActivity(millis());
 //
 //    // uma vez por loop()
-//    switch (idle.tick(millis())) { ... }
-//    if (idle.takeRepaint()) redesenhaTelaAtual();   // usa idle.ox()/idle.oy()
+//    const burnin::Stage st = idle.tick(millis());
+//    if (idle.takeRepaint()) {
+//      redesenhaTelaAtual();                       // usa idle.ox()/idle.oy()
+//      if (st == burnin::STAGE_DIM)                // escurece o que acabou de sair
+//        burnin::dimFrame((uint16_t *)tv.getBuffer(), (size_t)tv.width() * tv.height());
+//    }
 //
 //    // nos pintores ja existentes, somando a deriva ao que ja vinha:
-//    paintCurrent(&rca, idle.ox(), idle.oy(), nullptr);
+//    paintCurrent(&tv, idle.ox(), idle.oy(), nullptr);
 // ============================================================================
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "SafeArea.h"
@@ -275,13 +270,6 @@ inline int driftY(uint32_t step) {
 // 3/8 derruba a energia do fosforo para ~37% sem sumir com a leitura.
 static const uint8_t DIM_NUM = 3, DIM_DEN = 8;
 
-// Ajuste opcional do nivel de saida do CVBS. Ver secao 3 do cabecalho: so pelo
-// PAINEL (Panel_CVBS::setOutputLevel), nunca pelo M5ModuleRCA, e nao desca de
-// OUT_LEVEL_DIM sob risco de a TV perder o sincronismo.
-static const uint8_t OUT_LEVEL_NORMAL = 200; // = rca.setOutputBoost(true)
-static const uint8_t OUT_LEVEL_DIM = 150;    // -25%, teto conservador
-static const bool USE_OUTPUT_LEVEL_DIM = false; // nasce desligado: nao testado na TV
-
 // RGB565 escurecido. RECEBE E DEVOLVE uint16_t: um uint32_t aqui seria lido
 // como RGB888 na hora de desenhar (colortype.hpp:861-866).
 inline uint16_t dim565(uint16_t c, uint8_t num, uint8_t den) {
@@ -290,6 +278,26 @@ inline uint16_t dim565(uint16_t c, uint8_t num, uint8_t den) {
                     ((uint16_t)(((c & 0x1F) * num) / den)));
 }
 inline uint16_t dim565(uint16_t c) { return dim565(c, DIM_NUM, DIM_DEN); }
+
+// Escurece no lugar um quadro inteiro, do jeito que o LGFX_Sprite de 16 bits
+// guarda: RGB565 com os BYTES TROCADOS (o canvas `tv` do Fruit Jam e um sprite
+// desses em cima do framebuffer do DVI). Por isso desfaz a troca, escurece e
+// refaz — escurecer o valor cru misturaria o verde com o vermelho. Ver secao 3
+// do cabecalho para quando chamar.
+//
+// Idempotente? NAO: chamar duas vezes escurece duas vezes (3/8 de 3/8). Chame
+// uma vez por repintura completa.
+inline void dimFrame(uint16_t *px, size_t count, uint8_t num = DIM_NUM, uint8_t den = DIM_DEN) {
+  if (!px || !den)
+    return;
+  for (size_t i = 0; i < count; ++i) {
+    const uint16_t raw = px[i];
+    if (!raw)
+      continue; // preto continua preto; a maior parte do fundo sai de graca
+    const uint16_t c = dim565((uint16_t)((raw << 8) | (raw >> 8)), num, den);
+    px[i] = (uint16_t)((c << 8) | (c >> 8));
+  }
+}
 
 // Cor que uma tela deve usar no estagio `s`. No STAGE_BLANK tudo e preto: quem
 // chegou ali nao desenha interface nenhuma, so o protetor.
@@ -336,7 +344,7 @@ public:
     vy_ = SAVER_VY;
   }
 
-  // Toda acao do usuario passa por aqui: botao, toque, comando do diag.
+  // Toda acao do usuario passa por aqui: botao, comando do diag, controle web.
   // Volta ao estagio ativo e devolve true se a tela precisa ser repintada.
   //
   // O deslocamento e o contador de passos NAO sao zerados, de proposito, por
@@ -407,13 +415,6 @@ public:
   int saverY() const { return sy_; }
   int saverPrevX() const { return px_; }
   int saverPrevY() const { return py_; }
-
-  // Nivel de saida do CVBS sugerido para o estagio corrente. Ver secao 3: so
-  // vale alguma coisa se o chamador optar por USE_OUTPUT_LEVEL_DIM e aplicar
-  // pelo Panel_CVBS, nunca pelo M5ModuleRCA.
-  uint8_t outputLevel() const {
-    return (USE_OUTPUT_LEVEL_DIM && stage_ >= STAGE_DIM) ? OUT_LEVEL_DIM : OUT_LEVEL_NORMAL;
-  }
 
   // Cor ja ajustada ao estagio, atalho para os pintores.
   uint16_t shade(uint16_t c) const { return burnin::shade(stage_, c); }

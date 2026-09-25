@@ -1,12 +1,20 @@
 #pragma once
 // ============================================================================
-// Geometria da saída composta (RCA) do M5 RETRO TV.
+// Geometria do quadro de vídeo do Retro TV.
 //
-// O quadro continua sendo 320x240 esticado sobre toda a área ativa do NTSC, que
-// a TV mostra em 4:3. O que estas constantes definem é onde o conteúdo pode ser
-// desenhado dentro desse quadro: um tubo esconde cerca de 7% de cada borda por
-// overscan, então texto, réguas e faixas ficam na "área segura" e só o fundo
+// O quadro lógico é 320x240. No Core2 original ele saía esticado sobre toda a
+// área ativa do NTSC (composto); no Fruit Jam sai dobrado para 640x480 no DVI.
+// O que estas constantes definem é onde o conteúdo pode ser desenhado dentro
+// desse quadro: texto, réguas e faixas ficam na "área segura" e só o fundo
 // sangra até o limite do raster (sem tarjas pretas).
+//
+// Por que a caixa segura continua a mesma no DVI: um monitor de computador
+// mostra os 640x480 inteiros, sem overscan, e ali a margem é só respiro. Mas
+// muita TV pela HDMI aplica overscan por padrão (o mesmo ~5-7% de borda do
+// tubo, herdado da transmissão), e um conversor HDMI->RCA leva o quadro de
+// volta a um tubo de verdade. Conteúdo dentro da caixa aparece nos três casos;
+// encolher a margem só ganharia pixels no monitor e cortaria texto na TV.
+// E como o BurnIn.h tira dessa margem a folga da deriva, mexer aqui mexe lá.
 //
 // Compartilhado entre o firmware (src/main.cpp) e o simulador de telas (sim/),
 // para que os dois concordem sobre a mesma geometria.
