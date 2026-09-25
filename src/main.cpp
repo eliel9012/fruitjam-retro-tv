@@ -17,6 +17,8 @@
 #include "fj/Storage.h"
 
 #include "SafeArea.h"
+#include "Config.h"
+#include "BootSplash.h"
 #include "RtcClock.h"
 #include "ChannelMode.h"
 #include "PhotoShow.h"
@@ -397,6 +399,27 @@ void dualText(const String &line1, const String &line2 = "") {
   tv.setTextColor(RCA_ACCENT, TFT_NAVY);
   tv.setTextSize(1);
   tv.drawString(l2, 160, 130);
+}
+// Etapa do boot na abertura (BootSplash.h): a primeira chamada pinta a tela
+// inteira com o nome do dono; as seguintes trocam só a linha de status, sem
+// piscar. Erro de boot continua saindo por setError()/dualText().
+static uint32_t bootSplashSince = 0;
+static void bootStep(const char *status) {
+  static bool painted = false;
+  if (!painted) {
+    bootsplash::draw(&tv, cfg::OWNER, PTBR::APP, status, cfg::VERSION_SHORT);
+    bootSplashSince = millis();
+    painted = true;
+  } else
+    bootsplash::drawStatus(&tv, status);
+}
+
+// Segura a abertura por um mínimo de tempo: com cartão rápido e sem Wi-Fi o boot
+// acaba em menos de um segundo, e o nome piscaria sem dar para ler.
+static void bootSplashHold() {
+  constexpr uint32_t MIN_MS = 2000;
+  while (millis() - bootSplashSince < MIN_MS)
+    delay(20);
 }
 void setError(const String &message) {
   if (playing || wavFile)
@@ -4320,12 +4343,12 @@ static void appSetup() {
   input.begin();
   input.setAutoRepeat(true);
   jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
-  dualText(PTBR::APP, PTBR::INICIANDO);
+  bootStep(PTBR::INICIANDO);
   if (!jpegBuffer) {
     setError(PTBR::MEMORIA_INSUFICIENTE);
     return;
   }
-  dualText(PTBR::APP, PTBR::VERIFICANDO_SD);
+  bootStep(PTBR::VERIFICANDO_SD);
   // SDIO próprio: o cartão não divide barramento com nada, ao contrário do
   // Core2, onde o VSPI era do LCD também.
   if (!storage::begin()) {
@@ -4347,10 +4370,10 @@ static void appSetup() {
   libraryProgramCount();
   // Rádio antes do DAC (ver acima). Falhar aqui não impede o uso offline: o
   // NetworkManager só vai continuar sem conectar.
-  dualText(PTBR::APP, PTBR::CONECTANDO_WIFI);
+  bootStep(PTBR::CONECTANDO_WIFI);
   if (!net::beginRadio())
     Serial.println("[M5RETRO] ERRO: ESP32-C6 nao respondeu; seguindo sem rede");
-  dualText(PTBR::APP, PTBR::INICIANDO_AUDIO);
+  bootStep(PTBR::INICIANDO_AUDIO);
   // O volume do usuário é aplicado em software (playback::scalePcm), como no
   // original. O volume digital do DAC fica em 0 dB: somar os dois atenuaria em
   // dobro.
@@ -4359,7 +4382,7 @@ static void appSetup() {
     setError(PTBR::FALHA_AUDIO);
     return;
   }
-  dualText(PTBR::APP, PTBR::CARREGANDO_CONFIG);
+  bootStep(PTBR::CARREGANDO_CONFIG);
   if (!loadConfiguration()) {
     apiStatus = PTBR::CONFIG_REDE_AUSENTE;
     dualText(PTBR::CONFIG_REDE_AUSENTE, PTBR::EDITE_SECRETS);
@@ -4378,7 +4401,8 @@ static void appSetup() {
     setError(PTBR::MEMORIA_INSUFICIENTE);
     return;
   }
-  dualText(PTBR::APP, PTBR::SISTEMA_PRONTO);
+  bootStep(PTBR::SISTEMA_PRONTO);
+  bootSplashHold();
   // Offline playback must not be hidden behind network setup. The portal stays
   // available from CONFIGURACOES when the owner wants to add Wi-Fi later.
   bootReady = true;
