@@ -9,8 +9,8 @@
 //    make -C sim probes && ./sim/build/probe_weather_icons
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cmath>
 #include <cstdio>
@@ -22,7 +22,7 @@
 using namespace crt;
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 // Todo o catalogo, na ordem em que o olho deve compara-los: as familias que se
 // parecem ficam vizinhas, que e onde a ambiguidade aparece.
@@ -53,7 +53,7 @@ static uint16_t weatherBackground(uint32_t ms) {
 // diretorios de saida antes de desistir.
 static void savePng(const char *name) {
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, W, H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, W, H);
   if (!png) {
     fprintf(stderr, "createPng falhou para %s\n", name);
     return;
@@ -76,28 +76,29 @@ static void savePng(const char *name) {
 // Grade de `cols` x `rows` celulas com rotulo sob cada icone.
 static void grid(uint32_t ms, int size, int cols, int rows, int first, const char *name) {
   const uint16_t bg = weatherBackground(ms);
-  rca.fillScreen(bg);
-  rca.setFont(&fonts::Font0);
-  rca.setTextSize(1);
-  rca.setTextDatum(top_center);
-  rca.setTextColor(TFT_WHITE, bg);
+  tv.fillScreen(bg);
+  tv.setFont(&fonts::Font0);
+  tv.setTextSize(1);
+  tv.setTextDatum(top_center);
+  tv.setTextColor(TFT_WHITE, bg);
 
   const int cw = W / cols, ch = H / rows;
   for (int i = 0; i < cols * rows && first + i < N; ++i) {
     const int cx = (i % cols) * cw + cw / 2;
     const int cy = (i / cols) * ch + ch / 2;
-    wx::drawWeatherIcon(&rca, cx, cy - 6, size, ICONS[first + i]);
-    rca.drawString(SHORT[first + i], cx, cy + ch / 2 - 10);
+    wx::drawWeatherIcon(&tv, cx, cy - 6, size, ICONS[first + i]);
+    tv.drawString(SHORT[first + i], cx, cy + ch / 2 - 10);
   }
   savePng(name);
 }
 
 int main(int, char **) {
   panel.setScaling(3, 3);
-  rca.setPanel(&panel);
-  if (!rca.init())
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init())
     return 1;
-  rca.setColorDepth(8); // RGB332, igual ao firmware na saida composta
+  tv.setColorDepth(16); // RGB565, igual ao canvas `tv` do Fruit Jam
 
   // 48 px: tamanho de lista/rodape. Tres fases do fundo para conferir se o
   // contorno preto some quando o azul escurece.

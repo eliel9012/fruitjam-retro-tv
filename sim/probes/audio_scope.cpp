@@ -23,8 +23,8 @@
 //    make -C sim probes && cd sim && ./build/probe_audio_scope
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cmath>
 #include <cstdio>
@@ -38,7 +38,7 @@ using namespace crt;
 namespace as = audioscope;
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 static int g_fail = 0;
 static int g_checks = 0;
@@ -138,7 +138,7 @@ static FILE *openOut(const char *name) {
 
 static void shot(const char *name) {
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, W, H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, W, H);
   if (!png) {
     fprintf(stderr, "    createPng falhou\n");
     return;
@@ -153,30 +153,31 @@ static void shot(const char *name) {
 
 // Moldura no espirito da MUSIC_NOW_PLAYING, so para o PNG ter contexto.
 static void backdrop(const char *sub) {
-  rca.fillScreen(TFT_NAVY);
-  rca.setTextDatum(top_left);
-  rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.setTextSize(2);
-  rca.drawString("MUSICA", SAFE_L, HEAD_Y);
-  rca.setTextSize(1);
-  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, as::ACCENT);
-  rca.setTextColor(TFT_YELLOW, TFT_NAVY);
-  rca.drawString("SINAL DE TESTE", SAFE_L, BODY_Y + 8);
-  rca.setTextColor(as::ACCENT, TFT_NAVY);
-  rca.drawString(sub, SAFE_L, BODY_Y + 26);
+  tv.fillScreen(TFT_NAVY);
+  tv.setTextDatum(top_left);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.setTextSize(2);
+  tv.drawString("MUSICA", SAFE_L, HEAD_Y);
+  tv.setTextSize(1);
+  tv.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, as::ACCENT);
+  tv.setTextColor(TFT_YELLOW, TFT_NAVY);
+  tv.drawString("SINAL DE TESTE", SAFE_L, BODY_Y + 8);
+  tv.setTextColor(as::ACCENT, TFT_NAVY);
+  tv.drawString(sub, SAFE_L, BODY_Y + 26);
   // Area segura, so no PNG, para conferir que o painel nao escapa.
-  rca.drawRect(SAFE_L, SAFE_T, SAFE_W, SAFE_H, TFT_DARKGREY);
+  tv.drawRect(SAFE_L, SAFE_T, SAFE_W, SAFE_H, TFT_DARKGREY);
 }
 
 // ===========================================================================
 int main(int, char **) {
   panel.setScaling(2, 2);
-  rca.setPanel(&panel);
-  if (!rca.init()) {
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init()) {
     fprintf(stderr, "falha ao inicializar o painel SDL\n");
     return 1;
   }
-  rca.setColorDepth(8); // RGB332, igual ao firmware na saida composta
+  tv.setColorDepth(16); // RGB565, igual ao canvas `tv` do Fruit Jam
 
   // -----------------------------------------------------------------------
   printf("\n1. ORCAMENTO DE MEMORIA (SRAM)\n");
@@ -531,11 +532,11 @@ int main(int, char **) {
     as::reset(sc);
     sc.mode = as::BARS;
     uint32_t t = 1000;
-    as::tick(&rca, 0, 0, sc, tap, t); // primeiro: fundo + analise
+    as::tick(&tv, 0, 0, sc, tap, t); // primeiro: fundo + analise
     const uint32_t f1 = sc.frames;
     for (int i = 0; i < 5; ++i) {
       t += as::UPDATE_MS;
-      as::tick(&rca, 0, 0, sc, tap, t); // nada novo publicado
+      as::tick(&tv, 0, 0, sc, tap, t); // nada novo publicado
     }
     printf("   quadros analisados=%u, prazos sem dado novo=%u\n", (unsigned)sc.frames,
            (unsigned)sc.starved);
@@ -545,7 +546,7 @@ int main(int, char **) {
     // Envelhecimento: passado STALE_MS o mostrador desce sozinho ate zero.
     for (int i = 0; i < 40; ++i) {
       t += as::UPDATE_MS;
-      as::tick(&rca, 0, 0, sc, tap, t);
+      as::tick(&tv, 0, 0, sc, tap, t);
     }
     int resting = 0;
     for (int b = 0; b < as::BANDS; ++b)
@@ -555,10 +556,10 @@ int main(int, char **) {
     // E o prazo respeita o wrap de millis(): now perto de 2^32.
     as::reset(sc);
     uint32_t big = 0xFFFFFF00u;
-    as::tick(&rca, 0, 0, sc, tap, big);
+    as::tick(&tv, 0, 0, sc, tap, big);
     const uint32_t before = sc.starved + sc.frames;
     big += as::UPDATE_MS; // passa de 2^32 e volta a zero
-    as::tick(&rca, 0, 0, sc, tap, big);
+    as::tick(&tv, 0, 0, sc, tap, big);
     check(sc.starved + sc.frames == before + 1, "timeReached() atravessa o wrap de millis() sem travar");
   }
 
@@ -579,7 +580,7 @@ int main(int, char **) {
       stereoTone(st, as::N, 1000.0, 1000.0, 30000.0);
       tap.publish(st, 2 * as::N, 2);
       t += as::UPDATE_MS;
-      as::tick(&rca, 0, 0, sc, tap, t); // primeiro quadro: fundo inteiro
+      as::tick(&tv, 0, 0, sc, tap, t); // primeiro quadro: fundo inteiro
       const uint32_t firstPx = sc.touched;
 
       // Regime permanente com o MESMO sinal: nada deveria mudar.
@@ -587,14 +588,14 @@ int main(int, char **) {
       for (int i = 0; i < 8; ++i) {
         tap.publish(st, 2 * as::N, 2);
         t += as::UPDATE_MS;
-        as::tick(&rca, 0, 0, sc, tap, t);
+        as::tick(&tv, 0, 0, sc, tap, t);
         steady += sc.touched;
       }
       // Sinal novo: mede o custo de uma mudanca grande.
       stereoTone(st, as::N, 4000.0, 250.0, 30000.0);
       tap.publish(st, 2 * as::N, 2);
       t += as::UPDATE_MS;
-      as::tick(&rca, 0, 0, sc, tap, t);
+      as::tick(&tv, 0, 0, sc, tap, t);
       const uint32_t changePx = sc.touched;
       const as::Rect d = as::dirtyRect(sc);
 
@@ -630,8 +631,8 @@ int main(int, char **) {
     stereoTone(st, as::N, 500.0, 500.0, 30000.0);
     tap.publish(st, 2 * as::N, 2);
     t += as::UPDATE_MS;
-    as::tick(&rca, 0, 0, sc, tap, t);
-    as::drawModeLabel(&rca, 0, 0, sc);
+    as::tick(&tv, 0, 0, sc, tap, t);
+    as::drawModeLabel(&tv, 0, 0, sc);
     shot("scope");
 
     // --- espectro: varios tons, para as 12 barras ficarem em alturas diferentes ---
@@ -653,20 +654,20 @@ int main(int, char **) {
     for (int i = 0; i < 4; ++i) {
       tap.publish(st, 2 * as::N, 2);
       t += as::UPDATE_MS;
-      as::tick(&rca, 0, 0, sc, tap, t);
+      as::tick(&tv, 0, 0, sc, tap, t);
     }
-    as::drawModeLabel(&rca, 0, 0, sc);
+    as::drawModeLabel(&tv, 0, 0, sc);
     shot("bars");
 
     // --- espectro em decaimento: mostra o ponto de pico separado da barra ---
     backdrop("MODO: ESPECTRO  (PICOS RETIDOS)");
-    as::drawStatic(&rca, 0, 0, sc);
+    as::drawStatic(&tv, 0, 0, sc);
     for (int b = 0; b < as::BANDS; ++b) {
       sc.level[b] = (uint8_t)(6 + b * 2);
       sc.peak[b] = (uint8_t)(sc.level[b] + 12 > as::BAR_MAX ? as::BAR_MAX : sc.level[b] + 12);
     }
-    as::detail::drawBars(&rca, 0, 0, sc);
-    as::drawModeLabel(&rca, 0, 0, sc);
+    as::detail::drawBars(&tv, 0, 0, sc);
+    as::drawModeLabel(&tv, 0, 0, sc);
     shot("bars_peak");
 
     // --- VU ---
@@ -681,9 +682,9 @@ int main(int, char **) {
     for (int i = 0; i < 3; ++i) {
       tap.publish(st, 2 * as::N, 2);
       t += as::UPDATE_MS;
-      as::tick(&rca, 0, 0, sc, tap, t);
+      as::tick(&tv, 0, 0, sc, tap, t);
     }
-    as::drawModeLabel(&rca, 0, 0, sc);
+    as::drawModeLabel(&tv, 0, 0, sc);
     printf("   VU: agulha L=%u px, R=%u px (de %d)\n", sc.vuL, sc.vuR, as::VU_LEN);
     check(sc.vuL > sc.vuR, "o canal mais alto tem a agulha mais longa");
     shot("vu");

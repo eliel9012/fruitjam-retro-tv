@@ -93,11 +93,14 @@
 //  ---------------------------------------------------------------------------
 //  Cor
 //  ---------------------------------------------------------------------------
-//  O buffer de MCU do JPEGDEC e SEMPRE RGB565 (o firmware pede
-//  jpeg.setPixelType(RGB565_LITTLE_ENDIAN)), independente da profundidade do
-//  painel — e por isso smearRow() pode mexer nos bits na mao. Ja o painel pode
-//  estar em RGB565 ou RGB332 (settings.color16): nada aqui depende disso,
-//  porque tudo sai por pushImage de lgfx::rgb565_t, que o LovyanGFX converte.
+//  O buffer de MCU que pushBlock() recebe TEM de ser RGB565 na ordem nativa
+//  (jpeg.setPixelType(RGB565_LITTLE_ENDIAN)) — e por isso smearRow() pode
+//  mexer nos bits na mao. No Fruit Jam o caminho rapido do video pede ao
+//  JPEGDEC RGB565_BIG_ENDIAN, que e a ordem que o LGFX_Sprite guarda (PORTING.md
+//  3.5); com o filtro VHS ligado, o decode tem de voltar a LITTLE_ENDIAN, senao
+//  o croma borra os bytes trocados e a cor sai errada sem erro nenhum. A saida
+//  e por pushImage de lgfx::rgb565_t, que a LovyanGFX converte para o que o
+//  destino guardar (no Fruit Jam o canvas `tv` e sempre RGB565).
 //
 //  ARMADILHA DE TIPO: o LovyanGFX escolhe o formato da cor pelo TIPO DO
 //  ARGUMENTO. uint16_t/int16_t/int32_t viram RGB565; uint32_t vira RGB888
@@ -121,12 +124,12 @@
 //    vhsFilter.beginFrame(millis(), (CRT_W - videoWidth) / 2,
 //                         (CRT_H - videoHeight) / 2, videoWidth, videoHeight);
 //
-//    // em jpegDraw(), no lugar do rca.pushImage():
-//    vhsFilter.pushBlock(&rca, draw->x + ox, draw->y + oy, draw->iWidth,
+//    // em jpegDraw(), no lugar do tv.pushImage():
+//    vhsFilter.pushBlock(&tv, draw->x + ox, draw->y + oy, draw->iWidth,
 //                        draw->iHeight, draw->pPixels);
 //
 //    // logo depois do jpeg.decode() bem-sucedido:
-//    vhsFilter.drawOverlay(&rca);
+//    vhsFilter.drawOverlay(&tv);
 //
 //  beginFrame() e o unico ponto que avanca o estado. redrawCurrentFrame() (o
 //  redecode do quadro pausado) NAO deve chama-lo: reaproveitando a mesma tabela
@@ -315,7 +318,7 @@ public:
 
   // ---- caminho do blit (chamado de dentro do jpegDraw) ---------------------
 
-  // Substitui o rca.pushImage() do jpegDraw. Faz o croma no proprio buffer de
+  // Substitui o tv.pushImage() do jpegDraw. Faz o croma no proprio buffer de
   // MCU (nenhum segundo passe pelo quadro) e empurra a tira em faixas de
   // deslocamento constante — linha nao deslocada nao custa chamada extra.
   // `px` e o buffer RGB565 do JPEGDEC, com passo `w`; e escrito no lugar, o que

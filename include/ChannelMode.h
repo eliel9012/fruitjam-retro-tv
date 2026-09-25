@@ -45,7 +45,7 @@
 //   que compara a diferenca com sinal. millis() da a volta em ~49 dias e
 //   `now > deadline` cru trava o timer para sempre quando isso acontece.
 //
-// Dependencias: M5GFX (vem pela VcrFont), SafeArea.h, UiLogic.h, Ascii.h.
+// Dependencias: LovyanGFX (fj/Gfx.h, vem pela VcrFont), SafeArea.h, UiLogic.h, Ascii.h.
 // Nada de Arduino, SD, WiFi ou FreeRTOS: o destino e um lgfx::LovyanGFX*, entao
 // o mesmo header serve ao painel CVBS do aparelho e ao painel SDL do simulador.
 //
@@ -55,7 +55,7 @@
 #include "Ascii.h"
 #include "SafeArea.h"
 #include "UiLogic.h" // timeReached()
-#include "VcrFont.h" // traz o M5GFX junto
+#include "VcrFont.h" // traz a LovyanGFX (fj/Gfx.h) junto
 
 #include <stddef.h>
 #include <stdint.h>

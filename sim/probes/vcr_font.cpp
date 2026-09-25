@@ -1,7 +1,7 @@
 // ============================================================================
 //  Probe da VcrFont — bancada para olhar a fonte do OSD glifo por glifo.
 //
-//  Roda o MESMO rasterizador M5GFX do aparelho, em RGB332 (setColorDepth(8)),
+//  Roda o MESMO rasterizador do aparelho (LovyanGFX), em RGB565 como o `tv`,
 //  e grava PNGs. O ponto é conferir com o olho o que nenhuma asserção pega:
 //  traço que afina, contador que fecha, letra que vira outra.
 //
@@ -17,8 +17,8 @@
 //  no orçamento do include/VcrFont.h.
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +30,7 @@
 using namespace crt;
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 static const char CHARSET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.-/%+?!";
 
@@ -144,8 +144,8 @@ static void pageGrid() {
   const int Wp = pad * 2 + COLS * (cw + pad);
   const int Hp = top + rows * (ch + pad) + 74;
 
-  LGFX_Sprite page(&rca);
-  page.setColorDepth(8);
+  LGFX_Sprite page(&tv);
+  page.setColorDepth(16);
   if (!page.createSprite(Wp, Hp)) {
     fprintf(stderr, "sem memoria para a pagina da grade\n");
     return;
@@ -191,8 +191,8 @@ static void pageZoom(const char *hard, const char *file) {
   const int Wp = pad + COLS * (cw + pad);
   const int Hp = top + rows * (ch + pad);
 
-  LGFX_Sprite page(&rca);
-  page.setColorDepth(8);
+  LGFX_Sprite page(&tv);
+  page.setColorDepth(16);
   if (!page.createSprite(Wp, Hp)) {
     fprintf(stderr, "sem memoria para a pagina de zoom\n");
     return;
@@ -228,8 +228,8 @@ static void pageOutline() {
   const int Wp = vcrfont::textWidth(phrase, s) + 16;
   const int Hp = 2 * vcrfont::textHeight(s) + 40;
 
-  LGFX_Sprite page(&rca);
-  page.setColorDepth(8);
+  LGFX_Sprite page(&tv);
+  page.setColorDepth(16);
   if (!page.createSprite(Wp, Hp)) {
     fprintf(stderr, "sem memoria para a pagina de contorno\n");
     return;
@@ -262,13 +262,13 @@ static void fakeVideo() {
         r = r * 3 / 4;
         g = g * 3 / 4;
       }
-      rca.drawPixel(x, y, rca.color888(r, g, b));
+      tv.drawPixel(x, y, tv.color888(r, g, b));
     }
   }
   // Um objeto claro e um escuro cruzando as linhas de texto: é aí que o texto
   // sem contorno some (no claro) e o preto puro some (no escuro).
-  rca.fillRect(120, 10, 130, 90, rca.color888(250, 250, 240));
-  rca.fillRect(40, 150, 110, 70, rca.color888(12, 12, 12));
+  tv.fillRect(120, 10, 130, 90, tv.color888(250, 250, 240));
+  tv.fillRect(40, 150, 110, 70, tv.color888(12, 12, 12));
 }
 
 // ---------------------------------------------------------------------------
@@ -281,24 +281,24 @@ static void pageOsd() {
   const int32_t black = TFT_BLACK;
 
   // As duas primeiras linhas sem contorno: onde cruzam o objeto branco, somem.
-  vcrfont::drawText(&rca, "PLAY  SP  0:12:34", SAFE_L, SAFE_T, white, 1);
-  vcrfont::drawText(&rca, "M5 RETRO TV", SAFE_L, SAFE_T + 18, white, 1);
+  vcrfont::drawText(&tv, "PLAY  SP  0:12:34", SAFE_L, SAFE_T, white, 1);
+  vcrfont::drawText(&tv, "M5 RETRO TV", SAFE_L, SAFE_T + 18, white, 1);
 
   // As mesmas duas com contorno: legíveis sobre o mesmo objeto.
-  vcrfont::drawText(&rca, "PLAY  SP  0:12:34", SAFE_L, SAFE_T + 42, white, 1, black);
-  vcrfont::drawText(&rca, "M5 RETRO TV", SAFE_L, SAFE_T + 60, white, 1, black);
+  vcrfont::drawText(&tv, "PLAY  SP  0:12:34", SAFE_L, SAFE_T + 42, white, 1, black);
+  vcrfont::drawText(&tv, "M5 RETRO TV", SAFE_L, SAFE_T + 60, white, 1, black);
 
   // 2x com contorno, centralizado — o modo 24x32 dos títulos.
-  vcrfont::drawTextCentered(&rca, "REC 100%", 0, 96, W, rca.color565(255, 80, 80), 2, black);
+  vcrfont::drawTextCentered(&tv, "REC 100%", 0, 96, W, tv.color565(255, 80, 80), 2, black);
 
   // Linha com as letras de diagonal difícil, em tamanho real sobre o preto.
-  vcrfont::drawText(&rca, "VHS/DVD MIX WXYZ", 4, 138, white, 1, black);
+  vcrfont::drawText(&tv, "VHS/DVD MIX WXYZ", 4, 138, white, 1, black);
 
   // Faixa do OSD, tal como o player a usa.
-  vcrfont::drawText(&rca, "CH 03 - 12/25", SAFE_L, crt::SAFE_B - 40, white, 1, black);
-  vcrfont::drawTextCentered(&rca, "SP 0:12:34", 0, crt::SAFE_B - 22, W, white, 1, black);
+  vcrfont::drawText(&tv, "CH 03 - 12/25", SAFE_L, crt::SAFE_B - 40, white, 1, black);
+  vcrfont::drawTextCentered(&tv, "SP 0:12:34", 0, crt::SAFE_B - 22, W, white, 1, black);
 
-  savePng(&rca, W, H, "vcr_font_osd.png");
+  savePng(&tv, W, H, "vcr_font_osd.png");
 }
 
 // ---------------------------------------------------------------------------
@@ -306,8 +306,8 @@ static void pageOsd() {
 // ---------------------------------------------------------------------------
 static void pageCompare() {
   const int Wp = 420, Hp = 240;
-  LGFX_Sprite page(&rca);
-  page.setColorDepth(8);
+  LGFX_Sprite page(&tv);
+  page.setColorDepth(16);
   if (!page.createSprite(Wp, Hp)) {
     fprintf(stderr, "sem memoria para a pagina de comparacao\n");
     return;
@@ -364,12 +364,13 @@ int main(int, char **) {
   cfg.memory_height = cfg.panel_height = H;
   panel.config(cfg);
   panel.setScaling(3, 3);
-  rca.setPanel(&panel);
-  if (!rca.init()) {
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init()) {
     fprintf(stderr, "falha ao iniciar o painel SDL\n");
     return 1;
   }
-  rca.setColorDepth(8); // RGB332, igual ao firmware na saida composta
+  tv.setColorDepth(16); // RGB565, igual ao canvas `tv` do Fruit Jam
 
   reportCost();
   pageGrid();

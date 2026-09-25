@@ -24,16 +24,17 @@
 //         num buffer de pilha, um de cada vez, na hora de abrir.
 //
 //     Nada de LGFX_Sprite aqui: um sprite de 5 KB já causou falta de memória
-//     neste projeto, e um de tela cheia (76.800 B em RGB332) não cabe.
+//     no Core2, e um de tela cheia (153.600 B em RGB565) não cabe na SRAM ao
+//     lado do framebuffer.
 //
 //  2. Transições são as do include/ScreenFx.h — este arquivo não tem dither
 //     próprio. **Achado importante**: `crossfade()` e `fadeIn()` exigem um
-//     LGFX_Sprite 320x240 RGB332 do chamador e, recebendo `nullptr`, caem em
+//     LGFX_Sprite 320x240 RGB565 do chamador e, recebendo `nullptr`, caem em
 //     `hardCut()` — corte seco, sem nenhuma animação, devolvendo false. Já o
 //     `fadeThrough()` com `nullptr` continua **visível**: ele esmaece até o
 //     preto com o dither de Bayer (que não precisa de buffer nenhum) e só o
-//     segundo tempo, o reacender, vira corte seco. Como aqui não há SRAM para
-//     o sprite, `beginTransition()` usa `fadeThrough`. É de propósito.
+//     segundo tempo, o reacender, vira corte seco. Como o sprite é opcional,
+//     `beginTransition()` usa `fadeThrough`. É de propósito.
 //
 //  3. `millis()` dá a volta em ~49 dias. O prazo usa `timeReached()` da
 //     UiLogic.h (aritmética com sinal sobre a diferença), nunca `now > prazo`.
@@ -81,7 +82,7 @@
 //    photos.reset(millis());
 //    take(sdMutex); photos.scan(SD); give(sdMutex);
 //    take(sdMutex); photos.load(SD, millis()); give(sdMutex);
-//    photos.paint(&rca, 0, 0);   // primeiro quadro, sem transição
+//    photos.paint(&tv, 0, 0);    // primeiro quadro, sem transição
 //
 //    // no loop():
 //    if (tx.busy())            tx.tick(millis());
@@ -91,11 +92,11 @@
 //      photos.beginTransition(tx, millis(), nullptr);
 //    }
 //
-//  Compila em -std=gnu++11. Depende de M5GFX (pelo ScreenFx.h), SafeArea.h,
-//  Ascii.h e UiLogic.h. SD e JPEGDEC são detectados por __has_include: sem
-//  eles (simulador de desktop) o arquivo continua compilando, só sem as duas
-//  funções de cartão e sem o decode — o que permite testar a lógica pura em
-//  sim/probes/photo_show.cpp.
+//  Compila em -std=gnu++11. Depende da LovyanGFX (fj/Gfx.h, pelo ScreenFx.h),
+//  SafeArea.h, Ascii.h e UiLogic.h. O JPEGDEC é detectado por __has_include:
+//  sem ele (simulador de desktop) o arquivo continua compilando, só sem o
+//  decode — o que permite testar a lógica pura em sim/probes/photo_show.cpp.
+//  As funções de cartão são templates e só existem de fato quando chamadas.
 // ============================================================================
 
 #include "Ascii.h"
@@ -113,17 +114,19 @@
 #define PHOTOSHOW_HAS_JPEGDEC 1
 #endif
 #endif
-#if !defined(PHOTOSHOW_HAS_SD) && defined(__has_include)
-#if __has_include(<FS.h>)
+// As funções de cartão são templates sobre o tipo do sistema de arquivos, e
+// não recebem mais um fs::FS&: no arduino-pico o `SD` é um SDClass que NÃO
+// herda de fs::FS (é uma fachada sobre o SDFS), e além disso o FS::open de lá
+// exige o modo. Com template, qualquer objeto que tenha open(path, "r")
+// serve — o SD do arduino-pico, o do ESP32 e um falso no simulador — e o
+// header não precisa de <FS.h>. PHOTOSHOW_HAS_SD continua existindo só para
+// quem ainda testa por ele.
+#ifndef PHOTOSHOW_HAS_SD
 #define PHOTOSHOW_HAS_SD 1
-#endif
 #endif
 
 #if PHOTOSHOW_HAS_JPEGDEC
 #include <JPEGDEC.h>
-#endif
-#if PHOTOSHOW_HAS_SD
-#include <FS.h>
 #endif
 
 namespace photo {
@@ -580,20 +583,19 @@ public:
   const Fit &fit() const { return fit_; }
 
   // -- cartão (PRÉ-CONDIÇÃO: o chamador segura o sdMutex) --------------------
-#if PHOTOSHOW_HAS_SD
   // Lista a pasta e ordena. Curto de propósito: só lê nomes de diretório.
   //
   // PRÉ-CONDIÇÃO: o chamador já tomou o sdMutex e o devolve logo depois.
-  int scan(fs::FS &fs, uint32_t now = 0) {
+  template <class Fs> int scan(Fs &fs, uint32_t now = 0) {
     cat_.clear();
-    fs::File dir = fs.open(dir_);
+    auto dir = fs.open(dir_, "r");
     if (!dir || !dir.isDirectory()) {
       if (dir)
         dir.close();
       afterScan(now);
       return 0;
     }
-    for (fs::File e = dir.openNextFile(); e; e = dir.openNextFile()) {
+    for (auto e = dir.openNextFile(); e; e = dir.openNextFile()) {
       if (!e.isDirectory())
         cat_.add(e.name());
       e.close();
@@ -608,7 +610,7 @@ public:
   // preso só pelo tempo da leitura.
   //
   // PRÉ-CONDIÇÃO: o chamador já tomou o sdMutex e o devolve logo depois.
-  Result load(fs::FS &fs, uint32_t now) {
+  template <class Fs> Result load(Fs &fs, uint32_t now) {
     bytes_ = 0;
     srcW_ = srcH_ = 0;
     if (!cat_.count())
@@ -618,7 +620,7 @@ public:
     char p[160];
     if (!cat_.path(index_, dir_, p, sizeof(p)))
       return finish(RES_UNREADABLE, now);
-    fs::File f = fs.open(p);
+    auto f = fs.open(p, "r");
     if (!f || f.isDirectory()) {
       if (f)
         f.close();
@@ -641,7 +643,6 @@ public:
     bytes_ = size;
     return measure(now);
   }
-#endif // PHOTOSHOW_HAS_SD
 
   // Mede o cabeçalho do que já está no buffer e escolhe a redução. Separado do
   // load() para o chamador poder alimentar o buffer por outro caminho.
@@ -679,7 +680,7 @@ public:
 
   // Pintor no formato dos outros: soma (ox, oy) a TUDO, não mexe no recorte
   // (é por ele que o ScreenFx limita o repinte) e pode ser chamado mais de uma
-  // vez no mesmo quadro. Serve para o painel CVBS e para o LCD.
+  // vez no mesmo quadro. Serve para o canvas `tv` e para um sprite.
   void paint(lgfx::LovyanGFX *dst, int ox, int oy) {
     if (!dst)
       return;
@@ -700,10 +701,10 @@ public:
 
   // Começa a transição para a foto corrente.
   //
-  // `scratch` é o LGFX_Sprite 320x240 RGB332 que o crossfade exigiria. NESTE
-  // APARELHO ELE É SEMPRE nullptr: não há SRAM para 76.800 bytes e a PSRAM
-  // está descartada para o caminho de vídeo. Por isso aqui se usa
-  // `fadeThrough`, e não `crossfade`: sem sprite o crossfade vira corte seco
+  // `scratch` é o LGFX_Sprite 320x240 RGB565 que o crossfade exigiria (ver
+  // ScreenFx.h: no Fruit Jam só cabe na PSRAM, via ps_malloc + setBuffer).
+  // Hoje o main.cpp passa nullptr. Por isso aqui se usa `fadeThrough`, e não
+  // `crossfade`: sem sprite o crossfade vira corte seco
   // puro (hardCut), enquanto o fadeThrough ainda esmaece de verdade até o
   // preto com o dither de Bayer — que não precisa de buffer nenhum — e só o
   // reacender é que vira corte. Devolve o que o ScreenFx devolveu (false =

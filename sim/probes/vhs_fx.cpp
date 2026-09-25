@@ -21,8 +21,8 @@
 //    make -C sim probes && cd sim && ./build/probe_vhs_fx
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,7 +42,7 @@ static const int VX = (W - VW) / 2, VY = (H - VH) / 2;
 static const int STRIP_W = 128, STRIP_H = 16;
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 // Cinza-sentinela fora da imagem: qualquer pixel diferente disto acima ou
 // abaixo do video denuncia escrita fora do lugar.
@@ -108,7 +108,7 @@ static void buildSource() {
 static uint16_t strip[STRIP_W * STRIP_H];
 
 static void renderAt(vhs::Filter &f, uint32_t nowMs, int px, int py, int pw, int ph) {
-  rca.fillScreen(kSentinel);
+  tv.fillScreen(kSentinel);
   f.beginFrame(nowMs, px, py, pw, ph);
   for (int by = 0; by < ph; by += STRIP_H) {
     const int h = (by + STRIP_H > ph) ? ph - by : STRIP_H;
@@ -120,10 +120,10 @@ static void renderAt(vhs::Filter &f, uint32_t nowMs, int px, int py, int pw, int
       for (int r = 0; r < h; ++r)
         for (int x = 0; x < w; ++x)
           strip[(size_t)r * w + x] = source[(size_t)((by + r) % VH) * VW + ((bx + x) % VW)];
-      f.pushBlock(&rca, px + bx, py + by, w, h, strip);
+      f.pushBlock(&tv, px + bx, py + by, w, h, strip);
     }
   }
-  f.drawOverlay(&rca);
+  f.drawOverlay(&tv);
 }
 
 static void renderFrame(vhs::Filter &f, uint32_t nowMs) { renderAt(f, nowMs, VX, VY, VW, VH); }
@@ -152,7 +152,7 @@ static FILE *openOut(const char *name) {
 
 static void shot(const char *name) {
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, W, H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, W, H);
   if (!png) {
     fprintf(stderr, "    createPng falhou\n");
     ++failures;
@@ -179,7 +179,7 @@ static inline uint16_t bswap16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 
 
 static void grabFrame(uint16_t *dst) {
   for (int y = 0; y < H; ++y) {
-    rca.readRect(0, y, W, 1, dst + (size_t)y * W);
+    tv.readRect(0, y, W, 1, dst + (size_t)y * W);
     for (int x = 0; x < W; ++x)
       dst[(size_t)y * W + x] = bswap16(dst[(size_t)y * W + x]);
   }
@@ -232,15 +232,16 @@ static Budget runWear(vhs::Wear wear, const char *name, uint32_t seed, int frame
 
 int main(int, char **) {
   panel.setScaling(2, 2);
-  rca.setPanel(&panel);
-  if (!rca.init()) {
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init()) {
     fprintf(stderr, "falha ao inicializar o painel SDL\n");
     return 1;
   }
-  // O firmware esta em RGB565 por padrao (rca.setColorDepth(16)); o probe usa a
+  // O firmware esta em RGB565 por padrao (tv.setColorDepth(16)); o probe usa a
   // mesma profundidade para que os PNGs mostrem o ruido com a mesma quantizacao.
   // Nada em VhsFx.h depende disso: tudo sai por pushImage de rgb565_t.
-  rca.setColorDepth(16);
+  tv.setColorDepth(16);
   buildSource();
 
   printf("video %dx%d em (%d,%d) dentro de %dx%d; tiras de %dx%d\n\n", VW, VH, VX, VY, W, H, STRIP_W,

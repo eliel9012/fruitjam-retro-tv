@@ -2,23 +2,28 @@
 //  probe_screen_fx — bancada do include/ScreenFx.h
 //
 //  Roda cada transição contra um relógio sintético de 60 Hz (16 ms por quadro,
-//  a cadência de campo do NTSC) e grava cinco PNGs por efeito, nas marcas de
-//  0%, 25%, 50%, 75% e 100% da duração. O painel está em 8 bits para que a
-//  quantização RGB332 do quadro composto apareça nos PNGs tal como na TV.
+//  a cadência de quadro do DVI 640x480@60) e grava cinco PNGs por efeito, nas
+//  marcas de 0%, 25%, 50%, 75% e 100% da duração. O painel está em 16 bits
+//  (RGB565), a mesma profundidade do canvas `tv` do Fruit Jam.
 //
 //  Ao final imprime o custo medido: quantos passos a transição desenhou e
 //  quantos pixels foram escritos/repintados no total. É esse número que decide
-//  se o efeito cabe no orçamento por quadro do ESP32.
+//  se o efeito cabe no orçamento por quadro do aparelho.
+//
+//  E confere, pixel a pixel, que o crossfade com sprite de 16 bits termina
+//  EXATAMENTE na página de destino — um swap de bytes esquecido na leitura do
+//  sprite passaria despercebido no olho (cor parecida) e aparece aqui.
 //
 //    make -C sim probes && ./sim/build/probe_screen_fx
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX + backend SDL, a mesma porta de entrada do firmware
+#include "SimPanel.h" // painel SDL em 320x240, não no 240x320 padrão da LovyanGFX
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "SafeArea.h"
 #include "ScreenFx.h"
@@ -26,7 +31,7 @@
 using namespace crt;
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 // ---------------------------------------------------------------------------
 //  Duas páginas no espírito da tela de previsão: "condições atuais" e
@@ -111,7 +116,7 @@ static FILE *openOut(const char *name, int idx) {
 
 static void shot(const char *name, int idx) {
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, W, H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, W, H);
   if (!png)
     return;
   FILE *f = openOut(name, idx);
@@ -146,7 +151,7 @@ static Run drive(crt::fx::Transition &tx, const char *name, uint32_t dur) {
     }
     if (done)
       break;
-    t += 16;         // um campo NTSC
+    t += 16;         // um quadro a 60 Hz
     if (t > dur * 4) // rede de segurança: transição que não termina é bug
       break;
   }
@@ -167,77 +172,125 @@ static void report(const char *name, const crt::fx::Transition &tx, uint32_t fra
 
 int main(int, char **) {
   panel.setScaling(2, 2);
-  rca.setPanel(&panel);
-  if (!rca.init()) {
+  sim::configure(panel);
+  tv.setPanel(&panel);
+  if (!tv.init()) {
     fprintf(stderr, "falha ao inicializar o painel SDL\n");
     return 1;
   }
-  rca.setColorDepth(8); // RGB332, igual ao firmware na saída composta
+  tv.setColorDepth(16); // RGB565, igual ao canvas `tv` do Fruit Jam
 
-  // Sprite de composição do chamador: 320x240 a 8 bits = 76.800 bytes. No Core2
-  // isto tem de ser PSRAM (setPsram(true)); aqui é memória de desktop.
-  lgfx::LGFX_Sprite scratch(&rca);
-  scratch.setPsram(true);
-  scratch.setColorDepth(8);
-  scratch.createSprite(W, H);
+  // Sprite de composição do chamador: 320x240 a 16 bits = 153.600 bytes. No
+  // aparelho o buffer vem de ps_malloc() e entra por setBuffer() — o
+  // setPsram(true) da LovyanGFX no rp2040 é malloc comum (ver ScreenFx.h).
+  // Aqui o mesmo caminho, com malloc de desktop.
+  uint16_t *scratchPx = (uint16_t *)malloc((size_t)W * H * 2);
+  lgfx::LGFX_Sprite scratch(&tv);
+  if (scratchPx)
+    scratch.setBuffer(scratchPx, W, H, 16);
   const bool hasScratch = scratch.getBuffer() != nullptr;
-  printf("sprite de composicao: %s\n\n", hasScratch ? "ok (76800 bytes)" : "INDISPONIVEL");
+  printf("sprite de composicao: %s\n\n", hasScratch ? "ok (153600 bytes, RGB565)" : "INDISPONIVEL");
+  int failures = 0;
 
-  crt::fx::Transition tx(&rca);
+  crt::fx::Transition tx(&tv);
   const crt::fx::Screen now = crt::fx::screen(pageNow);
   const crt::fx::Screen fc = crt::fx::screen(pageForecast);
   uint32_t frames;
 
   // 1. Esmaecimento para preto.
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   tx.fadeOut(0, 480, TFT_BLACK);
   frames = drive(tx, "fadeout", 480).frames;
   report("fadeout", tx, frames);
 
   // 2. Esmaecimento a partir do preto.
-  rca.fillScreen(TFT_BLACK);
+  tv.fillScreen(TFT_BLACK);
   tx.fadeIn(0, fc, &scratch, 480, TFT_BLACK);
   frames = drive(tx, "fadein", 480).frames;
   report("fadein", tx, frames);
 
   // 3. Crossfade direto entre as duas páginas.
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   tx.crossfade(0, fc, &scratch, 640);
   frames = drive(tx, "crossfade", 640).frames;
   report("crossfade", tx, frames);
+  {
+    // O quadro final do crossfade tem de ser idêntico à página desenhada direto.
+    std::vector<uint16_t> got((size_t)W * H);
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        got[(size_t)y * W + x] = tv.readPixel(x, y);
+    pageForecast(&tv, 0, 0, nullptr);
+    int diff = 0;
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        diff += got[(size_t)y * W + x] != tv.readPixel(x, y);
+    printf("crossfade 16 bits: %d pixels diferentes da pagina de destino (esperado: 0)\n\n", diff);
+    if (diff)
+      ++failures;
+  }
 
   // 4. Esmaecimento para preto e de volta (o par clássico do TWC).
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   tx.fadeThrough(0, fc, &scratch, 380, 380, TFT_BLACK);
   frames = drive(tx, "fadethrough", 760).frames;
   report("fadethrough", tx, frames);
 
   // 5. Deslizamento horizontal: a página atual sai pela esquerda.
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   tx.slide(0, now, fc, crt::fx::DIR_LEFT, 520);
   frames = drive(tx, "slide", 520).frames;
   report("slide", tx, frames);
 
   // 6. Cortina vertical de cima para baixo.
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   tx.wipe(0, fc, crt::fx::DIR_DOWN, 480);
   frames = drive(tx, "wipe", 480).frames;
   report("wipe", tx, frames);
 
   // 7. Degradação sem sprite: crossfade deve virar corte seco e devolver false.
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   const bool ok = tx.crossfade(0, fc, nullptr, 640);
   printf("crossfade sem sprite: devolveu %s, busy=%s (esperado: false/false)\n", ok ? "true" : "false",
          tx.busy() ? "true" : "false");
+  if (ok || tx.busy())
+    ++failures;
+
+  // 7b. Profundidade que o ScreenFx não sabe reinterpretar (24 bits): também
+  //     corte seco. E 8 bits (RGB332, o contrato do upstream) continua aceito.
+  {
+    lgfx::LGFX_Sprite deep(&tv);
+    deep.setColorDepth(24);
+    deep.createSprite(W, H);
+    pageNow(&tv, 0, 0, nullptr);
+    const bool ok24 = tx.crossfade(0, fc, &deep, 640);
+    tx.skip();
+    lgfx::LGFX_Sprite small(&tv);
+    small.setColorDepth(8);
+    small.createSprite(W, H);
+    pageNow(&tv, 0, 0, nullptr);
+    const bool ok8 = tx.crossfade(0, fc, &small, 640);
+    tx.skip();
+    printf("crossfade com sprite de 24 bits: %s (esperado: false); de 8 bits: %s (esperado: true)\n",
+           ok24 ? "true" : "false", ok8 ? "true" : "false");
+    if (ok24 || !ok8)
+      ++failures;
+    deep.deleteSprite();
+    small.deleteSprite();
+  }
 
   // 8. skip() no meio da transição: deve saltar direto ao quadro final.
-  pageNow(&rca, 0, 0, nullptr);
+  pageNow(&tv, 0, 0, nullptr);
   tx.slide(0, now, fc, crt::fx::DIR_LEFT, 520);
   tx.tick(160);
   tx.skip();
   shot("skip", 0);
   printf("skip no meio do slide: busy=%s (esperado: false)\n", tx.busy() ? "true" : "false");
+  if (tx.busy())
+    ++failures;
 
-  scratch.deleteSprite();
-  return 0;
+  scratch.deleteSprite(); // só solta a referência: o buffer é nosso
+  free(scratchPx);
+  printf("\n%s\n", failures ? "FALHOU" : "ok");
+  return failures ? 1 : 0;
 }

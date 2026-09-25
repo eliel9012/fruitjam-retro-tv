@@ -3,7 +3,8 @@
 #include "UiLogic.h"
 #include "InputManager.h"
 #include "NetworkManager.h"
-#include <M5Unified.h>
+#include "fj/Board.h" // o stub de tests/stubs, não o do aparelho
+#include "fj/Net.h"   // idem
 #include <cassert>
 #include <algorithm>
 #include <iostream>
@@ -12,8 +13,6 @@
 #include <fstream>
 #include <iterator>
 uint32_t fakeMillis = 0;
-FakeM5 M5;
-FakeWiFi WiFi;
 struct MemoryStream {
   std::vector<uint8_t> bytes;
   size_t offset = 0, reads = 0;
@@ -80,7 +79,10 @@ struct FakeFS {
   };
   bool exists(const std::string &p) const { return files.count(p); }
   bool remove(const std::string &p) { return files.erase(p); }
-  File open(const std::string &p, const char *) {
+  File open(const std::string &p, const char *mode) {
+    // SafeStorage tem de abrir com "w" (trunca). No arduino-pico FILE_WRITE é
+    // O_APPEND: o JSON novo sairia colado no velho (PORTING.md 3.7).
+    assert(std::string(mode) == "w");
     files[p] = "";
     return {this, p};
   }
@@ -217,30 +219,30 @@ void testNavigation() {
   InputManager input;
   input.begin();
   fakeMillis = 0;
-  M5.BtnB.down = true;
+  board::fakeButtons[1] = true;
   input.update();
   fakeMillis = 100;
-  M5.BtnB.down = false;
+  board::fakeButtons[1] = false;
   input.update();
   assert(input.getAction() == NavAction::SELECT);
   assert(input.getAction() == NavAction::NONE);
-  M5.BtnB.down = true;
+  board::fakeButtons[1] = true;
   input.update();
   fakeMillis = 900;
   input.update();
-  M5.BtnB.down = false;
+  board::fakeButtons[1] = false;
   input.update();
   assert(input.getAction() == NavAction::BACK);
   fakeMillis = 1000;
-  M5.BtnB.down = true;
+  board::fakeButtons[1] = true;
   input.update();
   fakeMillis = 2700;
   input.update();
-  M5.BtnB.down = false;
+  board::fakeButtons[1] = false;
   input.update();
   assert(input.getAction() == NavAction::HOME);
   input.setAutoRepeat(true);
-  M5.BtnA.down = true;
+  board::fakeButtons[0] = true;
   input.update();
   fakeMillis += 401;
   input.update();
@@ -248,16 +250,16 @@ void testNavigation() {
   fakeMillis += 400;
   input.update();
   assert(input.getAction() == NavAction::LEFT);
-  M5.BtnA.down = false;
+  board::fakeButtons[0] = false;
   input.update();
   assert(input.getAction() == NavAction::NONE);
   input.setAutoRepeat(false);
-  M5.BtnC.down = true;
+  board::fakeButtons[2] = true;
   input.update();
   fakeMillis += 701;
   input.update();
   assert(input.getAction() == NavAction::NEXT);
-  M5.BtnC.down = false;
+  board::fakeButtons[2] = false;
   input.update();
   assert(input.getAction() == NavAction::NONE);
   assert(!timeReached(0xfffffff0, 0x10));

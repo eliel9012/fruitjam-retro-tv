@@ -45,7 +45,7 @@
 // apenas como uma margem um pouco maior, que e o que drawInfo()/drawSettings()
 // ja fazem hoje.
 //
-// Dependencias: M5GFX (vem pela VcrFont), SafeArea.h e Ascii.h. Nada de
+// Dependencias: LovyanGFX (fj/Gfx.h, vem pela VcrFont), SafeArea.h e Ascii.h. Nada de
 // Arduino, WiFi, SD ou FreeRTOS: o destino e um LovyanGFX*, entao o mesmo
 // header serve ao painel CVBS do aparelho e ao painel SDL do simulador.
 //

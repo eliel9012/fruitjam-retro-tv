@@ -69,7 +69,7 @@
 //  de verdade custa um glifo novo na VcrFont.h (16 linhas de tabela, 32 bytes
 //  de flash) e uma entrada em glyphIndex — fora do escopo deste header.
 //
-// Dependencias: SafeArea.h, VcrFont.h (que traz o M5GFX) e Ascii.h. Nada de
+// Dependencias: SafeArea.h, VcrFont.h (que traz a LovyanGFX) e Ascii.h. Nada de
 // Arduino, SD ou FreeRTOS — o mesmo header compila no firmware (gnu++11) e no
 // simulador SDL.
 // ============================================================================

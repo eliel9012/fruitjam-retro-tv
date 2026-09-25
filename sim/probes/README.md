@@ -12,23 +12,24 @@ Esqueleto mínimo (o `main` é seu; a janela é opcional — para conferir o
 resultado prefira gravar um PNG com `createPng`, que funciona headless):
 
 ```cpp
-#include <SDL2/SDL.h>   // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h"     // LovyanGFX + backend SDL, a mesma porta do firmware
+#include "SimPanel.h"   // sim::configure(): painel em 320x240
 #include "SafeArea.h"   // geometria compartilhada com o firmware
 
 static lgfx::Panel_sdl panel;
-static M5GFX rca;
+static lgfx::LGFX_Device tv;
 
 int main(int, char **) {
   panel.setScaling(3, 3);
-  rca.setPanel(&panel);
-  if (!rca.init()) return 1;
-  rca.setColorDepth(8);        // RGB332, igual ao firmware na saída composta
+  sim::configure(panel);       // a LovyanGFX nasce 240x320; sem isto a tela sai cortada
+  tv.setPanel(&panel);
+  if (!tv.init()) return 1;
+  tv.setColorDepth(16);        // RGB565, igual ao canvas `tv` do Fruit Jam
 
   // ... desenhe aqui ...
 
   size_t len = 0;
-  uint8_t *png = (uint8_t *)rca.createPng(&len, 0, 0, crt::W, crt::H);
+  uint8_t *png = (uint8_t *)tv.createPng(&len, 0, 0, crt::W, crt::H);
   FILE *f = fopen("build/probe.png", "wb");
   fwrite(png, 1, len, f); fclose(f); free(png);
   return 0;
@@ -36,3 +37,7 @@ int main(int, char **) {
 ```
 
 Regras: um probe não edita `sim/src/main.cpp`, `sim/Makefile` nem `src/main.cpp`.
+
+Probe antigo, escrito para o M5GFX (`#include <M5GFX.h>`, `static M5GFX rca;`),
+continua compilando: `compat/M5GFX.h` é uma ponte que já configura o painel em
+320x240. Código novo usa o esqueleto acima.

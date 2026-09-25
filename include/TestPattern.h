@@ -62,14 +62,15 @@
 //     o dono do barramento.
 //   * Texto ASCII, sem acento: as fontes bitmap so tem ASCII.
 //
-// Dependencias: M5GFX (vem pela VcrFont.h), SafeArea.h e Ascii.h. Nada de
-// Arduino, FreeRTOS, SD ou I2S — o destino e um `lgfx::LovyanGFX*`, entao o
-// mesmo header serve ao painel CVBS do aparelho e ao painel SDL do simulador.
+// Dependencias: LovyanGFX (fj/Gfx.h, vem pela VcrFont.h), SafeArea.h e
+// Ascii.h. Nada de Arduino, FreeRTOS, SD ou I2S — o destino e um
+// `lgfx::LovyanGFX*`, entao o mesmo header serve ao canvas `tv` do aparelho e
+// ao painel SDL do simulador.
 // ============================================================================
 
 #include "Ascii.h"
 #include "SafeArea.h"
-#include "VcrFont.h" // traz <M5GFX.h> e a fonte grossa 12x16 do cartaz
+#include "VcrFont.h" // traz fj/Gfx.h (LovyanGFX) e a fonte grossa 12x16 do cartaz
 
 #include <stddef.h>
 #include <stdint.h>

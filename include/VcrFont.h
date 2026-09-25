@@ -53,8 +53,9 @@
 // acompanha a escala (1 px de bitmap = `scale` px na tela), que é o certo: um
 // contorno de 1 px real sumiria embaixo de um traço de 8.
 //
-// Dependências: só M5GFX. Nada de Arduino/WiFi/SD/FreeRTOS, para que o mesmo
-// header sirva ao painel CVBS do aparelho e ao painel SDL do simulador.
+// Dependências: só a LovyanGFX, por fj/Gfx.h (era o M5GFX no Core2). Nada de
+// Arduino/WiFi/SD/FreeRTOS, para que o mesmo header sirva ao canvas `tv` do
+// aparelho e ao painel SDL do simulador.
 // ============================================================================
 
 namespace vcrfont {

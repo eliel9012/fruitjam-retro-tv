@@ -1,3 +1,4 @@
 #pragma once
-// No firmware o Wi-Fi vem da WiFiNINA; no teste nativo, do mesmo WiFi falso.
+// WiFiNINA falso: o mesmo WiFi dos testes (ver WiFi.h daqui), que já fala a
+// API comum às duas bibliotecas.
 #include "WiFi.h"

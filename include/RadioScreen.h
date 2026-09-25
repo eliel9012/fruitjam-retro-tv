@@ -66,7 +66,7 @@
 #include "Ascii.h"
 #include "SafeArea.h"
 #include "UiLogic.h" // timeReached()
-#include "VcrFont.h" // traz o M5GFX junto
+#include "VcrFont.h" // traz a LovyanGFX (fj/Gfx.h) junto
 
 // ---------------------------------------------------------------------------
 //  Logotipo da estação (header GERADO, fora deste arquivo)
