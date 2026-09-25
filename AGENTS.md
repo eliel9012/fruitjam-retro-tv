@@ -30,7 +30,7 @@ só fala DVI.
 
 | | Core2 + RCA (upstream) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, 264 MHz (o DVHSTX sobe o relógio) |
+| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, 126 MHz (o DVHSTX sobe o relógio duas vezes: 240 MHz num preinit, depois o valor exato do modo de vídeo -- ver fj/UsbHost.h) |
 | SRAM / PSRAM | ~320 KB / 4,5 MB | 520 KB / 8 MB (QSPI) |
 | Vídeo | CVBS NTSC 320×240 | DVI 640×480@60, quadro lógico 320×240 |
 | Tela local | LCD 320×240 + touch | **nenhuma** |
@@ -308,6 +308,8 @@ include/fj/Board.h      pinos, board::begin, botões, detecção do cartão
 include/fj/Storage.h    SD em SDIO
 include/fj/AudioOut.h   TLV320DAC3100: rota, volume, taxa, write()
 include/fj/Net.h        ESP32-C6/WiFiNINA: net::Lock, httpGet, ntpEpoch
+include/fj/UsbHost.h    teclado/gamepad USB host (Adafruit_TinyUSB + Pico-PIO-USB)
+include/fj/UsbHidMap.h  decodificação HID -> NavAction, funções puras (testadas)
 src/fj/*.cpp            implementações das acima
 
 include/PlaybackIO.h    leitor de MJPEG concatenado e de WAV PCM
@@ -493,6 +495,30 @@ Fonte dos dados: **Open-Meteo** (`api.open-meteo.com`), pública e sem chave, co
 resposta de ~800 bytes, buscada por `net::httpGet` num buffer na PSRAM. Os
 ícones são escolhidos pelo **código WMO**, não por comparação de string.
 
+### 3.9 Controles USB
+
+Teclado e gamepad pelas portas USB host (D+ GPIO 1, 5V_EN GPIO 11), novo neste
+fork -- o Core2 não tinha USB host. `include/fj/UsbHost.h` documenta por
+extenso as decisões (pilha, PIO, núcleo, clock) e `PORTING.md` §3.11 resume o
+porquê de cada uma; aqui só o que muda no fluxo de navegação:
+
+`fj/UsbHost.cpp` decodifica os relatórios HID com `fj/UsbHidMap.h` (funções
+puras, testadas em `tests/test_core.cpp`: teclado boot, gamepad genérico via
+parser do report descriptor, DualShock4/DualSense por VID/PID) e entrega uma
+`NavAction` por um `ActionHandler` (ponteiro de função) que `appSetup()`
+fornece -- o mesmo desenho do controle web (`webCommand`/
+`FileTransfer::setCommandHandler`): a camada `fj/` não inclui `InputManager.h`
+nem sabe da fila do `loop()`. A função entra pela mesma fila do
+`InputManager` (`InputSource::USB`), então nunca existe um segundo caminho de
+navegação capaz de divergir do físico. XInput (Xbox) fica de fora -- ver
+`PLANO_E_REVISAO.md`.
+
+**NÃO TESTADO NO APARELHO.** O maior risco é o clock: `display::begin()` fixa
+o `clk_sys` em 126 MHz (640×480@60), que não é múltiplo de 12 MHz -- a regra
+que os próprios exemplos da Adafruit para PIO-USB tratam como obrigatória.
+`diag usb` mostra o clock real; se o teclado/gamepad piscar, perder relatório
+ou travar, é o primeiro suspeito.
+
 ---
 
 ## 4. Compilar e testar
@@ -520,8 +546,11 @@ A plataforma é a comunitária do Max Gerhardt
 (`maxgerhardt/platform-raspberrypi`) com o core do Earle Philhower
 (arduino-pico): a plataforma oficial `raspberrypi` do PlatformIO não tem RP2350.
 `board_build.f_cpu` fica em 150 MHz no `platformio.ini` porque a biblioteca do
-DVHSTX recusa compilar com outro valor e sobe o relógio para 264 MHz sozinha.
-As bibliotecas estão fixadas por commit.
+DVHSTX recusa compilar com outro valor e sobe o relógio sozinha em tempo de
+execução -- para 240 MHz num preinit antes do `setup()`, depois para o valor
+exato que o modo de vídeo pede (126 MHz para 640×480@60; ver o comentário de
+clock em `include/fj/UsbHost.h`, que precisou medir isto de verdade porque o
+PIO-USB depende do clock). As bibliotecas estão fixadas por commit.
 
 Sem acesso ao registro do PlatformIO: clone as bibliotecas de `lib_deps` numa
 pasta e crie `platformio_local.ini` (ignorado pelo git):
@@ -552,6 +581,7 @@ diag colors        confere o caminho RGB565 dos blocos JPEG
 diag bench         mede leitura do cartão, decode e blit em microssegundos
 diag time          origem e valor da hora do sistema
 diag radio         estado do rádio pela internet
+diag usb           dispositivos USB conectados (VID:PID, tipo) e último evento
 diag play/pause/resume/stop/home/back/next/previous/select/left/right
 diag radar/weather/music
 diag audio toggle|tv|internal|mute

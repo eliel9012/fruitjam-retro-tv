@@ -12,7 +12,7 @@ entra como **não testado no Fruit Jam** até alguém gravar e conferir.
 
 | Função | Core2 + RCA (original) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32 240 MHz, 2 núcleos Xtensa | RP2350B, 2× Cortex-M33, **264 MHz** (o DVHSTX sobe o relógio) |
+| CPU | ESP32 240 MHz, 2 núcleos Xtensa | RP2350B, 2× Cortex-M33, **126 MHz** em regime (o DVHSTX sobe o relógio duas vezes -- 240 MHz num preinit, depois o valor exato do modo de vídeo; ver §3.11) |
 | SRAM | ~320 KB | 520 KB |
 | PSRAM | 4,5 MB | 8 MB (QSPI, CS 47) |
 | Vídeo | CVBS NTSC 320×240 (M5ModuleRCA) | **DVI 640×480@60** pelo HSTX, quadro lógico 320×240 dobrado |
@@ -24,6 +24,7 @@ entra como **não testado no Fruit Jam** até alguém gravar e conferir.
 | RTC | BM8563 com bateria | **nenhum**: hora só via NTP do ESP32-C6 |
 | Energia | AXP192 (desligar de verdade) | sem PMIC: "desligar" = tela preta + dormir até um botão |
 | LEDs | — | 5 NeoPixels (GPIO 32) |
+| USB host | — (nenhuma porta) | teclado/gamepad, D+ GPIO 1 (D- é D+ +1), 5V_EN GPIO 11 (ver §3.11) |
 
 Pinos: `include/fj/Board.h`.
 
@@ -150,6 +151,46 @@ Continuam em `/M5RETRO/...`, para que o mesmo cartão sirva nos dois aparelhos.
 O arduino-pico compila em **gnu++17**. O teste `make -C sim cxx11` continua
 existindo para os headers que o upstream compartilha — mantenha-os em C++11
 enquanto for razoável, para o fork poder puxar correções do m5-retro-tv.
+
+### 3.11 USB host (teclado/gamepad)
+
+Novo no fork: o Core2 não tinha porta USB host nenhuma. Pilha
+[Adafruit_TinyUSB](https://github.com/adafruit/Adafruit_TinyUSB_Arduino) (já
+vem dentro do `framework-arduinopico`) + `-DUSE_TINYUSB` no `platformio.ini` +
+[Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB) (lib_dep à
+parte) para bit-bangar um segundo controlador USB num PIO. O contrato e o
+porquê de cada decisão estão comentados por extenso em `include/fj/UsbHost.h`
+(headers-fonte, não repita aqui) — resumo:
+
+- **Stack `USE_TINYUSB`, nunca `USE_TINYUSB_HOST`.** A segunda vira o
+  controlador *nativo* em host e mata o Serial/CDC da gravação. Conferido lendo
+  `framework-arduinopico/tools/platformio-build.py` (`configure_usb_flags`) e
+  `SerialUSB.cpp` (`#if !defined(USE_TINYUSB)`); `Serial` vira
+  `Adafruit_USBD_CDC` por `#define`, e continua funcionando pela mesma USB-C.
+- **PIO2, forçado.** O Pico-PIO-USB carrega seu programa sempre no offset 0 do
+  PIO escolhido, sem checar o que já está lá — diferente do SDIO/I2S, que usam
+  o alocador dinâmico do arduino-pico (`PIOProgram`, tenta PIO0 primeiro).
+  Reservar o PIO2 evita a colisão enquanto os outros dois couberem em PIO0/1.
+- **Núcleo 1.** O Pico-PIO-USB instala um alarme de hardware de 1 ms
+  (independente do FreeRTOS) no núcleo que chama `USBHost.begin()`. O núcleo 0
+  tem a interrupção de linha do DVI (~31,5 kHz) e não pode ganhar mais nenhum
+  IRQ periódico; o núcleo 1 já absorve RCA_PCM e VIDEO_DEC.
+- **Clock: NÃO é 240 nem 264 MHz em regime.** `display::begin()` reprograma o
+  PLL do sistema para o valor exato que o modo de vídeo pede — 126 MHz para
+  640×480@60 — e isso NÃO é múltiplo de 12 MHz, a regra que os próprios
+  exemplos da Adafruit tratam como obrigatória (e travam o boot se não bater).
+  Este port não trava o boot por isso; só mede e loga (`diag usb` mostra o
+  clk_sys real). NÃO TESTADO: é o primeiro suspeito se o teclado/gamepad
+  piscar, perder relatório ou travar no aparelho.
+- **Dispositivos**: teclado HID boot, gamepad HID genérico (parser do report
+  descriptor em `include/fj/UsbHidMap.h`, funções puras testadas em
+  `tests/test_core.cpp`), DualShock4/DualSense por VID/PID com layout fixo.
+  XInput (Xbox) fica de fora — precisaria do driver `tusb_xinput` (Ryzee119,
+  MIT) integrado à parte; ver o item pendente no `PLANO_E_REVISAO.md`.
+- Entra pela mesma fila do `InputManager` (`InputSource::USB`), pelo mesmo
+  desenho do controle web: `fj/UsbHost.cpp` não inclui `InputManager.h` nem
+  conhece `input` — recebe um `ActionHandler` (function pointer) que
+  `appSetup()` fornece, do jeito que `FileTransfer` recebe `webCommand`.
 
 ---
 

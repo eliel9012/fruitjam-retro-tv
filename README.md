@@ -337,6 +337,27 @@ screen says what each one does there — there is no second screen any more.
 The video clock follows the PCM actually delivered; late frames are skipped
 without being decoded.
 
+### USB keyboard and gamepad
+
+Plug a USB keyboard or gamepad into the host port (the separate USB-A-shaped
+connector, not the USB-C used to flash and for the serial console). It sends
+the same navigation as the three buttons, through the same queue, so it can
+never disagree with them.
+
+- **Keyboard**: arrow keys navigate, Enter selects, Esc or Backspace goes
+  back, Space pauses/resumes, Page Up/Down is previous/next.
+- **Generic HID gamepad**: d-pad or the left analog stick navigate. Which
+  button confirms, goes back, or is a shortcut follows a common convention
+  among cheap USB gamepads — **not verified against a real controller**; it
+  may be different on yours.
+- **DualShock4 / DualSense**: recognised by USB vendor ID, with a fixed,
+  publicly documented report layout (d-pad, Cross, Circle, L1, the PS
+  button) — also not verified on real hardware yet.
+- Xbox controllers (XInput) are not supported yet; see `PLANO_E_REVISAO.md`.
+
+**Not tested on the device.** `diag usb` on the serial console lists connected
+devices (VID:PID and type) and the last connect/disconnect event.
+
 ## Tests
 
 ```sh
@@ -368,7 +389,7 @@ colours are right on a real monitor.
 
 Serial at 115200 baud over USB: `diag status`, `diag mem`, `diag fb`,
 `diag cores`, `diag scan`, `diag colors`, `diag bench`, `diag time`,
-`diag radio`, navigation (`diag play`, `pause`, `resume`, `stop`, `back`, `home`,
+`diag radio`, `diag usb`, navigation (`diag play`, `pause`, `resume`, `stop`, `back`, `home`,
 `next`, `previous`, `select`, `left`, `right`), screens (`diag radar`,
 `weather`, `music`) and `diag audio toggle|tv|internal|mute`. Credentials are
 never printed.
@@ -668,6 +689,27 @@ cada tela diz o que cada um faz ali — não existe mais uma segunda tela.
 O relógio de vídeo segue o PCM efetivamente entregue; quadros atrasados são
 pulados sem decodificar.
 
+### Teclado e gamepad USB
+
+Ligue um teclado ou gamepad USB na porta host (o conector separado, em forma
+de USB-A — não a USB-C usada para gravar e para o console serial). Ele manda a
+mesma navegação dos três botões, pela mesma fila, então nunca diverge deles.
+
+- **Teclado**: setas navegam, Enter seleciona, Esc ou Backspace volta, Espaço
+  pausa/retoma, Page Up/Down é anterior/próximo.
+- **Gamepad HID genérico**: d-pad ou o analógico esquerdo navegam. Qual botão
+  confirma, volta ou é atalho segue uma convenção comum entre gamepads USB
+  baratos — **não conferida com um controle de verdade**; pode ser diferente
+  no seu.
+- **DualShock4 / DualSense**: reconhecidos pelo fabricante (VID) da Sony, com
+  um layout de relatório fixo e documentado publicamente (d-pad, Cruz,
+  Círculo, L1, o botão PS) — também não conferido no aparelho ainda.
+- Controles Xbox (XInput) ainda não são suportados; ver `PLANO_E_REVISAO.md`.
+
+**Não testado no aparelho.** `diag usb` no console serial lista os
+dispositivos conectados (VID:PID e tipo) e o último evento de conectar/
+desconectar.
+
 ## Testes
 
 ```sh
@@ -699,7 +741,7 @@ cores estão certas num monitor de verdade.
 
 Serial a 115200 baud pela USB: `diag status`, `diag mem`, `diag fb`,
 `diag cores`, `diag scan`, `diag colors`, `diag bench`, `diag time`,
-`diag radio`, navegação (`diag play`, `pause`, `resume`, `stop`, `back`, `home`,
+`diag radio`, `diag usb`, navegação (`diag play`, `pause`, `resume`, `stop`, `back`, `home`,
 `next`, `previous`, `select`, `left`, `right`), telas (`diag radar`, `weather`,
 `music`) e `diag audio toggle|tv|internal|mute`. Credenciais nunca são impressas.
 

@@ -29,6 +29,13 @@ constexpr uint8_t NEOPIXEL = PIN_NEOPIXEL;
 constexpr uint8_t NEOPIXEL_COUNT = NUM_NEOPIXEL;
 constexpr uint8_t PERIPHERAL_RESET = PIN_PERIPHERAL_RESET;
 constexpr uint8_t SD_DETECT = PIN_SD_DETECT;
+// Porta USB host (teclado/gamepad). D- é sempre D+ +1: o PIO-USB não aceita
+// pino separado para D-, então PIN_USB_HOST_DM só existe para documentar.
+// Ver fj/UsbHost.h para quem liga estes pinos.
+constexpr uint8_t USB_HOST_DP = PIN_USB_HOST_DP;
+constexpr uint8_t USB_HOST_DM = PIN_USB_HOST_DM;
+constexpr uint8_t USB_HOST_5V_EN = PIN_5V_EN;
+constexpr uint8_t USB_HOST_5V_EN_STATE = PIN_5V_EN_STATE;
 
 // Solta o reset dos periféricos e configura os botões. Primeira coisa do setup().
 void begin();
