@@ -110,8 +110,8 @@
 // ~1,2 KB de .bss; no Fruit Jam soma ~40 B de estado de rede. Alem disso:
 //   TRANSFER_PAGE       : ~1,3 KB de .rodata (flash, nao SRAM)
 //   buffer de bloco     : 8 KiB de PSRAM, alocado em begin(), liberado em stop()
-//   WiFiServer          : um objeto de poucos bytes, criado uma vez e nunca
-//                         liberado (o socket do C6 tambem nao fecha)
+//   socket de escuta    : o da porta 80 em fj/Net (net::listen), dividido com
+//                         o portal; nunca fecha (o socket do C6 nao fecha)
 //   WiFiNINA            : 1500 B de SRAM (malloc do WiFiSocketBuffer) por
 //                         socket em uso, liberados no stop() do socket
 //   pilha               : nenhuma alocacao grande; tudo o que e grande e membro
@@ -768,26 +768,16 @@ template <class FS> bool ensureParents(FS &fs, const char *path, char *scratch, 
 namespace xfer {
 
 namespace detail {
-// O socket de escuta do NINA NAO FECHA. O WiFiNINA nao tem WiFiServer::end(), e
-// no firmware NINA o comando de fechar socket (stopClientTcp) so fecha o lado
-// cliente: o NetworkServer do slot continua escutando. Criar um WiFiServer novo
-// a cada visita a tela gastaria um slot do C6 por visita (sao poucos, divididos
-// com radio, previsao e radar) e ainda deixaria dois servidores disputando a
-// mesma porta. Entao o servidor e um so por programa, criado na primeira visita
-// e REUSADO nas seguintes; fora da tela ele so deixa de ser atendido.
+// O socket de escuta do NINA NAO FECHA (nao ha WiFiServer::end(), e o comando
+// de fechar do firmware so fecha o lado cliente). Por isso o servidor vem do
+// registro compartilhado de fj/Net (net::listen/net::accept): um socket por
+// porta por programa, o MESMO que o portal de configuracao usa na porta 80.
+// Dois WiFiServer proprios na mesma porta disputariam as conexoes.
 // Estado ESTABLISHED do `wl_tcp_state` do WiFiNINA (utility/wifi_spi.h). Aquele
 // header nao e publico e traz uma penca de #define de comando SPI; o valor e
 // fixo no protocolo e o firmware NINA so devolve 4 ou 0 (getClientStateTcp).
 static const uint8_t NINA_TCP_ESTABLISHED = 4;
 
-struct Listener {
-  WiFiServer *server;
-  uint16_t port;
-};
-inline Listener &listener() {
-  static Listener l = {nullptr, 0};
-  return l;
-}
 } // namespace detail
 
 enum class TransferStatus : uint8_t {
@@ -928,7 +918,6 @@ private:
   enum class Method : uint8_t { OUTRO, GET, HEAD, PUT };
   enum class Route : uint8_t { DESCONHECIDA, RAIZ, UPLOAD, CONTROLE, COMANDO };
 
-  WiFiServer *_server = nullptr; // de detail::listener(); nao e nosso
   WiFiClient _client;
   File _file;
   SemaphoreHandle_t _sd = nullptr;
@@ -1062,24 +1051,7 @@ inline bool FileTransfer::begin(SemaphoreHandle_t sdMutex, uint16_t port) {
     _status = TransferStatus::FALHA;
     return false;
   }
-  {
-    net::Lock lock;
-    detail::Listener &l = detail::listener();
-    if (!l.server || l.port != _port) {
-      // Porta nova: o socket antigo fica orfao no C6 (nao ha como fecha-lo, ver
-      // detail::Listener) e o objeto antigo tambem fica — sao poucos bytes, e
-      // o WiFiServer nao tem destrutor virtual para um delete limpo. Na pratica
-      // a porta e sempre 80 e isto roda uma vez por boot.
-      l.server = new WiFiServer(_port);
-      l.port = _port;
-      l.server->begin();
-    } else if (!l.server->status()) {
-      // O C6 foi reiniciado (reset do GPIO 22) ou o servidor caiu: escuta de novo.
-      l.server->begin();
-    }
-    _server = l.server;
-    _listening = _server->status() != 0;
-  }
+  _listening = net::listen(_port);
   if (!_listening) {
     _error = "servidor HTTP nao subiu";
     _status = TransferStatus::FALHA;
@@ -1107,7 +1079,6 @@ inline void FileTransfer::stop() {
   // O servidor NAO e fechado (o NINA nao sabe fechar, ver detail::Listener):
   // so deixa de ser atendido. Conexoes que chegarem agora esperam na fila do C6
   // ate o navegador desistir.
-  _server = nullptr;
   if (_buffer) {
     free(_buffer);
     _buffer = NULL;
@@ -1235,7 +1206,7 @@ inline void FileTransfer::handle() {
     WiFiClient next;
     {
       net::Lock lock;
-      next = _server ? _server->available() : WiFiClient();
+      next = _listening ? net::accept(_port) : WiFiClient();
     }
     if (!next)
       return;

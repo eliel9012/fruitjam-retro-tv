@@ -271,7 +271,6 @@ uint32_t lastRadarDraw = 0, lastApiPoll = 0, lastApiGood = 0, lastStats = 0,
 String lastError, apiStatus = "NAO CONFIGURADA";
 struct RadarRequest {
   SecretsConfig config;
-  String ca;
 };
 struct RadarResponse {
   JsonDocument data;
@@ -326,7 +325,6 @@ subs::Subtitles subtitles;
 File srtFile;
 bool srtOpen = false;
 uint32_t radioLastDraw = 0;
-bool radioDepthSaved = true;
 // Cache da repintura parcial da tela do radio. Sem ele, cada passada redesenha
 // a tela inteira.
 radioui::Cache radioCache;
@@ -1769,6 +1767,11 @@ void servicePowerOff() {
   delay(50); // repique do contato ao soltar
   while (!InputManager::anyDown())
     delay(20);
+  // Reinicia só depois de SOLTAR: o botão 1 do Fruit Jam é também o BOOT, e
+  // reiniciar com ele apertado pode cair no modo de gravação (drive RP2350)
+  // em vez de subir o firmware.
+  while (InputManager::anyDown())
+    delay(20);
   Serial.println("[M5RETRO] Botao apertado: reiniciando");
   Serial.flush();
   rp2040.reboot();
@@ -2231,7 +2234,7 @@ bool startMusic(const String &path) {
   // andamento. O PCM (WAV ou MP3 decodificado) sai pela tarefa de áudio via
   // audioout; daqui só se abre o arquivo.
   playing = false;
-  while (audioReady && !audioIdle && !audioFailed)
+  while (audioReady && !audioIdle && !audioFailed && !radioActive.load() && !toneActive.load())
     vTaskDelay(pdMS_TO_TICKS(1));
   if (sdMutex)
     xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -2314,7 +2317,7 @@ bool startMusic(const String &path) {
 
 void stopMusic() {
   playing = false;
-  while (audioReady && !audioIdle && !audioFailed)
+  while (audioReady && !audioIdle && !audioFailed && !radioActive.load() && !toneActive.load())
     vTaskDelay(pdMS_TO_TICKS(1));
   if (sdMutex)
     xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -3177,7 +3180,7 @@ void weatherTick() {
 
 void startWeather() {
   playing = false;
-  while (audioReady && !audioIdle && !audioFailed)
+  while (audioReady && !audioIdle && !audioFailed && !radioActive.load() && !toneActive.load())
     vTaskDelay(pdMS_TO_TICKS(1));
   if (sdMutex)
     xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -3218,7 +3221,7 @@ void startWeather() {
 void stopWeather() {
   weatherAudio = false;
   playing = false;
-  while (audioReady && !audioIdle && !audioFailed)
+  while (audioReady && !audioIdle && !audioFailed && !radioActive.load() && !toneActive.load())
     vTaskDelay(pdMS_TO_TICKS(1));
   if (sdMutex)
     xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -4527,8 +4530,13 @@ static void appLoop() {
   const burnin::Stage estagio = telaParada ? idleMgr.tick(millis()) : burnin::STAGE_ACTIVE;
   if (!telaParada)
     idleMgr.notifyActivity(millis());
-  if (idleMgr.takeRepaint())
+  if (idleMgr.takeRepaint()) {
     redrawCurrentScreen();
+    // Sem backlight para baixar, o estágio ESCURO escurece o próprio quadro,
+    // uma vez, logo depois do redesenho (BurnIn.h, dimFrame).
+    if (estagio == burnin::STAGE_DIM)
+      burnin::dimFrame((uint16_t *)tv.getBuffer(), (size_t)tv.width() * tv.height());
+  }
   if (estagio == burnin::STAGE_BLANK) {
     // Protetor de tela: um bloco andando no preto. Apaga onde estava e pinta
     // onde esta, 192 px de cada, a cada 200 ms -- barato o bastante para ficar
@@ -4539,7 +4547,9 @@ static void appLoop() {
       tv.fillRect(idleMgr.saverX(), idleMgr.saverY(), burnin::SAVER_W, burnin::SAVER_H,
                    burnin::SAVER_COLOR);
     }
-  } else if (state == HOME && millis() - lastClockDraw >= 1000)
+  } else if (state == HOME && estagio != burnin::STAGE_DIM && millis() - lastClockDraw >= 1000)
+    // No ESCURO o relógio para: redesenhá-lo sairia em brilho normal por cima
+    // do quadro escurecido.
     drawHomeClock(true);
   pollAircraft();
   if (state == AIRCRAFT_RADAR && radarDirty) {
