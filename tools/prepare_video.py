@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Convert one local video to the Core2's bounded baseline MJPEG + PCM format."""
+"""Convert one local video to the Fruit Jam Retro TV's bounded baseline MJPEG + PCM format.
+
+Default output is 320x240 (the full logical frame, doubled to 640x480 on DVI).
+--size 240x160 keeps the smaller upstream (m5-retro-tv) default, cheaper to
+decode and entirely inside a CRT's safe area when watched through an HDMI->AV
+converter. The same card folder plays on both devices.
+"""
 import argparse
 import json
 import math
@@ -13,7 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path)
     parser.add_argument('destination', type=Path, help='New program directory (must not exist)')
-    parser.add_argument('--size', choices=('240x160', '320x240'), default='240x160')
+    parser.add_argument('--size', choices=('320x240', '240x160'), default='320x240',
+                        help='Frame size (default 320x240, full screen; 240x160 decodes faster)')
     parser.add_argument('--fps', type=int, choices=range(10, 31), default=15)
     parser.add_argument('--quality', type=int, choices=range(2, 16), default=5, help='JPEG qscale, lower is better/larger (default 5)')
     parser.add_argument('--title')
@@ -42,7 +49,7 @@ def main():
     duration = frames / args.fps
     width, height = map(int, args.size.split('x'))
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.m5-convert-', dir=destination.parent) as tmp:
+    with tempfile.TemporaryDirectory(prefix='.retrotv-convert-', dir=destination.parent) as tmp:
         folder = Path(tmp)
         command = ['ffmpeg', '-nostdin', '-v', 'error', '-i', str(source)]
         has_audio = any(s['codec_type'] == 'audio' for s in streams)

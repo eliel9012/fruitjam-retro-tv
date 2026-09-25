@@ -1,5 +1,10 @@
 # Revisão de Código — Firmware M5 RETRO TV
 
+> **Histórico do upstream.** Documento do [m5-retro-tv](https://github.com/eliel9012/m5-retro-tv)
+> (M5Stack Core2 + módulo RCA), preservado como referência. Pinos, barramentos e
+> números aqui são do Core2, não do Fruit Jam — para este fork, veja `AGENTS.md`
+> e `PORTING.md`.
+
 Documento de revisão completa do firmware M5 RETRO TV, descrevendo os problemas
 encontrados, as correções aplicadas e o estado final do projeto.
 
