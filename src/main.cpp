@@ -42,6 +42,12 @@
 #include "LocalizationPTBR.h"
 #include "SecretsManager.h"
 #include "ConfigurationPortal.h"
+#ifdef FRUITJAM_LAUNCHER_BUILD
+// So o env "fruitjam-launcher" grava o watchdog scratch register do
+// protocolo com o lancador (ver enterEmulators() em baixo); a build
+// standalone nao inclui hardware/watchdog.h nem referencia watchdog_hw.
+#include "hardware/watchdog.h"
+#endif
 
 // Adafruit Fruit Jam (RP2350B): DVI pelo HSTX, DAC TLV320DAC3100, Wi-Fi no
 // ESP32-C6. Fork do m5-retro-tv (M5Stack Core2 + modulo RCA); ver PORTING.md.
@@ -2694,15 +2700,15 @@ static void drawHomeClock(bool limpar) {
 }
 
 void drawHome() {
-  // 11 itens, na MESMA ordem de homeTarget() em UiLogic.h -- as duas listas
+  // 12 itens, na MESMA ordem de homeTarget() em UiLogic.h -- as duas listas
   // andam juntas e trocar uma sem a outra manda o usuario para a tela errada.
-  // Coluna da esquerda: 0..5. Coluna da direita: 6..10. (No Core2 havia uma
+  // Coluna da esquerda: 0..5. Coluna da direita: 6..11. (No Core2 havia uma
   // terceira lista, a grade de toque do LCD; sem tela local ela saiu, e o menu
   // e so a TV.)
   const char *items[] = {PTBR::VIDEOS,  PTBR::MUSICA,        PTBR::FOTOS,
                          PTBR::RADIO,   PTBR::WEATHER,       PTBR::TRAFEGO,
                          PTBR::PADRAO_TESTE, PTBR::TRANSFERENCIA, PTBR::CONFIGURACOES,
-                         PTBR::INFO_SISTEMA, PTBR::DESLIGAR};
+                         PTBR::INFO_SISTEMA, PTBR::EMULADORES, PTBR::DESLIGAR};
   static_assert(sizeof(items) / sizeof(items[0]) == HOME_COUNT,
                 "rotulos do menu inicial fora de sincronia com HOME_COUNT");
   tv.fillScreen(TFT_NAVY);
@@ -3670,6 +3676,94 @@ void stopRadio() {
   radioStream.end();
 }
 
+// ---------------------------------------------------------------------------
+//  EMULADORES (PORTING.md, secao "Emuladores")
+// ---------------------------------------------------------------------------
+//
+// Esta TV pode compartilhar a flash do Fruit Jam com o fork fruitjam-retro-tv
+// do pico-bootLoader (GPLv3, repositorio separado): ele fica residente nos
+// 512 KB iniciais (0x10000000) e reserva 4 MB no topo (0x10C00000) para uma
+// copia desta TV, gravada com o env "fruitjam-launcher" -- ver
+// platformio.ini e boards/fruitjam_launcher_memmap.ld. A build "fruitjam"
+// (env padrao, standalone em 0x10000000) nao tem lancador por baixo: nao ha
+// para onde voltar depois de abrir um emulador, entao o item so explica.
+//
+// Protocolo com o lancador, REIMPLEMENTADO aqui (nao copiado -- o codigo do
+// lancador fica no repositorio dele; isto e so a interface numerica que ele
+// ja publica para qualquer app que rode sob ele, o mesmo par de watchdog
+// scratch registers que um emulador usa para "voltar ao menu"):
+//   escrever 0xB007BACE no scratch[7] do watchdog e reiniciar por
+//   watchdog_reboot() (aqui, rp2040.reboot(), que e' exatamente isso -- ver
+//   RP2040Support.h) faz o lancador, no boot seguinte, mostrar o picker de
+//   emuladores em vez de retomar a regiao que estava ativa antes. E o MESMO
+//   caminho que um emulador usa para devolver o controle ao menu: o
+//   lancador nao precisa saber quem pediu.
+//
+// O que NAO esta implementado: pedir um emulador especifico direto (o
+// lancador so mostra o menu; escolher o emulador ainda e manual, com os
+// tres botoes, na tela dele). O enunciado desta tarefa deixava isso como
+// "ou" opcional -- ver PORTING.md para o raciocinio.
+#ifdef FRUITJAM_LAUNCHER_BUILD
+static constexpr int LOADER_RETURN_SCRATCH = 7;
+static constexpr uint32_t LOADER_RETURN_MAGIC = 0xB007BACEu;
+#endif
+
+void drawEmulatorsInfo() {
+  // So a build standalone chega aqui (ver enterEmulators()). Mesma
+  // diagramacao das outras telas de aviso (ex.: drawPhotos() sem fotos):
+  // cabecalho + corpo em ASCII dentro da area segura.
+  GfxTarget *d = &tv;
+  d->fillScreen(TFT_NAVY);
+  d->setTextDatum(top_left);
+  d->setTextSize(2);
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->drawString(PTBR::EMULADORES, SAFE_L, HEAD_Y);
+  d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  d->setTextSize(1);
+  d->setTextColor(RCA_ACCENT, TFT_NAVY);
+  d->drawString(PTBR::EMULADORES_PRECISA_LANCADOR, SAFE_L + 6, BODY_Y + 20);
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->drawString(PTBR::EMULADORES_EXPLICACAO_1, SAFE_L + 6, BODY_Y + 44);
+  d->drawString(PTBR::EMULADORES_EXPLICACAO_2, SAFE_L + 6, BODY_Y + 60);
+  d->drawString(PTBR::EMULADORES_EXPLICACAO_3, SAFE_L + 6, BODY_Y + 76);
+  d->drawString(PTBR::EMULADORES_EXPLICACAO_4, SAFE_L + 6, BODY_Y + 92);
+  drawControllerLabels(PTBR::VOLTAR, "", "");
+}
+
+// Entra em EMULADORES a partir do menu inicial. As duas builds tratam a
+// mesma UiState de formas completamente diferentes -- ver o comentario
+// grande acima.
+void enterEmulators() {
+  state = EMULATORS;
+#ifndef FRUITJAM_LAUNCHER_BUILD
+  drawEmulatorsInfo();
+#else
+  dualText(PTBR::EMULADORES_ABRINDO_MENU);
+  // Mesma ordem de requestPowerOff() (AGENTS.md, armadilha 3): radio/tom/
+  // musica do Weather primeiro, sao eles que seguram audioIdle. so depois
+  // esperar o decode e desligar rede/portal/audio -- nada disso pode
+  // continuar disputando o cartao ou a I2S depois que o lancador reescrever
+  // a flash de um emulador.
+  if (radioActive.load())
+    stopRadio();
+  toneActive = false;
+  weatherAudio = false;
+  playing = false;
+  paused = true;
+  waitVideoDecodeIdle();
+  if (portal.active())
+    portal.stop();
+  network.disconnect();
+  audioout::setRoute(audioout::Route::MUTED);
+  audioout::flushSilence();
+  Serial.println("[M5RETRO] EMULADORES: pedindo o menu do lancador e reiniciando");
+  Serial.flush();
+  delay(150); // deixa a mensagem aparecer e o audioTask ver o mudo, como o DESLIGAR
+  watchdog_hw->scratch[LOADER_RETURN_SCRATCH] = LOADER_RETURN_MAGIC;
+  rp2040.reboot(); // watchdog_reboot(0,0,10) por baixo -- nao volta
+#endif
+}
+
 void drawInfo() {
   // Página 0: hardware; página 1: rede. Datum top_left e uma linha por item,
   // com o valor cortado em 26 caracteres: da coluna de valores (x = 140) até a
@@ -3832,6 +3926,8 @@ void handleNavigation(NavAction a) {
         enterTestPattern();
       else if (state == RADIO)
         enterRadio();
+      else if (state == EMULATORS)
+        enterEmulators();
       else
         drawInfo();
       return;
@@ -4082,6 +4178,16 @@ void handleNavigation(NavAction a) {
     } else if (a == NavAction::LEFT || a == NavAction::RIGHT || a == NavAction::SELECT) {
       infoPage = 1 - infoPage;
       drawInfo();
+    }
+    return;
+  }
+  if (state == EMULATORS) {
+    // So alcancavel aqui na build standalone: a fruitjam-launcher ja
+    // reiniciou a placa dentro de enterEmulators(), antes de devolver o
+    // controle para este loop.
+    if (a != NavAction::NONE) {
+      state = HOME;
+      drawHome();
     }
     return;
   }
@@ -4406,6 +4512,12 @@ void serviceDiagnostics() {
     } else if (command == "diag weather") {
       stopProgram();
       startWeather();
+    } else if (command == "diag emulators") {
+      // Na build fruitjam-launcher isto reinicia a placa de verdade (ver
+      // enterEmulators()) -- util para testar o protocolo com o lancador
+      // sem precisar navegar ate o item EMULADORES pelos tres botoes.
+      stopProgram();
+      enterEmulators();
     } else if (command == "diag music") {
       stopProgram(); // já encerra a música do Weather Channel, se estiver ativa
       musicDir = MUSIC_ROOT;
@@ -4570,9 +4682,11 @@ static void redrawCurrentScreen() {
   case PHOTO_SHOW: drawPhotos(); break;
   case RADIO: drawRadioScreen(true); break;
   case TEST_PATTERN: drawTestPattern(); break;
+  case EMULATORS: drawEmulatorsInfo(); break;
   // WEATHER repinta sozinha no proprio ritmo; VIDEO_PLAYBACK e TEST_PATTERN
   // nunca chegam aqui porque o gerente nao escala nelas. SETUP_PORTAL e
-  // ERROR_SCREEN sao transitorias.
+  // ERROR_SCREEN sao transitorias. Na build fruitjam-launcher, EMULATORS
+  // reinicia a placa antes que o gerente anti-queima tenha chance de repintar.
   default: break;
   }
 }

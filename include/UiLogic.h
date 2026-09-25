@@ -16,20 +16,23 @@ enum UiState {
   PHOTO_SHOW,
   RADIO,
   TEST_PATTERN,
+  EMULATORS,
   ERROR_SCREEN
 };
 
 // Itens do menu inicial, em duas colunas. Uma constante so para desenho,
 // navegacao e toque: ja houve divergencia entre os tres e o resultado foi o
 // ultimo item ficar inalcancavel.
-constexpr int HOME_ITEM_COUNT = 11;
-constexpr int HOME_ROWS = 6; // 6 na coluna da esquerda, 5 na direita
+constexpr int HOME_ITEM_COUNT = 12;
+constexpr int HOME_ROWS = 6; // 6 na coluna da esquerda, 6 na direita
 inline UiState homeTarget(int selection) {
   // A ultima posicao (DESLIGAR) nao tem tela: quem navega trata antes de
-  // chamar isto, e cair aqui devolve HOME.
+  // chamar isto, e cair aqui devolve HOME. EMULADORES (penultima posicao) e
+  // a mesma UiState nas duas builds (standalone e fruitjam-launcher); quem
+  // muda de comportamento entre elas e enterEmulators(), em main.cpp.
   const UiState targets[] = {VIDEO_LIBRARY, MUSIC_BROWSER,  PHOTO_SHOW,    RADIO,
                              WEATHER,       AIRCRAFT_RADAR, TEST_PATTERN,  FILE_TRANSFER,
-                             SETTINGS,      SYSTEM_INFO};
+                             SETTINGS,      SYSTEM_INFO,    EMULATORS};
   const int n = (int)(sizeof(targets) / sizeof(targets[0]));
   return selection >= 0 && selection < n ? targets[selection] : HOME;
 }

@@ -19,6 +19,7 @@ constexpr const char *INFO_SISTEMA = "SISTEMA";
 constexpr const char *WEATHER = "TEMPO";
 constexpr const char *MUSICA = "MUSICA";
 constexpr const char *DESLIGAR = "DESLIGAR";
+constexpr const char *EMULADORES = "EMULADORES";
 constexpr const char *TRANSFERENCIA = "TRANSFERIR ARQUIVOS";
 constexpr const char *SEM_MUSICAS = "SEM MUSICAS NO CARTAO";
 constexpr const char *ANTERIOR = "ANTERIOR";
@@ -84,4 +85,13 @@ constexpr const char *SEM_FOTOS = "SEM FOTOS NO CARTAO";
 constexpr const char *NO_AR = "NO AR";
 constexpr const char *CONECTANDO = "CONECTANDO";
 constexpr const char *SEM_SINAL = "SEM SINAL";
+// Tela EMULADORES (PORTING.md, secao "Emuladores"). No build standalone
+// (env "fruitjam") ela so explica; no build do lancador (env
+// "fruitjam-launcher") o SELECT desta tela realmente reinicia a placa.
+constexpr const char *EMULADORES_PRECISA_LANCADOR = "EXIGE O LANCADOR PICO-BOOTLOADER";
+constexpr const char *EMULADORES_EXPLICACAO_1 = "Esta imagem foi gravada sozinha em 0x10000000";
+constexpr const char *EMULADORES_EXPLICACAO_2 = "e nao tem para onde voltar depois de um";
+constexpr const char *EMULADORES_EXPLICACAO_3 = "emulador. Grave o UF2 do lancador uma vez e";
+constexpr const char *EMULADORES_EXPLICACAO_4 = "depois o UF2 \"fruitjam-launcher\" desta TV.";
+constexpr const char *EMULADORES_ABRINDO_MENU = "ABRINDO O MENU DE EMULADORES...";
 } // namespace PTBR

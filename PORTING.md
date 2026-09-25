@@ -192,3 +192,148 @@ e com o mínimo.
 
 O `schematik-project.json` é ressincronizado **uma vez, no fim**, por quem
 integra. Não rode `tools/sync_schematik.py` numa parte.
+
+---
+
+## 6. Emuladores
+
+O dono quer emuladores (Genesis, Master System/Game Gear, SNES, Apple IIe,
+Macintosh) no mesmo Fruit Jam que a TV. A solução é um **lançador residente**
+que mora nos primeiros 512 KB da flash (0x10000000 — é o que o bootrom do
+RP2350 sempre executa primeiro) e decide, a cada boot, para onde saltar: a TV,
+o menu de emuladores, ou de volta para o que já estava rodando.
+
+O lançador é um **fork separado** de [fhoedemakers/pico-bootLoader](https://github.com/fhoedemakers/pico-bootLoader), GPLv3, em repositório
+próprio (`eliel9012/pico-bootloader`, branch `fruitjam-retro-tv`). **Nada do
+código dele foi copiado para cá** — o que segue é só a interface numérica
+(dois watchdog scratch registers) que ele já publica para qualquer app que
+rode sob ele; essa interface foi **reimplementada** neste repositório a partir
+do zero, com comentários próprios.
+
+### 6.1 Mapa de flash (Fruit Jam, 16 MB)
+
+```
+0x10000000  +-----------------------------+  <- bootrom sempre boota isto
+            |   pico-bootLoader (fork)    |     512 KB, nunca apagado
+            |                             |     pelo caminho de gravar
+0x10080000  +-----------------------------+     um emulador.
+            |   Partição de app           |
+            |   (emuladores) — 11,5 MB    |
+0x10C00000  +-----------------------------+  <- esta TV, env "fruitjam-launcher"
+            |   Fruit Jam retro-TV        |     4 MB, nunca apagados pelo
+            |                             |     caminho de gravar um emulador
+0x11000000  +-----------------------------+
+```
+
+A reserva dos 4 MB é feita **inteiramente do lado do lançador**
+(`CMakeLists.txt` dele, que reduz `FRENS_APP_SIZE` só para `HW_CONFIG==8`;
+todo outro board continua com a partição de app original de 15,5 MB). Este
+repositório não precisa saber desse número em tempo de build além do que já
+está no seu próprio linker script (`boards/fruitjam_launcher_memmap.ld`) —
+mas se algum dia a reserva mudar de tamanho, os dois lados têm de mudar juntos
+(a TV nunca deve ultrapassar o que o lançador reservou, ou a próxima gravação
+de um emulador corromperia o firmware da TV).
+
+### 6.2 Dois builds, um firmware
+
+| Env | Origem da flash | Quando usar |
+|---|---|---|
+| `fruitjam` (padrão) | `0x10000000` | Sem lançador. `pio run --target upload` grava e roda sozinho, como hoje. |
+| `fruitjam-launcher` | `0x10C00000` | Com o lançador já gravado. `board_build.ldscript` aponta para `boards/fruitjam_launcher_memmap.ld` (uma cópia estática de `lib/rp2350/memmap_default.ld` do arduino-pico com `ORIGIN` trocado — ver comentário no topo do arquivo para o porquê de não dar para usar `board_build.*` para isso). |
+
+O código-fonte é o mesmo nos dois; a diferença de comportamento (item
+EMULADORES real vs. só explicativo) é `#ifdef FRUITJAM_LAUNCHER_BUILD`
+(`-DFRUITJAM_LAUNCHER_BUILD`, só no env do lançador) em `src/main.cpp`, perto
+de `enterEmulators()`.
+
+Como o lançador salta por VTOR (desliga IRQs, aponta `SCB->VTOR` e pula para o
+reset vector — nunca passa pelo bootrom do RP2350), a imagem da TV **não
+precisa de um `IMAGE_DEF`/bloco de boot válido para o RP2350** nessa região; só
+precisa que o `.uf2` grave nos endereços certos, o que o `ORIGIN` do linker
+script já garante. `picotool uf2 convert -t elf` (usado pelo
+`platform-raspberrypi`) lê os endereços do ELF, não valida metadado de boot —
+grave o `.uf2` do env `fruitjam-launcher` do mesmo jeito que qualquer outro,
+por BOOTSEL/drag-and-drop.
+
+Esta TV **não usa** `EEPROM.h` nem `LittleFS` (configurações ficam no cartão
+SD, ver `SecretsManager.cpp`), então os símbolos `_FS_start`/`_FS_end`/
+`_EEPROM_start` do linker script do lançador ficam inertes, apontando para o
+fim da região — não há filesystem interno para reservar espaço.
+
+### 6.3 Protocolo TV ↔ lançador
+
+Dois registradores scratch do watchdog (sobrevivem a qualquer reset que não
+seja desligar e ligar a placa de verdade — POR; um `watchdog_reboot()` ou o
+botão RUN não os apagam):
+
+| Registrador | Quem escreve | Significado |
+|---|---|---|
+| `scratch[6] = 0xB007ED01` | lançador, antes de saltar para **qualquer** região (TV ou emulador) | "você foi lançado por mim" |
+| `scratch[7] = 0xB007BACE` | quem quer voltar ao menu (um emulador retornando, OU esta TV pedindo o menu) | "mostre o menu de emuladores no próximo boot" |
+
+`enterEmulators()` (`src/main.cpp`) escreve `scratch[7]` e chama
+`rp2040.reboot()` (que por baixo é `watchdog_reboot(0, 0, 10)` — ver
+`RP2040Support.h`). É **exatamente** o mesmo par que um emulador escreve para
+"voltar ao menu": o lançador não precisa saber quem pediu, então nenhuma
+mudança foi necessária do lado dele além de saber saltar para esta região.
+
+Antes de reiniciar, `enterEmulators()` encerra tudo que disputa áudio/cartão/
+rede, na mesma ordem de `requestPowerOff()` (rádio/tom/música do Weather
+primeiro — AGENTS.md, armadilha 3 do repositório principal: eles seguram
+`audioIdle`), espera o decode de vídeo (`waitVideoDecodeIdle()`), derruba o
+portal e a rede, e muda a rota de áudio para mudo antes do reboot.
+
+**O que não foi implementado:** pedir um emulador específico direto (só o
+menu de emuladores). O lançador sabe, em tese, flashar e saltar direto para um
+emulador escolhido por um arquivo no cartão (`/emu/launch.txt` foi cogitado),
+mas isso exigiria integrar com a lógica de flash/seleção do lançador
+(`g_emus[]`, `flashAndLaunch()`) de um jeito que não dava para validar sem uma
+placa — ficou como próximo passo. Hoje EMULADORES sempre abre o menu; escolher
+o emulador é manual, com os três botões, na tela do lançador.
+
+**Voltar da tela de emuladores para a TV**: o menu do lançador (SELECT →
+"Return to TV") ou um reset normal da placa voltam para a TV — o lançador, num
+boot a frio, salta direto para ela em vez de mostrar o menu (é assim que ele
+decide "reset normal = TV, não picker"). Ver o repositório do lançador para
+os detalhes do lado dele.
+
+### 6.4 Instalação
+
+1. Grave o `.uf2` do lançador (`pico-bootLoader_AdafruitFruitJam_arm_piousb.uf2`,
+   compilado do fork `fruitjam-retro-tv`) por BOOTSEL, uma vez.
+2. Grave o `.uf2` desta TV compilado com `pio run -e fruitjam-launcher`
+   (**não** o do env `fruitjam` — aquele espera rodar sozinho em
+   `0x10000000` e seria apagado pelo lançador). O drag-and-drop do BOOTSEL
+   grava nos endereços certos porque o linker script já os embute no `.uf2`.
+3. Copie os `.uf2` de cada emulador para `/emu/8/` no cartão SD (placa 8 =
+   Fruit Jam no lançador). O bundle pronto do PicoPlus para a placa 8 já serve
+   para Genesis, Master System/Game Gear e SNES.
+4. Mac e Apple IIe não vêm no bundle: compile
+   [adafruit/pico-mac](https://github.com/adafruit/pico-mac) e
+   [adafruit/reload-emulator](https://github.com/adafruit/reload-emulator)
+   localmente, como apps do lançador (`-DBUILD_FOR_BOOTLOADER=ON`/`BootPartition.cmake`, que os
+   relinka para `0x10080000` do jeito que o lançador espera). **Não baixe nem
+   grave ROMs de terceiros aqui**: os scripts de build desses dois projetos
+   baixam a ROM sozinhos durante a compilação — compile localmente com a
+   própria ROM, na sua máquina, e copie só o `.uf2` resultante para
+   `/emu/8/`.
+
+### 6.5 O que só a placa responde
+
+Nada disto rodou num Fruit Jam de verdade:
+
+- Se o salto por VTOR do lançador para `0x10C00000` realmente entrega um
+  estado limpo o bastante para o `setup()` do Arduino rodar (o lançador
+  desliga IRQs e SysTick antes de saltar, mas não reinicializa periféricos
+  como o DAC/PSRAM/DVI — o `board::begin()`/`display::begin()` desta TV
+  precisam reconfigurar tudo do zero de qualquer forma, mas isso nunca foi
+  testado depois de um salto por VTOR em vez de um boot normal).
+- Se `board_build.ldscript` de fato aponta o link para
+  `boards/fruitjam_launcher_memmap.ld` neste `platform-raspberrypi` (a lógica
+  foi conferida lendo o código-fonte do gerador de linker script do
+  arduino-pico, não compilando — ver riscos no relatório da sessão).
+- O protocolo de scratch registers em si: nunca houve um lançador rodando de
+  verdade para escrever `scratch[6]` antes de saltar, nem para ler
+  `scratch[7]` depois do reboot desta TV.
+- Se 4 MB é suficiente para esta TV (o firmware atual, no env `fruitjam`
+  padrão em 16 MB de flash, nunca foi medido de perto do limite).

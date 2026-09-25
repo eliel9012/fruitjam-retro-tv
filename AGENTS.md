@@ -387,14 +387,17 @@ BOOT → HOME → { VIDEO_LIBRARY → VIDEO_PLAYBACK
                 TEST_PATTERN
                 FILE_TRANSFER
                 SETTINGS → SETUP_PORTAL
-                SYSTEM_INFO }
+                SYSTEM_INFO
+                EMULATORS }
               ERROR_SCREEN (de qualquer lugar)
 ```
 
-O menu inicial tem 11 itens em **duas colunas** de 6 e 5. A ordem dos rótulos em
-`drawHome()` e o destino em `homeTarget()` têm de andar juntos; um
-`static_assert` prende a lista ao `HOME_ITEM_COUNT`. (No upstream havia um
-terceiro, `homeHit()`, a grade de toque; sem touch ele não tem mais chamador.)
+O menu inicial tem 12 itens em **duas colunas** de 6 e 6 (EMULADORES, entre
+SISTEMA e DESLIGAR, é deste fork Fruit Jam — ver PORTING.md, seção
+"Emuladores"). A ordem dos rótulos em `drawHome()` e o destino em
+`homeTarget()` têm de andar juntos; um `static_assert` prende a lista ao
+`HOME_ITEM_COUNT`. (No upstream havia um terceiro, `homeHit()`, a grade de
+toque; sem touch ele não tem mais chamador.)
 
 O enum está em `include/UiLogic.h`. O `loop()` despacha por `state`.
 
@@ -553,9 +556,14 @@ diag bench         mede leitura do cartão, decode e blit em microssegundos
 diag time          origem e valor da hora do sistema
 diag radio         estado do rádio pela internet
 diag play/pause/resume/stop/home/back/next/previous/select/left/right
-diag radar/weather/music
+diag radar/weather/music/emulators
 diag audio toggle|tv|internal|mute
 ```
+
+`diag emulators` chama `enterEmulators()` direto (mesmo caminho do item
+EMULADORES do menu inicial). No build `fruitjam-launcher` isso reinicia a
+placa de verdade -- é o jeito mais rápido de testar o protocolo com o
+lançador sem navegar até lá pelos três botões.
 
 A lista exata é a do tratador serial em `src/main.cpp`; esta aqui é o que veio do
 upstream menos o que dependia do LCD (`diag backlight`).
