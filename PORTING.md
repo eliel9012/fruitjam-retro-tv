@@ -318,9 +318,18 @@ os detalhes do lado dele.
    própria ROM, na sua máquina, e copie só o `.uf2` resultante para
    `/emu/8/`.
 
-### 6.5 O que só a placa responde
+### 6.5 O que já foi conferido, e o que só a placa responde
 
-Nada disto rodou num Fruit Jam de verdade:
+Conferido nesta sessão, sem placa: os dois envs (`fruitjam` e
+`fruitjam-launcher`) compilam e linkam de ponta a ponta com o PlatformIO
+local; `readelf -l` no ELF do `fruitjam-launcher` mostra o segmento de
+código carregado em `0x10c00000` e o entry point em `0x10c03139` (bit Thumb
+setado), batendo com `TV_BASE_ADDR` do lançador; `picotool info` no `.uf2`
+final mostra a família `rp2350-arm-s` correta (só depois do
+`tools/pio_fruitjam_launcher_uf2.py` — sem ele o `picotool uf2 convert`
+padrão do `platform-raspberrypi` recusa o segmento de RAM, ver o próprio
+arquivo para o porquê). `./tests/run.sh` e o simulador (`rca_1_INICIO.png`)
+conferem a UI nova. Nada disso é o mesmo que rodar num Fruit Jam de verdade:
 
 - Se o salto por VTOR do lançador para `0x10C00000` realmente entrega um
   estado limpo o bastante para o `setup()` do Arduino rodar (o lançador
@@ -328,12 +337,23 @@ Nada disto rodou num Fruit Jam de verdade:
   como o DAC/PSRAM/DVI — o `board::begin()`/`display::begin()` desta TV
   precisam reconfigurar tudo do zero de qualquer forma, mas isso nunca foi
   testado depois de um salto por VTOR em vez de um boot normal).
-- Se `board_build.ldscript` de fato aponta o link para
-  `boards/fruitjam_launcher_memmap.ld` neste `platform-raspberrypi` (a lógica
-  foi conferida lendo o código-fonte do gerador de linker script do
-  arduino-pico, não compilando — ver riscos no relatório da sessão).
 - O protocolo de scratch registers em si: nunca houve um lançador rodando de
   verdade para escrever `scratch[6]` antes de saltar, nem para ler
   `scratch[7]` depois do reboot desta TV.
 - Se 4 MB é suficiente para esta TV (o firmware atual, no env `fruitjam`
-  padrão em 16 MB de flash, nunca foi medido de perto do limite).
+  padrão em 16 MB de flash, nunca foi medido de perto do limite; o uso
+  observado no build local, ~400 KB de flash, sugere folga grande, mas isso
+  não conta bibliotecas carregadas condicionalmente nem crescimento futuro).
+- Se o BOOTSEL do RP2350 de fato aceita gravar um `.uf2` cujos blocos miram
+  `0x10C00000` (a família `rp2350-arm-s` está correta no arquivo, mas
+  ninguém testou o drag-and-drop numa placa real).
+- **Mac e Apple IIe como apps do lançador**: não foi possível compilar
+  `adafruit/pico-mac` nem `adafruit/reload-emulator` nesta sessão. O
+  `fetch-rom-dsk.sh` do `pico-mac` baixa a ROM de `archive.org`, e o proxy
+  de rede desta sessão recusou a conexão (HTTP 403) — o que, por acaso,
+  é exatamente o comportamento certo dado que este repositório não deveria
+  baixar ROMs de qualquer forma. A receita de integração (seção 6.4, item 4,
+  copiada do próprio README do lançador) não foi validada compilando; só a
+  leitura do `CMakeLists.txt` de cada projeto (que não tem `BUILD_FOR_BOOTLOADER`
+  nativo — precisa ser adicionado à mão, como o README do lançador descreve
+  para qualquer app RP2350 genérico).
