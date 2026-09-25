@@ -24,8 +24,8 @@ Os números que sustentam isso:
 | custo do MPEG-1 por quadro (decode + conversão) | típico **13% mais barato** que o MJPEG, mas **11,5% dos quadros custam mais que o pior MJPEG** e o pior custa **2,9×** | emulado, §3 |
 | vídeo a 30 fps ocupa do cartão | MJPEG q5: **~0,3 MB/s**; o SDIO de 4 bits entrega **15–27 MB/s** | medido no PC / publicado (arduino-pico) |
 
-E há folga sobrando: durante o vídeo o `loop()`, o áudio e a interrupção do DVI
-dividem o **núcleo 0**, e o **núcleo 1 fica ocioso** (§6). Levar o decode para lá
+E há folga sobrando: durante o vídeo o `loop()` e a interrupção do DVI dividem o
+**núcleo 0**, e o **núcleo 1 fica quase ocioso** — só o áudio, ~1% (§6). Levar o decode para lá
 é o primeiro passo; dividir cada quadro entre os dois núcleos é o segundo (§7).
 
 O MPEG-1 só compensa em **espaço no cartão** (mesma qualidade com ~3,5× menos
@@ -315,16 +315,17 @@ Orçamento de um quadro a 30 fps: **33,3 ms**.
 | blit | 7,5–12,3 ms | ~0: o `jpegDraw` entrega cada bloco ao `pushImage` do LovyanGFX, que só troca os bytes (RGB565 → RGB565 invertido). **Estimativa:** 2–4 ciclos/px, ~1 ms. Não emulado. |
 | filtro VHS (`vhsFilter.pushBlock`) | dentro do blit | não medido; desligado custa o mesmo `pushImage`; ligado soma o borrão de croma por bloco |
 
-**E o núcleo que decodifica não está livre.** No arduino-pico com FreeRTOS o
-`loop()` roda na tarefa `CORE0`, presa ao **núcleo 0**
-(`cores/rp2040/freertos/freertos-main.cpp:149-150`), com prioridade 4 de 8. No
-mesmo núcleo 0 estão a interrupção de linha do DVI (`PORTING.md` §2.1) e a
-tarefa de áudio `RCA_PCM`, também com prioridade 4 (`src/main.cpp`, criação da
-tarefa em `setup()`). O **núcleo 1 fica ocioso durante o vídeo** — lá só rodam as
-tarefas de rede do radar e da previsão, que nem existem enquanto o filme toca.
+**E o núcleo que decodifica não está livre.** O `setup()`/`loop()` do firmware
+roda na tarefa `APP` (16 KB de pilha), presa ao **núcleo 0** (`src/main.cpp`, fim
+do arquivo — a `CORE0` do arduino-pico, com 4 KB fixos, só dorme). No mesmo
+núcleo 0 está a interrupção de linha do DVI (`PORTING.md` §2.1). A tarefa de
+áudio `RCA_PCM` (prioridade 4) fica no **núcleo 1**, junto das tarefas de rede do
+radar, da previsão e do rádio — que nem existem enquanto o filme toca. O áudio
+PCM custa ~1% de um núcleo, então o **núcleo 1 fica praticamente ocioso durante
+o vídeo**.
 
 Conclusão: **o decode é o gargalo e fica no limite dos 30 fps mesmo com um núcleo
-inteiro**; dividindo o núcleo 0 com o DVI e o áudio, fica abaixo. A 24 ou 25 fps
+inteiro**; dividindo o núcleo 0 com a interrupção do DVI, fica abaixo. A 24 ou 25 fps
 (a maioria dos filmes) deve caber; a 30 fps com q5, não no pior quadro. O cartão
 e o áudio não pesam. Trocar de codec não resolve: o único mais rápido (Cinepak)
 perde em qualidade e quebra o OSD, e os mais compactos (MPEG-1, H.264) custam o
@@ -388,7 +389,8 @@ Mudanças:
 - **`vhsFilter`** (`include/VhsFx.h`): o `beginFrame()` sorteia o quadro inteiro
   antes; o `pushBlock()` precisa ser seguro com dois chamadores simultâneos em
   linhas disjuntas (contadores como `pushes_` e o borrão de croma — conferir).
-- A tarefa de decode do núcleo 0 fica com prioridade **abaixo** da do áudio.
+- A tarefa de decode que for para o núcleo 1 fica com prioridade **abaixo** da do
+  áudio, que mora lá.
 - Pastas antigas (`split` ausente) continuam tocando no caminho de um núcleo.
 
 ### 7.4 Ajustes baratos, independentes
@@ -426,8 +428,8 @@ Mudanças:
   leitura com algum cartão, o conserto é passar `clkDiv` > 1 no `SdioConfig`
   (o `SDFSConfig` do arduino-pico não expõe; seria preciso montar o SdFat direto).
   A 26 MHz ainda sobram ~13 MB/s, 40× o que o vídeo pede.
-- **Decode em dois núcleos**: o núcleo 0 já tem DVI e áudio. Se a tarefa de decode
-  atrasar a de áudio, volta o arrasto que o rádio já teve. Medir `audioUnderruns`.
+- **Decode em dois núcleos**: o núcleo 0 já tem o DVI e o núcleo 1 tem o áudio.
+  Se a tarefa de decode atrasar a de áudio, volta o arrasto que o rádio já teve. Medir `audioUnderruns`.
 - **Rasgo**: o framebuffer é único (`fj/Display.cpp`). Decodificar mais rápido
   não muda o rasgo; esperar o `waitVsync()` antes de decodificar muda, mas custa
   latência.
