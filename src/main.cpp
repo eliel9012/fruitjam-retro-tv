@@ -3738,12 +3738,13 @@ void enterEmulators() {
 #ifndef FRUITJAM_LAUNCHER_BUILD
   drawEmulatorsInfo();
 #else
-  dualText(PTBR::EMULADORES_ABRINDO_MENU);
   // Mesma ordem de requestPowerOff() (AGENTS.md, armadilha 3): radio/tom/
-  // musica do Weather primeiro, sao eles que seguram audioIdle. so depois
-  // esperar o decode e desligar rede/portal/audio -- nada disso pode
-  // continuar disputando o cartao ou a I2S depois que o lancador reescrever
-  // a flash de um emulador.
+  // musica do Weather primeiro, sao eles que seguram audioIdle. So depois
+  // esperar o decode -- ANTES do dualText abaixo, que nao pode dividir a
+  // tela com um quadro decodificando por baixo (mesmo raciocinio de
+  // requestPowerOff()) -- e so entao desligar rede/portal/audio: nada disso
+  // pode continuar disputando o cartao ou a I2S depois que o lancador
+  // reescrever a flash de um emulador.
   if (radioActive.load())
     stopRadio();
   toneActive = false;
@@ -3751,6 +3752,7 @@ void enterEmulators() {
   playing = false;
   paused = true;
   waitVideoDecodeIdle();
+  dualText(PTBR::EMULADORES_ABRINDO_MENU);
   if (portal.active())
     portal.stop();
   network.disconnect();
