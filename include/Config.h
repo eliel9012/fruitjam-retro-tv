@@ -21,4 +21,8 @@ constexpr uint16_t CRT_W = 320, CRT_H = 240, VIDEO_W = 320, VIDEO_H = 240;
 constexpr size_t MAX_JPEG = 128 * 1024, AUDIO_CHUNK = 1024;
 constexpr uint32_t AUDIO_RATE = 22050;
 constexpr char VERSION[] = "FRUIT JAM RETRO TV v0.1";
+constexpr char VERSION_SHORT[] = "v0.1";
+// Nome do dono na abertura (include/BootSplash.h). ASCII; a abertura converte
+// para maiúsculas e corta no que cabe.
+constexpr char OWNER[] = "ELIEL";
 } // namespace cfg
