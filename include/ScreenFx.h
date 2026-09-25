@@ -96,7 +96,7 @@
 //  igual no painel CVBS do aparelho e no painel SDL do simulador.
 // ============================================================================
 
-#include <M5GFX.h>
+#include "fj/Gfx.h"
 #include <stdint.h>
 
 namespace crt {

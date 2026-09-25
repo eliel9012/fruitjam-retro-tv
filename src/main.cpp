@@ -8,9 +8,13 @@
 #include "libhelix-mp3/mp3dec.h"
 #include "SafeStorage.h"
 #include "NetworkManager.h"
-#include <M5Unified.h>
-#include <M5GFX.h>
-#include <M5ModuleRCA.h>
+#include "fj/Platform.h"
+#include "fj/Gfx.h"
+#include "fj/Board.h"
+#include "fj/Display.h"
+#include "fj/AudioOut.h"
+#include "fj/Net.h"
+#include "fj/Storage.h"
 
 #include "SafeArea.h"
 #include "RtcClock.h"
@@ -29,16 +33,9 @@
 #include "FileTransfer.h"
 #include "TransferScreen.h"
 #include <SD.h>
-#include <SPI.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <WiFiNINA.h>
 #include <ArduinoJson.h>
 #include <JPEGDEC.h>
-#include <driver/i2s.h>
-#include <esp_heap_caps.h>
-#include <esp_timer.h>
-#include <mbedtls/platform.h>
 #include "InputManager.h"
 #include "LocalizationPTBR.h"
 #include "SecretsManager.h"
@@ -142,16 +139,8 @@ static bool mp3Begin(const String &path);
 static void mp3End();
 static size_t mp3ReadPcm(int16_t *dst, size_t samples);
 
-static constexpr uint8_t CVBS_PIN = 26;
-static constexpr uint8_t RCA_BCK = 19;
-static constexpr uint8_t RCA_DATA = 2;
-static constexpr uint8_t RCA_LRCK = 0;
-// Core2 microSD slot is on the display's VSPI bus. GPIO38 is its MISO;
-// GPIO19 is intentionally unavailable because the stacked RCA module uses it for PCM BCK.
-static constexpr uint8_t SD_CS = 4;
-static constexpr uint8_t SD_SCK = 18;
-static constexpr uint8_t SD_MISO = 38;
-static constexpr uint8_t SD_MOSI = 23;
+// Pinos: ver include/fj/Board.h. Vídeo, áudio, cartão e rádio têm barramentos
+// próprios no Fruit Jam; nenhuma das disputas de pino do Core2 existe aqui.
 static constexpr size_t MAX_JPEG = 128 * 1024;
 static constexpr size_t AUDIO_CHUNK = 1024;
 // Geometria da saída composta: quadro, área segura do tubo e faixas padrão.
@@ -219,13 +208,8 @@ const char *CACHE_FILE = "/M5RETRO/cache/aircraft.json";
 const char *MUSIC_ROOT = "/M5RETRO/music";
 const char *PHOTOS = "/M5RETRO/fotos";
 
-// NTSC (525/59,94 Hz, preto em 7,5 IRE). O modo PAL_M do M5GFX monta a linha
-// com 908 amostras, mas 4x3,57561149 MHz x 63,5556 us dá 909,02 — a linha sai
-// ~0,11% curta e a fase da burst anda a cada linha, o que produz a faixa de cor
-// diagonal que caminha pela tela. A tabela NTSC usa 910 amostras, que é o valor
-// exato para 4x3,579545 MHz, então a burst fica estável.
-M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::NTSC,
-                M5ModuleRCA::use_psram_t::psram_half_use, CVBS_PIN, 200);
+// O canvas da TV (`tv`) mora em fj/Display.cpp: é um LGFX_Sprite apontado para
+// o framebuffer do DVI. No firmware original era o M5ModuleRCA do CVBS.
 JPEGDEC jpeg;
 playback::MjpegReader mjpegReader;
 bool videoReadError = false;
@@ -437,7 +421,7 @@ void dualText(const String &line1, const String &line2 = "") {
   // ~40 chars na fonte Courier, 320px), evitando texto vazando do LCD/RCA.
   const String l1 = line1.length() > 17 ? line1.substring(0, 17) : line1;
   const String l2 = line2.length() > 44 ? line2.substring(0, 41) + "..." : line2;
-  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(middle_center);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
@@ -583,12 +567,12 @@ bool applyColorDepth() {
   // mas erraria em qualquer variante. Mascara sempre.
   const uint16_t desejada = settings.color16 ? 16 : 8;
   const uint16_t atual =
-      (uint16_t)(rca.getColorDepth() & lgfx::v1::color_depth_t::bit_mask);
+      (uint16_t)(tv.getColorDepth() & lgfx::v1::color_depth_t::bit_mask);
   if (atual == desejada)
     return true;
-  rca.setColorDepth(settings.color16 ? lgfx::v1::color_depth_t::rgb565_2Byte
+  tv.setColorDepth(settings.color16 ? lgfx::v1::color_depth_t::rgb565_2Byte
                                      : lgfx::v1::color_depth_t::rgb332_1Byte);
-  return (uint16_t)(rca.getColorDepth() & lgfx::v1::color_depth_t::bit_mask) == desejada;
+  return (uint16_t)(tv.getColorDepth() & lgfx::v1::color_depth_t::bit_mask) == desejada;
 }
 
 void saveSettings() {
@@ -607,12 +591,12 @@ void drawSetupPortal() {
   String line2 = portal.active() ? "WI-FI: " + portal.apSsid() : "INICIANDO...";
   dualText(line1, line2);
   if (portal.active()) {
-    rca.setTextDatum(top_left);
-    rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    rca.setTextSize(1);
-    rca.drawString("SENHA: " + portal.apPassword(), SAFE_L, 144);
-    rca.drawString("ABRA: 192.168.4.1", SAFE_L, 162);
-    rca.drawString(portal.status() == PortalStatus::CONFIGURANDO ? "CONFIGURACAO ATIVA"
+    tv.setTextDatum(top_left);
+    tv.setTextColor(TFT_WHITE, TFT_NAVY);
+    tv.setTextSize(1);
+    tv.drawString("SENHA: " + portal.apPassword(), SAFE_L, 144);
+    tv.drawString("ABRA: 192.168.4.1", SAFE_L, 162);
+    tv.drawString(portal.status() == PortalStatus::CONFIGURANDO ? "CONFIGURACAO ATIVA"
                                                                  : "AGUARDANDO CELULAR...",
                    SAFE_L, 180);
     M5.Display.fillScreen(TFT_NAVY);
@@ -1020,7 +1004,7 @@ int jpegDraw(JPEGDRAW *draw) {
   const int64_t t0 = benchActive ? esp_timer_get_time() : 0;
   // O filtro de fita fica DENTRO do medicao do bench de proposito: o custo dele
   // e custo de blit, e esconder isso faria o diag bench mentir.
-  vhsFilter.pushBlock(&rca, draw->x + (CRT_W - videoWidth) / 2,
+  vhsFilter.pushBlock(&tv, draw->x + (CRT_W - videoWidth) / 2,
                       draw->y + (CRT_H - videoHeight) / 2, draw->iWidth, draw->iHeight,
                       draw->pPixels);
   if (benchActive) {
@@ -1074,7 +1058,7 @@ bool readAndShowOneFrame(bool render) {
   if (width != videoWidth || height != videoHeight || firstFrame) {
     videoWidth = width;
     videoHeight = height;
-    rca.fillScreen(TFT_BLACK);
+    tv.fillScreen(TFT_BLACK);
   }
   jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
   // Sorteia os artefatos deste quadro antes de decodificar: o pushBlock consulta
@@ -1084,7 +1068,7 @@ bool readAndShowOneFrame(bool render) {
   const bool decoded = jpeg.decode(0, 0, 0);
   jpeg.close();
   if (decoded)
-    vhsFilter.drawOverlay(&rca); // faixa de troca de cabeca e banda de tracking
+    vhsFilter.drawOverlay(&tv); // faixa de troca de cabeca e banda de tracking
   if (!decoded) {
     jpegErrors++;
     videoReadError = true;
@@ -1233,7 +1217,7 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   // já resetou o leitor.
   playback::MjpegReader &reader = mjpegReader;
   reader.reset();
-  rca.fillScreen(TFT_BLACK);
+  tv.fillScreen(TFT_BLACK);
   videoFrameIndex = 0;
 
   uint64_t readUs = 0, decodeUs = 0, totalBytes = 0;
@@ -1411,7 +1395,7 @@ bool startProgram(const String &dir) {
   paused = false;
   state = VIDEO_PLAYBACK;
   setBacklight(true); // LCD visível por padrão, mostrando o pôster + HUD
-  rca.fillScreen(TFT_BLACK);
+  tv.fillScreen(TFT_BLACK);
   osdUntil = millis() + 3000;
   Serial.printf("[M5RETRO] Reproduzindo: %s video:%lu bytes wav:%lu bytes\n", dir.c_str(), mjpegFile.size(),
                 wavDataEnd - wavDataStart);
@@ -1514,7 +1498,7 @@ void videoTick() {
       subtitles.update(srtFile, posMs);
       xSemaphoreGive(sdMutex);
     }
-    subtitles.draw(&rca, 0, 0, posMs);
+    subtitles.draw(&tv, 0, 0, posMs);
   }
   // Ainda atrás do relógio depois de trabalhar: o loop não deve dormir 4 ms.
   videoBehind = playing && videoFrameIndex < target;
@@ -1889,19 +1873,19 @@ static void clearOsdLetterbox() {
   const int vx = (CRT_W - videoWidth) / 2, vy = (CRT_H - videoHeight) / 2;
   const int vr = vx + videoWidth, vb = vy + videoHeight;
   if (vb <= top || vy >= CRT_H) {
-    rca.fillRect(0, top, CRT_W, CRT_H - top, TFT_BLACK);
+    tv.fillRect(0, top, CRT_W, CRT_H - top, TFT_BLACK);
     return;
   }
   const int y0 = max(top, vy);
   if (y0 > top)
-    rca.fillRect(0, top, CRT_W, y0 - top, TFT_BLACK);
+    tv.fillRect(0, top, CRT_W, y0 - top, TFT_BLACK);
   if (vb < CRT_H)
-    rca.fillRect(0, vb, CRT_W, CRT_H - vb, TFT_BLACK);
+    tv.fillRect(0, vb, CRT_W, CRT_H - vb, TFT_BLACK);
   const int h = min(vb, CRT_H) - y0;
   if (vx > 0)
-    rca.fillRect(0, y0, vx, h, TFT_BLACK);
+    tv.fillRect(0, y0, vx, h, TFT_BLACK);
   if (vr < CRT_W)
-    rca.fillRect(vr, y0, CRT_W - vr, h, TFT_BLACK);
+    tv.fillRect(vr, y0, CRT_W - vr, h, TFT_BLACK);
 }
 
 // Redecodifica o quadro atual a partir do jpegBuffer (sem tocar no cartão).
@@ -1968,7 +1952,7 @@ void drawPlaybackOsd() {
   st.buttonLeft = PTBR::ANTERIOR;
   st.buttonCenter = isPaused ? "PLAY" : "PAUSA"; // vocabulário do painel do VCR
   st.buttonRight = PTBR::PROXIMO;
-  vcr::draw(&rca, st);
+  vcr::draw(&tv, st);
 }
 
 void setAudioOutput(AudioOutput output) {
@@ -2040,11 +2024,11 @@ void drawControllerLabels(const char *left, const char *center, const char *righ
   // telas que nada têm a ver com reprodução — e no boot nem aparecia. Durante o
   // playback quem manda é o OSD de videocassete, que tem legendas próprias.
   if (state != VIDEO_PLAYBACK) {
-    rca.fillRect(0, BAR_Y, CRT_W, BAR_H, TFT_NAVY);
-    rca.setTextDatum(middle_center);
-    rca.setTextSize(1);
-    rca.setTextColor(RCA_ACCENT, TFT_NAVY);
-    rca.drawString(String("[ ") + left + " ]  [ " + center + " ]  [ " + right + " ]", CRT_W / 2,
+    tv.fillRect(0, BAR_Y, CRT_W, BAR_H, TFT_NAVY);
+    tv.setTextDatum(middle_center);
+    tv.setTextSize(1);
+    tv.setTextColor(RCA_ACCENT, TFT_NAVY);
+    tv.drawString(String("[ ") + left + " ]  [ " + center + " ]  [ " + right + " ]", CRT_W / 2,
                    BAR_Y + BAR_H / 2);
   }
   drawBackButton();
@@ -2122,7 +2106,7 @@ static void musicScanDir() {
 }
 
 void drawMusicBrowser() {
-  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(top_left);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
@@ -2280,7 +2264,7 @@ void drawMusicNowPlaying() {
   const int pct = totalSec ? (int)((uint64_t)curSec * (SAFE_W - 2) / totalSec) : 0;
   // Nº da faixa corrente na fila (estilo iPod), para exibição.
   String trackNo = (musicQueueIndex >= 0 && musicQueueCount) ? String(musicQueueIndex + 1) + "/" + String(musicQueueCount) : String("");
-  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(top_left);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
@@ -2295,7 +2279,7 @@ void drawMusicNowPlaying() {
     // de botoes comeca em 202 -- nao sobra vao de 48 linhas em canto nenhum.
     // A troca e boa de qualquer forma: quem le o nome da faixa olha o LCD, e o
     // tubo ganha imagem em movimento, que e o que o anti-queima quer.
-    if (d == static_cast<M5GFX *>(&rca) && musicScopeOn) {
+    if (d == static_cast<GfxTarget *>(&tv) && musicScopeOn) {
       audioScope.x = SAFE_L + 8;
       audioScope.y = coverY + 20; // 82..130, centrado na faixa da capa
       audioscope::drawStatic(d, 0, 0, audioScope);
@@ -2617,7 +2601,7 @@ static xfer::State transferState() {
 
 void drawTransferFrame() {
   const xfer::State st = transferState();
-  xfer::draw(&rca, st);
+  xfer::draw(&tv, st);
   xfer::draw(&M5.Display, st);
   lastTransferStage = st.stage;
   drawBackButton();
@@ -2692,7 +2676,7 @@ void transferTick() {
   } else if (agora == xfer::Stage::Receiving && now - lastTransferDraw >= 250) {
     lastTransferDraw = now;
     const xfer::State st = transferState();
-    xfer::drawProgress(&rca, st);
+    xfer::drawProgress(&tv, st);
     xfer::drawProgress(&M5.Display, st);
   }
 }
@@ -2711,7 +2695,7 @@ static void drawHomeClock(bool limpar) {
   } else {
     snprintf(texto, sizeof(texto), "%s", "RELOGIO NAO SINCRONIZADO");
   }
-  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     if (limpar)
       d->fillRect(SAFE_L, CLOCK_Y, SAFE_W, 18, TFT_NAVY);
     d->setFont(&fonts::Font2);
@@ -2751,20 +2735,20 @@ void drawHome() {
     M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
     M5.Display.drawString(String(selected ? ">" : " ") + items[i], x + 4, y);
   }
-  rca.fillScreen(TFT_NAVY);
-  rca.setTextDatum(top_left);
-  rca.setTextSize(2);
-  rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(PTBR::APP, SAFE_L, HEAD_Y);
-  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-  rca.setTextSize(1);
+  tv.fillScreen(TFT_NAVY);
+  tv.setTextDatum(top_left);
+  tv.setTextSize(2);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.drawString(PTBR::APP, SAFE_L, HEAD_Y);
+  tv.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  tv.setTextSize(1);
   for (int i = 0; i < HOME_COUNT; i++) {
     // 6 linhas de 16 px a partir de CLOCK_Y+20 = 70 terminam em 166, com folga
     // ate a barra de legendas em 202.
     const int x = SAFE_L + 4 + homeColumn(i) * HOME_RCA_COL_W;
     const int y = CLOCK_Y + 20 + homeRow(i) * 16;
-    rca.setTextColor(i == homeSelection ? RCA_ACCENT : TFT_WHITE, TFT_NAVY);
-    rca.drawString(String(i == homeSelection ? ">" : " ") + items[i], x, y);
+    tv.setTextColor(i == homeSelection ? RCA_ACCENT : TFT_WHITE, TFT_NAVY);
+    tv.drawString(String(i == homeSelection ? ">" : " ") + items[i], x, y);
   }
   drawHomeClock(false); // a tela acabou de ser preenchida; não precisa limpar
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
@@ -2773,7 +2757,7 @@ void drawLibrary() {
   const int count = libraryProgramCount();
   librarySelection = count ? constrain(librarySelection, 0, count - 1) : 0;
   const int first = (librarySelection / 4) * 4;
-  for (auto *display : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *display : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     display->fillScreen(TFT_NAVY);
     display->setTextDatum(top_left);
     display->setTextSize(2);
@@ -2804,7 +2788,7 @@ void drawLibrary() {
 
 // Desenha um "aviaozinho" top-down orientado pela proa (0 = norte, horario).
 // Coordenadas locais: lx = direita, ly = frente (nariz). Rotaciona por heading.
-static void drawAirplane(M5GFX *d, int px, int py, double headingDeg, uint16_t color) {
+static void drawAirplane(GfxTarget *d, int px, int py, double headingDeg, uint16_t color) {
   const double a = headingDeg * DEG_TO_RAD;
   const double c = cos(a), s = sin(a);
   auto rot = [&](int lx, int ly, int &sx, int &sy) {
@@ -2833,7 +2817,7 @@ static void drawAirplane(M5GFX *d, int px, int py, double headingDeg, uint16_t c
 }
 
 void drawRadar() {
-  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
 
     // Título (canto superior esquerdo).
@@ -3215,11 +3199,11 @@ static void weatherTickerBuild() {
   // tela. Com só duas cópias, depois do wrap sobrava exatamente uma volta e
   // abria um vão preto na borda direita a cada ciclo.
   const String unit = tickerPayload + "      ";
-  rca.setFont(&fonts::Font2);
-  rca.setTextSize(1);
-  tickerWrapAt = rca.textWidth(unit.c_str());
+  tv.setFont(&fonts::Font2);
+  tv.setTextSize(1);
+  tickerWrapAt = tv.textWidth(unit.c_str());
   tickerFull = unit;
-  while (tickerWrapAt > 0 && rca.textWidth(tickerFull.c_str()) < tickerWrapAt + CRT_W)
+  while (tickerWrapAt > 0 && tv.textWidth(tickerFull.c_str()) < tickerWrapAt + CRT_W)
     tickerFull += unit;
   tickerOffset = 0;
 }
@@ -3252,7 +3236,7 @@ static void weatherDrawTicker(lgfx::LovyanGFX *dst, int ox, int oy) {
 static void weatherTickerTick() {
   if (tickerWrapAt > 0 && tickerOffset >= tickerWrapAt)
     tickerOffset -= tickerWrapAt;
-  weatherDrawTicker(&rca, 0, 0);
+  weatherDrawTicker(&tv, 0, 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -3376,9 +3360,9 @@ static crt::fx::Screen weatherScreen(int page) {
 void drawWeatherFrame() {
   lastWeatherBg = weatherBackground();
   if (weatherPage)
-    paintForecast(&rca, 0, 0, nullptr);
+    paintForecast(&tv, 0, 0, nullptr);
   else
-    paintCurrent(&rca, 0, 0, nullptr);
+    paintCurrent(&tv, 0, 0, nullptr);
 }
 void weatherTick() {
   const uint32_t now = millis();
@@ -3392,14 +3376,14 @@ void weatherTick() {
     // trocar de cartela. Não precisa de buffer nenhum.
     lastWeatherVersion = version;
     weatherTickerBuild();
-    weatherFx.attach(&rca);
+    weatherFx.attach(&tv);
     weatherFx.wipe(now, weatherScreen(weatherPage), crt::fx::DIR_DOWN);
     lastWeatherPageMs = now;
   } else if (weatherReady.load() && now - lastWeatherPageMs >= WEATHER_PAGE_MS) {
     // Rodízio das páginas: slide horizontal, a transição típica entre
     // "condições atuais" e "previsão estendida". Também sem buffer.
     const int next = weatherPage ? 0 : 1;
-    weatherFx.attach(&rca);
+    weatherFx.attach(&tv);
     weatherFx.slide(now, weatherScreen(weatherPage), weatherScreen(next), crt::fx::DIR_LEFT);
     weatherPage = next;
     lastWeatherPageMs = now;
@@ -3445,7 +3429,7 @@ void startWeather() {
   weatherPage = 0;
   lastWeatherPageMs = millis();
   lastWeatherVersion = UINT32_MAX;
-  weatherFx.attach(&rca);
+  weatherFx.attach(&tv);
   weatherFx.skip();
   weatherTickerBuild();
   drawWeatherFrame();
@@ -3515,17 +3499,17 @@ void drawSettings() {
   M5.Display.setTextSize(3);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
   M5.Display.drawString(value, 34, 110);
-  rca.fillScreen(TFT_NAVY);
-  rca.setTextDatum(top_left);
-  rca.setTextSize(2);
-  rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(PTBR::CONFIGURACOES, SAFE_L, HEAD_Y);
-  rca.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-  rca.setTextSize(1);
-  rca.setTextColor(RCA_ACCENT, TFT_NAVY);
-  rca.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], SAFE_L, BODY_Y + 26);
-  rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(value, SAFE_L + 10, BODY_Y + 58);
+  tv.fillScreen(TFT_NAVY);
+  tv.setTextDatum(top_left);
+  tv.setTextSize(2);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.drawString(PTBR::CONFIGURACOES, SAFE_L, HEAD_Y);
+  tv.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  tv.setTextSize(1);
+  tv.setTextColor(RCA_ACCENT, TFT_NAVY);
+  tv.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], SAFE_L, BODY_Y + 26);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.drawString(value, SAFE_L + 10, BODY_Y + 58);
   drawControllerLabels(settingsEditing ? "-" : "ACIMA", settingsEditing ? "SALVAR" : "OK",
                        settingsEditing ? "+" : "ABAIXO");
 }
@@ -3542,7 +3526,7 @@ void drawSettings() {
 void drawPhotos() {
   const uint32_t agora = millis();
   if (photoShow.count() == 0) {
-    for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+    for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
       d->fillScreen(TFT_NAVY);
       d->setTextDatum(top_left);
       d->setTextSize(2);
@@ -3565,7 +3549,7 @@ void drawPhotos() {
     xSemaphoreGive(sdMutex);
 
   // paint() ja limpa a tela, decodifica, poe a legenda e o rodape.
-  photoShow.paint(&rca, 0, 0);
+  photoShow.paint(&tv, 0, 0);
   // O LCD so recebe o texto: decodificar a mesma foto duas vezes dobraria o
   // custo por quadro sem ganho, e a foto no CVBS e que interessa.
   M5.Display.fillScreen(TFT_NAVY);
@@ -3621,11 +3605,11 @@ void drawTestPattern() {
   // As barras usam o QUADRO INTEIRO de proposito: a graca e ver o quanto o tubo
   // corta. So o texto respeita a area segura.
   if (testPatternPage == 0)
-    testpattern::drawBars(&rca, 0, 0);
+    testpattern::drawBars(&tv, 0, 0);
   else if (testPatternPage == 1)
-    testpattern::drawSlate(&rca, 0, 0);
+    testpattern::drawSlate(&tv, 0, 0);
   else
-    testpattern::drawSnow(&rca, 0, 0);
+    testpattern::drawSnow(&tv, 0, 0);
   // O LCD nao recebe as barras: ele nao e o que se quer calibrar, e repetir o
   // padrao la so confundiria a leitura.
   M5.Display.fillScreen(TFT_NAVY);
@@ -3699,7 +3683,7 @@ void drawRadioScreen(bool completo) {
   // Zerar o cache faz o proprio tick() fazer a primeira pintura completa.
   if (completo)
     radioui::cacheReset(radioCache);
-  radioui::tick(&rca, 0, 0, st, radioCache, millis());
+  radioui::tick(&tv, 0, 0, st, radioCache, millis());
 }
 
 void enterRadio() {
@@ -3755,7 +3739,7 @@ void stopRadio() {
 void drawInfo() {
   // Página 0: hardware; página 1: rede. Desenha tudo com datum top_left e
   // linhas separadas, truncadas, para nunca vazar do LCD (320x240, fonte ASCII).
-  for (auto *d : {static_cast<M5GFX *>(&rca), static_cast<M5GFX *>(&M5.Display)}) {
+  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
     d->fillScreen(TFT_NAVY);
     d->setTextDatum(top_left);
     d->setTextSize(2);
@@ -4435,8 +4419,8 @@ void serviceDiagnostics() {
     }
     if (command == "diag fb") {
       Serial.printf("[FB] profundidade=%d bits  %dx%d  bytes=%d\n",
-                    (int)(rca.getColorDepth() & 0xFF), rca.width(), rca.height(),
-                    rca.width() * rca.height() * ((rca.getColorDepth() & 0xFF) / 8));
+                    (int)(tv.getColorDepth() & 0xFF), tv.width(), tv.height(),
+                    tv.width() * tv.height() * ((tv.getColorDepth() & 0xFF) / 8));
       memset(line, 0, sizeof(line));
       continue;
     }
@@ -4450,7 +4434,7 @@ void serviceDiagnostics() {
       memset(vistos, 0, sizeof(vistos));
       uint32_t distintas = 0;
       for (int y = 0; y < CRT_H; ++y) {
-        rca.readRect(0, y, CRT_W, 1, linha);
+        tv.readRect(0, y, CRT_W, 1, linha);
         for (int x = 0; x < CRT_W; ++x) {
           const uint16_t c = (uint16_t)((linha[x] >> 8) | (linha[x] << 8)); // readRect troca os bytes
           if (!(vistos[c >> 3] & (1u << (c & 7)))) {
@@ -4472,7 +4456,7 @@ void serviceDiagnostics() {
       static uint16_t linha[CRT_W];
       Serial.println("[SCAN] linha: ciano claro  (faixa do ticker = 206..221)");
       for (int y = 150; y < CRT_H; ++y) {
-        rca.readRect(0, y, CRT_W, 1, linha);
+        tv.readRect(0, y, CRT_W, 1, linha);
         int ciano = 0, claro = 0;
         for (int x = 0; x < CRT_W; ++x) {
           const uint16_t c = linha[x];
@@ -4489,9 +4473,9 @@ void serviceDiagnostics() {
                     (unsigned)tickerFull.length(), tickerOffset, tickerWrapAt,
                     (unsigned)tickerPayload.length());
       Serial.printf("[SCAN] largura do texto=%d  TICKER_Y=%d TICKER_H=%d\n",
-                    rca.textWidth(tickerFull.c_str()), TICKER_Y, TICKER_H);
+                    tv.textWidth(tickerFull.c_str()), TICKER_Y, TICKER_H);
       for (int y = TICKER_Y - 2; y < TICKER_Y + TICKER_H + 2; ++y) {
-        rca.readRect(0, y, CRT_W, 1, linha);
+        tv.readRect(0, y, CRT_W, 1, linha);
         int distintas = 0;
         uint16_t vistas[6] = {0};
         for (int x = 0; x < CRT_W; ++x) {
@@ -4587,7 +4571,7 @@ void serviceDiagnostics() {
       handleNavigation(NavAction::LEFT);
     else if (command == "diag right")
       handleNavigation(NavAction::RIGHT);
-    else if (command == "diag audio rca")
+    else if (command == "diag audio tv")
       audioOutput = AudioOutput::RCA;
     else if (command == "diag audio internal")
       audioOutput = AudioOutput::INTERNAL;
@@ -4639,7 +4623,7 @@ void setup() {
   input.setAutoRepeat(true);
   uiHudInit(); // sprite do HUD criado uma única vez, fora do hot path
   jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
-  if (!rca.init()) {
+  if (!tv.init()) {
     M5.Display.println(PTBR::FALHA_NTSC);
     state = ERROR_SCREEN;
     drawBackButton();
@@ -4651,8 +4635,8 @@ void setup() {
   // blit custava 193 ns/pixel, 46 ciclos a 240 MHz, para o que deveria ser
   // cópia. Com psram_half_use o consumo de SRAM interna continua o mesmo
   // (76.800 B), porque metade das linhas vai para a PSRAM com cache de linha.
-  rca.setColorDepth(16);
-  rca.setOutputBoost(true);
+  tv.setColorDepth(16);
+  tv.setOutputBoost(true);
   dualText(PTBR::APP, PTBR::INICIANDO);
   if (!jpegBuffer) {
     setError(PTBR::MEMORIA_INSUFICIENTE);
@@ -4826,7 +4810,7 @@ void loop() {
     // entao chamar a cada volta do loop nao pisca no CVBS.
     if (tvChannel.bumperActive()) {
       const uint32_t agora = millis();
-      tvChannel.drawBumper(&rca, 0, 0, nullptr, agora);
+      tvChannel.drawBumper(&tv, 0, 0, nullptr, agora);
       const int proximo = tvChannel.ready(agora);
       if (proximo >= 0) {
         librarySelection = proximo;
@@ -4859,7 +4843,7 @@ void loop() {
   if (state == MUSIC_NOW_PLAYING) {
     musicTick();
     if (musicScopeOn)
-      audioscope::tick(&rca, 0, 0, audioScope, audioTap, millis());
+      audioscope::tick(&tv, 0, 0, audioScope, audioTap, millis());
   }
   if (state == FILE_TRANSFER) {
     transferTick();
@@ -4878,9 +4862,9 @@ void loop() {
     // onde esta, 192 px de cada, a cada 200 ms -- barato o bastante para ficar
     // horas ligado.
     if (idleMgr.takeSaverStep()) {
-      rca.fillRect(idleMgr.saverPrevX(), idleMgr.saverPrevY(), burnin::SAVER_W, burnin::SAVER_H,
+      tv.fillRect(idleMgr.saverPrevX(), idleMgr.saverPrevY(), burnin::SAVER_W, burnin::SAVER_H,
                    (uint16_t)TFT_BLACK);
-      rca.fillRect(idleMgr.saverX(), idleMgr.saverY(), burnin::SAVER_W, burnin::SAVER_H,
+      tv.fillRect(idleMgr.saverX(), idleMgr.saverY(), burnin::SAVER_W, burnin::SAVER_H,
                    burnin::SAVER_COLOR);
     }
   } else if (state == HOME && millis() - lastClockDraw >= 1000)

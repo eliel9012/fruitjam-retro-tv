@@ -138,7 +138,7 @@
 //  reproduz uma execucao inteira bit a bit.
 // ============================================================================
 
-#include <M5GFX.h>
+#include "fj/Gfx.h"
 #include <stdint.h>
 #include <string.h>
 

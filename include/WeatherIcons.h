@@ -22,7 +22,7 @@
 //   wx::drawWeatherIcon(&rca, cx, cy, 96, wx::iconFromWmo(code));
 // ============================================================================
 
-#include <M5GFX.h>
+#include "fj/Gfx.h"
 
 namespace wx {
 

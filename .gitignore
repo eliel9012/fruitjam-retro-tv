@@ -10,3 +10,4 @@ test-music/**/*.mp3
 test-music/**/*.wav
 test-music/**/*.jpg
 test-music/**/*.jpeg
+platformio_local*.ini

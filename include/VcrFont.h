@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#include <M5GFX.h>
+#include "fj/Gfx.h"
 
 // ============================================================================
 // VcrFont — fonte bitmap do OSD, no traço dos videocassetes Sony/Semp dos 90.
