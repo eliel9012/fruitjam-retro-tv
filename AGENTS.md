@@ -30,7 +30,7 @@ só fala DVI.
 
 | | Core2 + RCA (upstream) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, **240 MHz** (o DVHSTX sobe o relógio uma vez, no preinit; o modo de vídeo reprograma só o pll_sys/clk_hstx, dominio separado -- ver fj/UsbHost.h) |
+| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, **240 MHz** (o DVHSTX sobe o relógio uma vez, no preinit; o modo de vídeo reprograma só o pll_sys/clk_hstx, domínio separado -- ver fj/UsbHost.h e 2.2) |
 | SRAM / PSRAM | ~320 KB / 4,5 MB | 520 KB / 8 MB (QSPI) |
 | Vídeo | CVBS NTSC 320×240 | DVI 640×480@60, quadro lógico 320×240 |
 | Tela local | LCD 320×240 + touch | **nenhuma** |
@@ -548,14 +548,17 @@ A plataforma é a comunitária do Max Gerhardt
 (`maxgerhardt/platform-raspberrypi`) com o core do Earle Philhower
 (arduino-pico): a plataforma oficial `raspberrypi` do PlatformIO não tem RP2350.
 `board_build.f_cpu` fica em 150 MHz no `platformio.ini` porque a biblioteca do
-DVHSTX recusa compilar com outro valor e sobe o `clk_sys` sozinha em tempo de
-execução, uma vez, para 240 MHz, num preinit antes do `setup()`. O modo de
-vídeo escolhido depois em `display::begin()` reprograma só o pll_sys/clk_hstx
-(o clock de pixel do HSTX, 126 MHz para 640×480@60) -- domínio separado do
-clk_sys, que seguiria 240 MHz mesmo que o modo de vídeo mudasse (ver o
-comentário de clock em `include/fj/UsbHost.h`, que precisou conferir isto
-linha a linha porque o PIO-USB depende do clk_sys ser múltiplo de 12 MHz).
-As bibliotecas estão fixadas por commit.
+DVHSTX recusa compilar com outro valor. Ela mesma sobe o `clk_sys` sozinha em
+tempo de execução, uma vez, num preinit antes do `setup()`: o `#error` de
+compilação fala em 264 MHz, mas a conta do `clock_configure` no commit fixado
+dá **240 MHz** (PLL USB 480 MHz / 2) — mensagem de erro desatualizada da
+própria lib, não do nosso código; ver AGENTS 2.2 abaixo. O modo de vídeo
+escolhido depois em `display::begin()` reprograma só o `pll_sys`/`clk_hstx`
+(o clock de pixel do HSTX, 126 MHz para 640×480@60) — domínio separado do
+`clk_sys`, que segue 240 MHz mesmo com o DVI ativo (ver o comentário de clock
+em `include/fj/UsbHost.h`, que precisou conferir isto linha a linha porque o
+PIO-USB depende do `clk_sys` ser múltiplo de 12 MHz). As bibliotecas estão
+fixadas por commit.
 
 Sem acesso ao registro do PlatformIO: clone as bibliotecas de `lib_deps` numa
 pasta e crie `platformio_local.ini` (ignorado pelo git):

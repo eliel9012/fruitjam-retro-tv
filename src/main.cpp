@@ -1124,11 +1124,12 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
     return;
   }
 
-  // Reaproveita o leitor global: um MjpegReader local são 4104 bytes, e esta
-  // função roda na pilha do loop() (a tarefa CORE0 do arduino-pico tem só 4 KB),
-  // que ainda precisa do FAT,
-  // deserializeJson e dos printf com float do relatório. O stopProgram() acima
-  // já resetou o leitor.
+  // Reaproveita o leitor global: um MjpegReader local são 4104 bytes, e mesmo
+  // com esta função rodando na pilha de 16 KB da tarefa APP (não a CORE0 de
+  // 4 KB do arduino-pico, que só chama setup()/loop() e dorme — ver o
+  // xTaskCreatePinnedToCore(appTask, ...) no fim deste arquivo), não vale a
+  // pena mais um array desse tamanho ao lado do FAT, do deserializeJson e dos
+  // printf com float do relatório. O stopProgram() acima já resetou o leitor.
   playback::MjpegReader &reader = mjpegReader;
   reader.reset();
   tv.fillScreen(TFT_BLACK);
@@ -3697,7 +3698,7 @@ void drawInfo() {
     tv.drawString(value.substring(0, VAL_MAX), VAL_X, y0 + i * STEP);
   };
   if (!infoPage) {
-    // Relógio real, não o nominal: o DVHSTX sobe o RP2350 para 264 MHz por
+    // Relógio real, não o nominal: o DVHSTX sobe o RP2350 para 240 MHz por
     // conta própria, apesar do f_cpu de 150 MHz no platformio.ini.
     row(0, "PROCESSADOR", "RP2350B " + String(ESP.getCpuFreqMHz()) + " MHz");
     row(1, "SRAM LIVRE", String(ESP.getFreeHeap() / 1024) + " KB");
@@ -4177,8 +4178,15 @@ void provisionDevice(const String &payload) {
     Serial.println("[DIAG] ERROR invalid network/API configuration");
     return;
   }
+  // Mesmo mutex de saveSettings(): sem ele, um provisionamento pelo serial
+  // durante um vídeo disputaria o FatFS com a tarefa de áudio sem exclusão
+  // mútua nenhuma.
+  if (sdMutex)
+    xSemaphoreTake(sdMutex, portMAX_DELAY);
   bool saved = ca.length() ? storage::replace(SD, String(CA_FILE), ca) : true;
   saved = saved && secretsStore.save(cfg, currentSettings());
+  if (sdMutex)
+    xSemaphoreGive(sdMutex);
   if (!saved) {
     Serial.println("[DIAG] ERROR configuration write failed");
     return;
