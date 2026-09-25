@@ -4348,6 +4348,10 @@ static void appSetup() {
   if (!net::beginRadio())
     Serial.println("[M5RETRO] ERRO: ESP32-C6 nao respondeu; seguindo sem rede");
   dualText(PTBR::APP, PTBR::INICIANDO_AUDIO);
+  // O volume do usuário é aplicado em software (playback::scalePcm), como no
+  // original. O volume digital do DAC fica em 0 dB: somar os dois atenuaria em
+  // dobro.
+  audioout::setVolume(100);
   if (!audioout::begin(22050)) {
     setError(PTBR::FALHA_AUDIO);
     return;
