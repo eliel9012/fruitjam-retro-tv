@@ -4290,7 +4290,7 @@ void serviceDiagnostics() {
   }
 }
 
-void setup() {
+static void appSetup() {
   // USB CDC: quando o buffer da placa enche, o host segura o envio, então o
   // JSON de provisionamento (com o ca.pem) não se perde. No ESP32 a UART
   // precisava de setRxBufferSize(4096); aqui não existe nem faz falta.
@@ -4402,7 +4402,7 @@ static void redrawCurrentScreen() {
   }
 }
 
-void loop() {
+static void appLoop() {
   if (state == ERROR_SCREEN && !display::ready()) {
     // Boot parou antes do vídeo: não há tela nem cartão, só o serial.
     delay(100);
@@ -4563,3 +4563,24 @@ void loop() {
   // o loop praticamente não dorme.
   delay(state == VIDEO_PLAYBACK && videoBehind ? 1 : 4);
 }
+// Pilha do loop(): no arduino-pico com FreeRTOS, a tarefa CORE0 que roda setup()
+// e loop() nasce com 1024 PALAVRAS (4 KB), valor fixo em freertos-main.cpp. No
+// ESP32 eram 8 KB, e este firmware conta com isso: deserializeJson recursivo,
+// printf com float no diag bench, desenho com fontes. Em vez de remendar o
+// framework, setup() só cria uma tarefa com pilha folgada no MESMO núcleo 0 —
+// display::begin() precisa rodar no núcleo 0, que é onde a interrupção de linha
+// do DVI fica — e o loop() do Arduino apenas dorme.
+static constexpr uint32_t APP_STACK_BYTES = 16 * 1024;
+
+static void appTask(void *) {
+  appSetup();
+  for (;;)
+    appLoop();
+}
+
+void setup() {
+  xTaskCreatePinnedToCore(appTask, "APP", APP_STACK_BYTES, nullptr, configMAX_PRIORITIES / 2,
+                          nullptr, 0);
+}
+
+void loop() { vTaskDelay(portMAX_DELAY); }
