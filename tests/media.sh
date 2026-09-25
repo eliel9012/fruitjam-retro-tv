@@ -6,7 +6,7 @@ media_dir=$(mktemp -d "$PWD/work/media.XXXXXX")
 trap 'rm -rf "$media_dir"' EXIT HUP INT TERM
 ffmpeg -nostdin -v error -f lavfi -i testsrc2=size=640x360:rate=30 \
   -f lavfi -i sine=frequency=440:sample_rate=44100 -t 2 -c:v mpeg4 -c:a aac "$media_dir/source.mp4"
-python3 tools/prepare_video.py "$media_dir/source.mp4" "$media_dir/240"
+python3 tools/prepare_video.py "$media_dir/source.mp4" "$media_dir/240" --size 240x160
 ffmpeg -nostdin -v error -i "$media_dir/source.mp4" -an -c:v copy "$media_dir/silent.mp4"
 python3 tools/prepare_video.py "$media_dir/silent.mp4" "$media_dir/320" --size 320x240
 ./tests/run.sh "$media_dir/240/video.mjpeg" "$media_dir/240/audio.wav"

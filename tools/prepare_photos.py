@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Converte fotos para o formato que o slideshow do M5 RETRO TV consegue exibir.
+"""Converte fotos para o formato que o slideshow do Fruit Jam Retro TV consegue exibir.
+
+O formato e o mesmo do upstream (m5-retro-tv, Core2): o JPEGDEC e o MAX_JPEG
+sao os mesmos, entao a mesma pasta /M5RETRO/fotos serve nos dois aparelhos.
 
 Uso:
     python3 tools/prepare_photos.py ORIGEM [ORIGEM...] DESTINO
@@ -20,7 +23,7 @@ Por que este script existe, em vez de "e so copiar o JPEG":
        nenhum erro para capturar.
 
     3. Teto de 128 KB. O buffer de decodificacao e ps_malloc(MAX_JPEG) com
-       MAX_JPEG = 128*1024 (src/main.cpp:138). Foto de celular tem 0,5 a 5 MB
+       MAX_JPEG = 128*1024 (src/main.cpp). Foto de celular tem 0,5 a 5 MB
        e simplesmente nao cabe.
 
     4. Escala. O JPEGDEC so reduz em 1/2, 1/4 e 1/8. Uma foto de 4000 px em
@@ -41,7 +44,7 @@ import sys
 # Precisa bater com MAX_JPEG em src/main.cpp.
 MAX_JPEG = 128 * 1024
 
-# Quadro do NTSC composto. Ver include/SafeArea.h.
+# Quadro logico da TV: 320x240, dobrado para 640x480 no DVI. Ver include/SafeArea.h.
 FRAME_W, FRAME_H = 320, 240
 
 EXTENSOES = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
@@ -148,7 +151,7 @@ def verificar_baseline(caminho):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Prepara fotos para /M5RETRO/fotos no M5 RETRO TV.",
+        description="Prepara fotos para /M5RETRO/fotos no Fruit Jam Retro TV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exemplo:\n"
                "  python3 tools/prepare_photos.py ~/Pictures/viagem ~/Downloads/M5RETRO-fotos\n")
