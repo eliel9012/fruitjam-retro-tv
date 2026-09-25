@@ -1686,8 +1686,11 @@ void pollAircraft() {
 }
 
 String normalizeSdPath(const String &path) {
-  // ESP32 FS directory entries can be reported with the internal VFS mount
-  // prefix (/sd). SD.open and SD.exists require the public card path instead.
+  // No ESP32 as entradas de diretório podiam vir com o prefixo interno do VFS
+  // (/sd). No arduino-pico o File::name() devolve só o nome e o fullName() já é
+  // o caminho do cartão, então isto não dispara aqui. Fica porque é barato e
+  // porque o mesmo caminho pode chegar de fora (serial, controle web) escrito
+  // no formato antigo.
   if (path.startsWith("/sd/"))
     return path.substring(3);
   if (path == "/sd")
@@ -1696,9 +1699,10 @@ String normalizeSdPath(const String &path) {
 }
 
 String libraryChildPath(const String &root, const String &entryName) {
-  // FAT directory iteration may return only a child name (for example
-  // "primeiro-teste") instead of an absolute SD path. Always rebuild the
-  // physical card path from the root currently being scanned.
+  // A iteração de diretório do FAT devolve só o nome do filho ("primeiro-teste"),
+  // não o caminho absoluto: no arduino-pico o File::name() corta tudo até a
+  // última barra, como no ESP32 2.x. Por isso o caminho do cartão é sempre
+  // reconstruído a partir da raiz que está sendo varrida.
   const String child = normalizeSdPath(entryName);
   if (child.startsWith("/"))
     return child;
@@ -2106,52 +2110,72 @@ static void musicScanDir() {
 }
 
 void drawMusicBrowser() {
-  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    d->fillScreen(TFT_NAVY);
-    d->setTextDatum(top_left);
-    d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->setTextSize(2);
-    d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
-    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-    // breadcrumb do diretório corrente.
-    String crumb = musicDir;
-    crumb.replace(String(MUSIC_ROOT), "/");
-    d->setTextSize(1);
-    d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
-    d->drawString(crumb, SAFE_L, HEAD_RULE_Y + 6);
-    if (!musicEntryCount)
-      d->drawString(PTBR::SEM_MUSICAS, SAFE_L + 6, BODY_Y + 48);
-    const int first = (musicSelection / 4) * 4;
-    for (int row = 0; row < 4 && first + row < musicEntryCount; ++row) {
-      const int index = first + row, y = BODY_Y + 14 + row * 32;
-      const bool selected = index == musicSelection;
-      d->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? RCA_ACCENT : TFT_NAVY);
-      d->setTextColor(selected ? TFT_NAVY : (musicEntries[index].isFolder ? RCA_ACCENT : TFT_WHITE),
-                      selected ? RCA_ACCENT : TFT_NAVY);
-      String label = String(selected ? "> " : "  ") + musicEntries[index].name;
-      if (musicEntries[index].isFolder)
-        label += "/";
-      d->drawString(label.substring(0, 40), SAFE_L + 8, y + 6);
-    }
-    d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount,
-                  SAFE_R - 80, HEAD_Y);
+  // Só a TV: o Fruit Jam não tem tela local.
+  GfxTarget *d = &tv;
+  d->fillScreen(TFT_NAVY);
+  d->setTextDatum(top_left);
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->setTextSize(2);
+  d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
+  d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  // Breadcrumb do diretório corrente. O caminho é nome de pasta do cartão, e
+  // pode ter acento: sem normalizar, cada letra acentuada vira dois buracos na
+  // fonte bitmap (armadilha 9 do AGENTS.md).
+  String crumb = musicDir;
+  crumb.replace(String(MUSIC_ROOT), "/");
+  char crumbAscii[64];
+  ascii::normalize(crumbAscii, sizeof(crumbAscii), crumb.c_str());
+  d->setTextSize(1);
+  d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
+  d->drawString(crumbAscii, SAFE_L, HEAD_RULE_Y + 6);
+  if (!musicEntryCount)
+    d->drawString(PTBR::SEM_MUSICAS, SAFE_L + 6, BODY_Y + 48);
+  const int first = (musicSelection / 4) * 4;
+  for (int row = 0; row < 4 && first + row < musicEntryCount; ++row) {
+    const int index = first + row, y = BODY_Y + 14 + row * 32;
+    const bool selected = index == musicSelection;
+    d->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? RCA_ACCENT : TFT_NAVY);
+    d->setTextColor(selected ? TFT_NAVY : (musicEntries[index].isFolder ? RCA_ACCENT : TFT_WHITE),
+                    selected ? RCA_ACCENT : TFT_NAVY);
+    String label = String(selected ? "> " : "  ") + musicEntries[index].name;
+    if (musicEntries[index].isFolder)
+      label += "/";
+    d->drawString(label.substring(0, 40), SAFE_L + 8, y + 6);
   }
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->drawString(String(musicEntryCount ? musicSelection + 1 : 0) + " / " + musicEntryCount,
+                SAFE_R - 80, HEAD_Y);
   drawControllerLabels("ACIMA", "OK", "ABAIXO");
 }
 
+// O JPEGDEC entrega RGB565_BIG_ENDIAN (ver loadAlbumCover), que é exatamente
+// como o LGFX_Sprite de 16 bits guarda o pixel. Declarar os blocos como
+// lgfx::swap565_t diz isso ao LovyanGFX, e ele copia sem converter. O tipo do
+// ponteiro é o que escolhe o formato (armadilha 11): um uint16_t* cru seria lido
+// como RGB565 nativo e a capa sairia com as cores trocadas, sem aviso.
 static int coverDraw(JPEGDRAW *draw) {
   if (coverTarget)
     coverTarget->pushImage(draw->x, draw->y, draw->iWidth, draw->iHeight,
-                           reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
+                           reinterpret_cast<const lgfx::swap565_t *>(draw->pPixels));
   return 1;
 }
+
+// Pixels da capa, alocados por nós na PSRAM e emprestados ao sprite com
+// setBuffer(). O LovyanGFX no RP2040/RP2350 implementa o setPsram(true) com um
+// malloc comum: uma capa de 250x250 iria parar em 125 KB de SRAM, disputando com
+// o framebuffer do DVI. Como o buffer é "preallocated", o deleteSprite() não o
+// libera: quem libera é freeCover().
+static uint16_t *coverPixels = nullptr;
 
 static void freeCover() {
   if (coverSprite) {
     coverSprite->deleteSprite();
     delete coverSprite;
     coverSprite = nullptr;
+  }
+  if (coverPixels) {
+    free(coverPixels); // o free() do arduino-pico reconhece ponteiro da PSRAM
+    coverPixels = nullptr;
   }
 }
 
@@ -2206,7 +2230,7 @@ static bool loadAlbumCover(const String &trackPath) {
     free(buf);
     return false;
   }
-  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  jpeg.setPixelType(RGB565_BIG_ENDIAN); // ordem do LGFX_Sprite; ver coverDraw()
   const int fullW = jpeg.getWidth(), fullH = jpeg.getHeight();
   if (fullW < 1 || fullH < 1) {
     jpeg.close();
@@ -2224,16 +2248,18 @@ static bool loadAlbumCover(const String &trackPath) {
   const int w = (fullW + scale - 1) / scale;
   const int h = (fullH + scale - 1) / scale;
 
-  coverSprite = new LGFX_Sprite();
-  coverSprite->setPsram(true);
-  coverSprite->setColorDepth(16);
-  if (!coverSprite->createSprite(w, h)) {
-    delete coverSprite;
-    coverSprite = nullptr;
+  // Na PSRAM (é só leitura depois de pronta, e a SRAM fica para o
+  // framebuffer do DVI) e em 16 bits, a mesma profundidade do `tv`: sprite com
+  // profundidade diferente do painel dá cor errada em silêncio (armadilha 10).
+  coverPixels = (uint16_t *)ps_calloc((size_t)w * (size_t)h, sizeof(uint16_t));
+  if (!coverPixels) {
     jpeg.close();
     free(buf);
     return false;
   }
+  coverSprite = new LGFX_Sprite();
+  coverSprite->setColorDepth(16);
+  coverSprite->setBuffer(coverPixels, w, h, 16);
   coverTarget = coverSprite;
   const bool ok = jpeg.decode(0, 0, options);
   coverTarget = nullptr;
@@ -2244,15 +2270,13 @@ static bool loadAlbumCover(const String &trackPath) {
   return ok;
 }
 
-void drawMusicNowPlaying() {
-  char title[64] = "MUSICA";
-  if (musicMeta.title[0])
-    strcpy(title, musicMeta.title);
-  else if (musicQueueIndex >= 0 && musicQueueIndex < musicQueueCount) {
-    const String p = musicQueue[musicQueueIndex];
-    const int s = p.lastIndexOf('/');
-    ascii::normalize(title, sizeof(title), (s >= 0 ? p.substring(s + 1) : p).c_str());
-  }
+// Faixa do progresso e do relógio da faixa, 160..182. Separada do resto da tela
+// para o musicTick() repintar só ela uma vez por segundo: no Core2 quem mostrava
+// o tempo andando era o LCD, e sem ele a TV ficaria com o relógio parado.
+static constexpr int MUSIC_PROGRESS_Y = 160, MUSIC_PROGRESS_H = 24;
+static uint32_t musicProgressDrawn = 0;
+
+static void drawMusicProgress(GfxTarget *d, bool limpar) {
   const bool isPaused = paused.load();
   // Duração: usa o bitrate real do MP3 quando já conhecido (1º frame); senão a
   // estimativa inicial de 128 kbps gravada em wavDataEnd.
@@ -2261,30 +2285,69 @@ void drawMusicNowPlaying() {
     totalSec = (uint32_t)(mp3File.size() * 8ULL / (uint64_t)musicBitrateKbps / 1000ULL);
   }
   const uint32_t curSec = sampleRate ? samplesPlayed.load() / sampleRate : 0;
-  const int pct = totalSec ? (int)((uint64_t)curSec * (SAFE_W - 2) / totalSec) : 0;
+  int pct = totalSec ? (int)((uint64_t)curSec * (SAFE_W - 2) / totalSec) : 0;
+  if (pct > SAFE_W - 2)
+    pct = SAFE_W - 2; // a duração do MP3 é estimada e pode ficar curta
+  if (limpar)
+    d->fillRect(SAFE_L, MUSIC_PROGRESS_Y, SAFE_W, MUSIC_PROGRESS_H, TFT_NAVY);
+  d->setTextDatum(top_left);
+  d->setTextSize(1);
+  d->drawRect(SAFE_L, MUSIC_PROGRESS_Y, SAFE_W, 6, RCA_ACCENT);
+  if (pct > 0)
+    d->fillRect(SAFE_L + 1, MUSIC_PROGRESS_Y + 1, pct, 4, TFT_YELLOW);
+  d->setTextColor(RCA_ACCENT, TFT_NAVY);
+  char clockLine[48];
+  snprintf(clockLine, sizeof(clockLine), "%s %02lu:%02lu / %02lu:%02lu", isPaused ? "PAUSA" : "PLAY",
+           (unsigned long)(curSec / 60UL), (unsigned long)(curSec % 60UL),
+           (unsigned long)(totalSec / 60UL), (unsigned long)(totalSec % 60UL));
+  if (musicShuffle)
+    strncat(clockLine, "  SHUFFLE", sizeof(clockLine) - strlen(clockLine) - 1);
+  else if (musicRepeat)
+    strncat(clockLine, "  REPETIR", sizeof(clockLine) - strlen(clockLine) - 1);
+  d->drawString(clockLine, SAFE_L, MUSIC_PROGRESS_Y + 14);
+  musicProgressDrawn = millis();
+}
+
+void drawMusicNowPlaying() {
+  char title[64] = "MUSICA";
+  if (musicMeta.title[0])
+    strcpy(title, musicMeta.title); // o Id3.h já entrega ASCII normalizado
+  else if (musicQueueIndex >= 0 && musicQueueIndex < musicQueueCount) {
+    const String p = musicQueue[musicQueueIndex];
+    const int s = p.lastIndexOf('/');
+    ascii::normalize(title, sizeof(title), (s >= 0 ? p.substring(s + 1) : p).c_str());
+  }
   // Nº da faixa corrente na fila (estilo iPod), para exibição.
   String trackNo = (musicQueueIndex >= 0 && musicQueueCount) ? String(musicQueueIndex + 1) + "/" + String(musicQueueCount) : String("");
-  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    d->fillScreen(TFT_NAVY);
-    d->setTextDatum(top_left);
+  // Só a TV: o Fruit Jam não tem tela local.
+  GfxTarget *d = &tv;
+  d->fillScreen(TFT_NAVY);
+  d->setTextDatum(top_left);
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->setTextSize(2);
+  d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
+  d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  d->setTextSize(1);
+  // Capa do álbum (esquerda) com borda estilo VHS.
+  const int coverY = BODY_Y + 8;
+  if (musicScopeOn) {
+    // O visualizador ocupa a faixa da capa e dos metadados: a capa vai de 62 a
+    // 150, o progresso de 160 a 182 e a faixa de botões começa em 202, e não
+    // sobra vão de 48 linhas em canto nenhum. No Core2 o nome da faixa ficava no
+    // LCD; aqui a TV é a única tela, então título e artista sobem para as duas
+    // linhas acima do painel (58 e 70), que terminam antes dele em 82.
+    d->setTextColor(TFT_YELLOW, TFT_NAVY);
+    d->drawString(truncateText(title, 28), SAFE_L, BODY_Y + 4);
+    char who[96];
+    snprintf(who, sizeof(who), "%s%s%s", musicMeta.artist[0] ? musicMeta.artist : "---",
+             musicMeta.album[0] ? " - " : "", musicMeta.album);
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->setTextSize(2);
-    d->drawString(PTBR::MUSICA, SAFE_L, HEAD_Y);
-    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-    d->setTextSize(1);
-    // Capa do álbum (esquerda) com borda estilo VHS.
-    const int coverY = BODY_Y + 8;
-    // No tubo, o visualizador OCUPA a faixa da capa e dos metadados. Nao ha
-    // outro lugar: a capa vai de 62 a 150, o progresso de 160 a 192 e a faixa
-    // de botoes comeca em 202 -- nao sobra vao de 48 linhas em canto nenhum.
-    // A troca e boa de qualquer forma: quem le o nome da faixa olha o LCD, e o
-    // tubo ganha imagem em movimento, que e o que o anti-queima quer.
-    if (d == static_cast<GfxTarget *>(&tv) && musicScopeOn) {
-      audioScope.x = SAFE_L + 8;
-      audioScope.y = coverY + 20; // 82..130, centrado na faixa da capa
-      audioscope::drawStatic(d, 0, 0, audioScope);
-      audioscope::drawModeLabel(d, 0, 0, audioScope);
-    } else {
+    d->drawString(truncateText(who, 44), SAFE_L, BODY_Y + 16);
+    audioScope.x = SAFE_L + 8;
+    audioScope.y = coverY + 20; // 82..130, centrado na faixa da capa
+    audioscope::drawStatic(d, 0, 0, audioScope);
+    audioscope::drawModeLabel(d, 0, 0, audioScope);
+  } else {
     if (coverSprite) {
       const int cw = coverSprite->width(), ch = coverSprite->height();
       const float sc = min(min(88.0f / cw, 88.0f / ch), 1.6f);
@@ -2301,30 +2364,16 @@ void drawMusicNowPlaying() {
     d->drawString(truncateText(musicMeta.album[0] ? musicMeta.album : "---", 24), metaX, coverY + 50);
     if (musicMeta.year[0])
       d->drawString(musicMeta.year, metaX, coverY + 70);
-    } // fim do ramo sem visualizador
-    // Nº da faixa + bitrate (canto sup. direito, à esquerda do botão voltar).
-    if (trackNo.length()) {
-      String meta = trackNo;
-      if (mp3Mode && musicBitrateKbps > 0)
-        meta += " " + String(musicBitrateKbps) + "K";
-      d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
-      d->drawString(meta, SAFE_R - 96, HEAD_RULE_Y + 6);
-    }
-    // Progresso (com tempo total correto).
-    d->drawRect(SAFE_L, 160, SAFE_W, 6, RCA_ACCENT);
-    if (pct > 0)
-      d->fillRect(SAFE_L + 1, 161, pct, 4, TFT_YELLOW);
-    d->setTextColor(RCA_ACCENT, TFT_NAVY);
-    char clockLine[48];
-    snprintf(clockLine, sizeof(clockLine), "%s %02lu:%02lu / %02lu:%02lu", isPaused ? "PAUSA" : "PLAY",
-             curSec / 60UL, curSec % 60UL, totalSec / 60UL, totalSec % 60UL);
-    if (musicShuffle)
-      strncat(clockLine, "  SHUFFLE", sizeof(clockLine) - strlen(clockLine) - 1);
-    else if (musicRepeat)
-      strncat(clockLine, "  REPETIR", sizeof(clockLine) - strlen(clockLine) - 1);
-    d->drawString(clockLine, SAFE_L, 174);
   }
-  drawBackButton();
+  // Nº da faixa + bitrate (canto superior direito, abaixo da régua).
+  if (trackNo.length()) {
+    String meta = trackNo;
+    if (mp3Mode && musicBitrateKbps > 0)
+      meta += " " + String(musicBitrateKbps) + "K";
+    d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
+    d->drawString(meta, SAFE_R - 96, HEAD_RULE_Y + 6);
+  }
+  drawMusicProgress(d, false); // a tela acabou de ser preenchida
 }
 
 static bool mp3Begin(const String &path) {
@@ -2427,7 +2476,9 @@ bool startMusic(const String &path) {
   // barras da anterior por alguns quadros (armadilha 6 do AGENTS.md).
   audioTap.clear();
   audioscope::reset(audioScope);
-  // Garante I2S1 livre: encerra qualquer vídeo/weather em andamento.
+  // Garante a tarefa de áudio ociosa: encerra qualquer vídeo/weather em
+  // andamento. O PCM (WAV ou MP3 decodificado) sai pela tarefa de áudio via
+  // audioout; daqui só se abre o arquivo.
   playing = false;
   while (audioReady && !audioIdle && !audioFailed)
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -2526,8 +2577,14 @@ void stopMusic() {
 }
 
 void musicTick() {
-  if (!playbackFinished)
+  if (!playbackFinished) {
+    // Relógio da faixa a 1 Hz, repintando só a sua faixa: a tela inteira a cada
+    // segundo piscaria e apagaria o visualizador. Com o protetor de tela no ar
+    // não se desenha nada: a interface não está na tela.
+    if (idleMgr.stage() != burnin::STAGE_BLANK && millis() - musicProgressDrawn >= 1000)
+      drawMusicProgress(&tv, true);
     return;
+  }
   playbackFinished = false;
   if (audioStreamError) {
     audioStreamError = false;
@@ -2576,10 +2633,15 @@ void musicTick() {
 // áudio e a saída composta tem prazo rígido por linha de varredura — receber
 // dezenas de MB com tudo isso rodando junto engasgaria os dois.
 // ----------------------------------------------------------------------------
+// Endereço e rede da tela, lidos UMA vez em startTransfer(). O transferTick()
+// monta o estado a cada volta do loop, e no Fruit Jam cada WiFi.SSID() ou
+// localIP() é uma transação SPI com o ESP32-C6 (sob net::Lock) — perguntar isso
+// centenas de vezes por segundo disputaria o barramento com o próprio servidor
+// que está recebendo o arquivo.
+static String transferAddress, transferSsid;
+
 static xfer::State transferState() {
-  static String endereco, rede;
-  endereco = "http://" + fileTransfer.ip();
-  rede = WiFi.SSID();
+  const String &endereco = transferAddress, &rede = transferSsid;
   xfer::State st;
   st.address = endereco.c_str();
   st.ssid = rede.c_str();
@@ -2602,9 +2664,7 @@ static xfer::State transferState() {
 void drawTransferFrame() {
   const xfer::State st = transferState();
   xfer::draw(&tv, st);
-  xfer::draw(&M5.Display, st);
   lastTransferStage = st.stage;
-  drawBackButton();
 }
 
 // Controle remoto pelo navegador. Chamado da tarefa do servidor HTTP, entao so
@@ -2640,28 +2700,36 @@ void startTransfer() {
     setError(PTBR::SEM_WIFI);
     return;
   }
-  // Sem isto o Wi-Fi fica em modem sleep: o rádio só acorda a cada DTIM, o ping
-  // sobe para centenas de ms e o SYN de entrada se perde. Para receber dezenas
-  // de MB o rádio precisa ficar acordado. Religado ao sair, para não custar
-  // bateria nas outras telas.
-  WiFi.setSleep(false);
+  // Sem isto o Wi-Fi pode ficar em modem sleep: o rádio só acorda a cada DTIM,
+  // o ping sobe para centenas de ms e o SYN de entrada se perde. Para receber
+  // dezenas de MB o rádio precisa ficar acordado. No NINA isso é o
+  // noLowPowerMode(). Não se religa a economia ao sair: o Fruit Jam não tem
+  // bateria, e o rádio pela internet também quer o Wi-Fi acordado.
+  {
+    net::Lock trava;
+    WiFi.noLowPowerMode();
+    transferSsid = WiFi.SSID();
+  }
   if (!fileTransfer.begin(sdMutex)) {
-    WiFi.setSleep(true);
     setError(fileTransfer.lastError());
     return;
+  }
+  {
+    // O net::Lock é recursivo: tomar aqui é seguro mesmo que o ip() já o tome.
+    net::Lock trava;
+    transferAddress = "http://" + fileTransfer.ip();
   }
   state = FILE_TRANSFER;
   lastTransferStage = xfer::Stage::Error; // garante o primeiro desenho
   lastTransferDraw = 0;
   drawTransferFrame();
-  Serial.printf("[M5RETRO] Transferencia em http://%s:%u usuario:%s senha:%s escutando:%d\n",
-                fileTransfer.ip().c_str(), (unsigned)fileTransfer.port(), fileTransfer.user(),
+  Serial.printf("[M5RETRO] Transferencia em %s:%u usuario:%s senha:%s escutando:%d\n",
+                transferAddress.c_str(), (unsigned)fileTransfer.port(), fileTransfer.user(),
                 fileTransfer.password(), (int)fileTransfer.listening());
 }
 
 void stopTransfer() {
   fileTransfer.stop();
-  WiFi.setSleep(true); // devolve a economia de energia às demais telas
   state = HOME;
   drawHome();
 }
@@ -2677,13 +2745,14 @@ void transferTick() {
     lastTransferDraw = now;
     const xfer::State st = transferState();
     xfer::drawProgress(&tv, st);
-    xfer::drawProgress(&M5.Display, st);
   }
 }
 
-// Data e hora com segundos, do relógio sincronizado por NTP. Antes do primeiro
-// sincronismo o epoch fica em 1970, e aí mostrar "01/01/1970" seria pior que
-// não mostrar nada — nesse caso sai um aviso.
+// Data e hora com segundos, do relógio sincronizado por NTP. O Fruit Jam não tem
+// RTC com bateria: a hora só existe depois que o ESP32-C6 sincronizou (RtcClock.h
+// acerta o relógio do sistema com settimeofday). Antes disso o epoch fica em
+// 1970, e mostrar "01/01/1970" seria pior que não mostrar nada — sai "--:--",
+// como um videocassete recém-ligado na tomada.
 static void drawHomeClock(bool limpar) {
   char texto[32];
   const time_t agora = time(nullptr);
@@ -2693,48 +2762,33 @@ static void drawHomeClock(bool limpar) {
     snprintf(texto, sizeof(texto), "%02d/%02d/%04d  %02d:%02d:%02d", t.tm_mday, t.tm_mon + 1,
              t.tm_year + 1900, t.tm_hour, t.tm_min, t.tm_sec);
   } else {
-    snprintf(texto, sizeof(texto), "%s", "RELOGIO NAO SINCRONIZADO");
+    snprintf(texto, sizeof(texto), "%s", "--:--");
   }
-  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    if (limpar)
-      d->fillRect(SAFE_L, CLOCK_Y, SAFE_W, 18, TFT_NAVY);
-    d->setFont(&fonts::Font2);
-    d->setTextSize(1);
-    d->setTextDatum(top_right);
-    d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(texto, SAFE_R - 1, CLOCK_Y);
-    d->setTextDatum(top_left);
-    d->setFont(&fonts::Font0);
-  }
+  GfxTarget *d = &tv;
+  if (limpar)
+    d->fillRect(SAFE_L, CLOCK_Y, SAFE_W, 18, TFT_NAVY);
+  d->setFont(&fonts::Font2);
+  d->setTextSize(1);
+  d->setTextDatum(top_right);
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->drawString(texto, SAFE_R - 1, CLOCK_Y);
+  d->setTextDatum(top_left);
+  d->setFont(&fonts::Font0);
   lastClockDraw = millis();
 }
 
 void drawHome() {
   // 11 itens, na MESMA ordem de homeTarget() em UiLogic.h -- as duas listas
   // andam juntas e trocar uma sem a outra manda o usuario para a tela errada.
-  // Coluna da esquerda: 0..5. Coluna da direita: 6..10.
+  // Coluna da esquerda: 0..5. Coluna da direita: 6..10. (No Core2 havia uma
+  // terceira lista, a grade de toque do LCD; sem tela local ela saiu, e o menu
+  // e so a TV.)
   const char *items[] = {PTBR::VIDEOS,  PTBR::MUSICA,        PTBR::FOTOS,
                          PTBR::RADIO,   PTBR::WEATHER,       PTBR::TRAFEGO,
                          PTBR::PADRAO_TESTE, PTBR::TRANSFERENCIA, PTBR::CONFIGURACOES,
                          PTBR::INFO_SISTEMA, PTBR::DESLIGAR};
   static_assert(sizeof(items) / sizeof(items[0]) == HOME_COUNT,
                 "rotulos do menu inicial fora de sincronia com HOME_COUNT");
-  M5.Display.fillScreen(TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString(PTBR::APP, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-  M5.Display.setTextSize(1);
-  for (int i = 0; i < HOME_COUNT; i++) {
-    const int x = HOME_LCD_X0 + homeColumn(i) * HOME_LCD_COL_W;
-    const int y = HOME_LCD_Y0 + homeRow(i) * HOME_LCD_STEP;
-    const bool selected = i == homeSelection;
-    if (selected)
-      M5.Display.fillRoundRect(x, y - 2, HOME_LCD_COL_W - 8, 16, 3, RCA_ACCENT);
-    M5.Display.setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
-    M5.Display.drawString(String(selected ? ">" : " ") + items[i], x + 4, y);
-  }
   tv.fillScreen(TFT_NAVY);
   tv.setTextDatum(top_left);
   tv.setTextSize(2);
@@ -2757,32 +2811,32 @@ void drawLibrary() {
   const int count = libraryProgramCount();
   librarySelection = count ? constrain(librarySelection, 0, count - 1) : 0;
   const int first = (librarySelection / 4) * 4;
-  for (auto *display : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    display->fillScreen(TFT_NAVY);
-    display->setTextDatum(top_left);
-    display->setTextSize(2);
-    display->setTextColor(TFT_WHITE, TFT_NAVY);
-    display->drawString(PTBR::VIDEOS, SAFE_L, HEAD_Y);
-    display->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-    display->setTextSize(1);
-    if (!count)
-      display->drawString("SEM VIDEOS NO CARTAO", SAFE_L + 6, BODY_Y + 48);
-    for (int row = 0; row < 4 && first + row < count; ++row) {
-      const int index = first + row, y = BODY_Y + 14 + row * 32;
-      String path = libraryProgramAt(index);
-      // Nome de pasta vem do cartão e pode ter acento. As fontes bitmap são
-      // ASCII: sem normalizar, cada letra acentuada em UTF-8 vira DOIS espaços
-      // ("Nao Me Deixes" sairia "N  o Me Deixes").
-      char title[48];
-      ascii::normalize(title, sizeof(title), path.substring(path.lastIndexOf('/') + 1).c_str());
-      const bool selected = index == librarySelection;
-      display->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? RCA_ACCENT : TFT_NAVY);
-      display->setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
-      display->drawString(String(selected ? "> " : "  ") + title, SAFE_L + 8, y + 6);
-    }
-    display->setTextColor(TFT_WHITE, TFT_NAVY);
-    display->drawString(String(count ? librarySelection + 1 : 0) + " / " + count, SAFE_R - 80, HEAD_Y);
+  // Só a TV: o Fruit Jam não tem tela local.
+  GfxTarget *display = &tv;
+  display->fillScreen(TFT_NAVY);
+  display->setTextDatum(top_left);
+  display->setTextSize(2);
+  display->setTextColor(TFT_WHITE, TFT_NAVY);
+  display->drawString(PTBR::VIDEOS, SAFE_L, HEAD_Y);
+  display->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  display->setTextSize(1);
+  if (!count)
+    display->drawString("SEM VIDEOS NO CARTAO", SAFE_L + 6, BODY_Y + 48);
+  for (int row = 0; row < 4 && first + row < count; ++row) {
+    const int index = first + row, y = BODY_Y + 14 + row * 32;
+    String path = libraryProgramAt(index);
+    // Nome de pasta vem do cartão e pode ter acento. As fontes bitmap são
+    // ASCII: sem normalizar, cada letra acentuada em UTF-8 vira DOIS espaços
+    // ("Nao Me Deixes" sairia "N  o Me Deixes").
+    char title[48];
+    ascii::normalize(title, sizeof(title), path.substring(path.lastIndexOf('/') + 1).c_str());
+    const bool selected = index == librarySelection;
+    display->fillRoundRect(SAFE_L, y - 2, SAFE_W, 28, 4, selected ? RCA_ACCENT : TFT_NAVY);
+    display->setTextColor(selected ? TFT_NAVY : TFT_WHITE, selected ? RCA_ACCENT : TFT_NAVY);
+    display->drawString(String(selected ? "> " : "  ") + title, SAFE_L + 8, y + 6);
   }
+  display->setTextColor(TFT_WHITE, TFT_NAVY);
+  display->drawString(String(count ? librarySelection + 1 : 0) + " / " + count, SAFE_R - 80, HEAD_Y);
   drawControllerLabels("ANTERIOR", "PLAY", "PROXIMO");
 }
 
@@ -3526,45 +3580,31 @@ void drawSettings() {
 void drawPhotos() {
   const uint32_t agora = millis();
   if (photoShow.count() == 0) {
-    for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-      d->fillScreen(TFT_NAVY);
-      d->setTextDatum(top_left);
-      d->setTextSize(2);
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(PTBR::FOTOS, SAFE_L, HEAD_Y);
-      d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-      d->setTextSize(1);
-      d->drawString(PTBR::SEM_FOTOS, SAFE_L + 6, BODY_Y + 40);
-      d->drawString("ENVIE PELO MENU TRANSFERIR ARQUIVOS", SAFE_L + 6, BODY_Y + 60);
-    }
+    GfxTarget *d = &tv; // so a TV: o Fruit Jam nao tem tela local
+    d->fillScreen(TFT_NAVY);
+    d->setTextDatum(top_left);
+    d->setTextSize(2);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->drawString(PTBR::FOTOS, SAFE_L, HEAD_Y);
+    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+    d->setTextSize(1);
+    d->drawString(PTBR::SEM_FOTOS, SAFE_L + 6, BODY_Y + 40);
+    d->drawString("ENVIE PELO MENU TRANSFERIR ARQUIVOS", SAFE_L + 6, BODY_Y + 60);
     drawControllerLabels(PTBR::VOLTAR, "", "");
     return;
   }
   // A leitura do cartao tem de acontecer sob o mutex: o audioTask le o mesmo
-  // SPI. O decode em si e sobre o buffer ja em memoria, fora do mutex.
+  // cartao. O decode em si e sobre o buffer ja em memoria, fora do mutex.
   if (sdMutex)
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-  photoShow.load(SD, agora);
+  // No arduino-pico o SD e so uma fachada (SDClass, que nao e fs::FS); o
+  // sistema de arquivos do cartao que o PhotoShow espera e o SDFS.
+  photoShow.load(SDFS, agora);
   if (sdMutex)
     xSemaphoreGive(sdMutex);
 
   // paint() ja limpa a tela, decodifica, poe a legenda e o rodape.
   photoShow.paint(&tv, 0, 0);
-  // O LCD so recebe o texto: decodificar a mesma foto duas vezes dobraria o
-  // custo por quadro sem ganho, e a foto no CVBS e que interessa.
-  M5.Display.fillScreen(TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.drawString(PTBR::FOTOS, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-  M5.Display.setTextSize(1);
-  char nome[48];
-  photoShow.displayName(nome, sizeof(nome));
-  M5.Display.drawString(nome, 12, 52);
-  M5.Display.drawString(String(photoShow.index() + 1) + " / " + String(photoShow.count()), 12, 70);
-  if (!photoShow.hasImage())
-    M5.Display.drawString(photoShow.statusText(), 12, 92);
   drawControllerLabels(PTBR::ANTERIOR, "TEMPO", PTBR::PROXIMO);
 }
 
@@ -3587,7 +3627,7 @@ void enterPhotos() {
     xSemaphoreTake(sdMutex, portMAX_DELAY);
   if (!SD.exists(PHOTOS))
     SD.mkdir(PHOTOS);
-  const int n = photoShow.scan(SD, agora);
+  const int n = photoShow.scan(SDFS, agora); // SDFS, nao SD: ver drawPhotos()
   if (sdMutex)
     xSemaphoreGive(sdMutex);
   photoShow.afterScan(agora);
@@ -3610,21 +3650,10 @@ void drawTestPattern() {
     testpattern::drawSlate(&tv, 0, 0);
   else
     testpattern::drawSnow(&tv, 0, 0);
-  // O LCD nao recebe as barras: ele nao e o que se quer calibrar, e repetir o
-  // padrao la so confundiria a leitura.
-  M5.Display.fillScreen(TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.drawString(PTBR::PADRAO_TESTE, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString(testPatternPage == 0   ? "BARRAS SMPTE + TOM 1 kHz"
-                        : testPatternPage == 1 ? "ENCERRAMENTO"
-                                               : "CHUVISCO",
-                        12, 52);
-  M5.Display.drawString("AJUSTE BRILHO, CONTRASTE E COR NA TV", 12, 72);
-  M5.Display.drawString(toneActive.load() ? "TOM: LIGADO (-20 dBFS)" : "TOM: DESLIGADO", 12, 92);
+  // No Core2 o nome do padrao e o estado do tom iam para o LCD. Sem tela local
+  // nada disso e repetido na TV: texto por cima das barras atrapalharia
+  // justamente a leitura que se quer fazer nelas. O tom de 1 kHz sai pela
+  // tarefa de audio (audioout), puxado do testTone enquanto toneActive.
   drawControllerLabels(PTBR::VOLTAR, "PADRAO", "");
 }
 
@@ -3705,24 +3734,10 @@ void enterRadio() {
   audioscope::reset(audioScope);
   radioPcmUs = 0; radioPcmCalls = 0; radioPcmMaxUs = 0;
   radioWriteUs = 0; radioFramesOut = 0; radioSince = millis();
-  // EXPERIMENTO: o decode de MP3 roda no core 0 disputando com a task_memcpy,
-  // que so existe porque o psram_half_use mantem metade das linhas na PSRAM.
-  // Em RGB332 o quadro inteiro cabe na SRAM e essa tarefa some. A tela do radio
-  // e um relogio parado, entao nao perde nada em cor.
-  radioDepthSaved = settings.color16;
-  if (settings.color16) {
-    settings.color16 = false;
-    applyColorDepth();
-  }
+  // No Core2 o radio baixava o painel para RGB332 enquanto tocava, para sumir
+  // com a task_memcpy do psram_half_use. O DVI do Fruit Jam e sempre RGB565 em
+  // SRAM e nao tem essa tarefa: nada a trocar aqui.
   state = RADIO;
-  M5.Display.fillScreen(TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.drawString(PTBR::RADIO, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-  M5.Display.setTextSize(1);
-  M5.Display.drawString(radio::STATIONS[0].name, 12, 52);
   drawControllerLabels(PTBR::VOLTAR, "", "");
   drawRadioScreen(true);
 }
@@ -3730,10 +3745,6 @@ void enterRadio() {
 void stopRadio() {
   radioActive = false;
   radioStream.end();
-  if (radioDepthSaved && !settings.color16) {
-    settings.color16 = true;
-    applyColorDepth();
-  }
 }
 
 void drawInfo() {
@@ -3797,10 +3808,6 @@ void handleNavigation(NavAction a) {
   if (sleepTimer.active())
     sleepTimer.restart(millis());
   osdUntil = millis() + 3000;
-  // Qualquer botão físico durante o playback religa o backlight, caso o comando
-  // "diag backlight" o tenha desligado para inspeção.
-  if (state == VIDEO_PLAYBACK)
-    setBacklight(true);
   if (a == NavAction::PREVIOUS)
     a = NavAction::LEFT;
   if (a == NavAction::NEXT)
@@ -3843,7 +3850,7 @@ void handleNavigation(NavAction a) {
     else if (a == NavAction::RIGHT)
       homeSelection = (homeSelection + 1) % HOME_COUNT;
     else if (a == NavAction::SELECT) {
-      if (homeSelection == HOME_POWER_OFF) { // DESLIGAR: apaga o Core2 via AXP192.
+      if (homeSelection == HOME_POWER_OFF) { // DESLIGAR: soft-off (tela preta, dorme ate um botao).
         requestPowerOff();
         return;
       }
@@ -3851,9 +3858,12 @@ void handleNavigation(NavAction a) {
       if (state == VIDEO_LIBRARY) {
         libraryScanned = false; // revarre ao entrar na biblioteca
         drawLibrary();
-      } else if (state == MUSIC_BROWSER)
+      } else if (state == MUSIC_BROWSER) {
+        // Revarre ao entrar, como a biblioteca de videos: sem isto a lista so
+        // era montada pelo "diag music" e o menu abria em SEM MUSICAS.
+        musicScanDir();
         drawMusicBrowser();
-      else if (state == AIRCRAFT_RADAR) {
+      } else if (state == AIRCRAFT_RADAR) {
         lastApiPoll = 0; // consulta imediata ao entrar no radar
         drawRadar();
       } else if (state == SETTINGS)
@@ -4105,8 +4115,8 @@ void handleNavigation(NavAction a) {
       return;
     }
     if (a == NavAction::SELECT || a == NavAction::PLAY_PAUSE) {
-      // Um toque curto = PLAY/PAUSA; um comando de "alternar modo" é feito via
-      // toque longo no centro (HOME/BACK), então aqui só PAUSA/RETOMA faz sentido.
+      // Um toque curto = PLAY/PAUSA; segurar o botão do meio já é VOLTAR/INÍCIO,
+      // então aqui só PAUSA/RETOMA faz sentido.
       paused = !paused;
       drawMusicNowPlaying();
       return;
