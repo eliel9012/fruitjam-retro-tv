@@ -12,10 +12,10 @@
 //    32 x fs: 8000 Hz dá 256 kHz e 11025 Hz dá 352,8 kHz — fora da faixa, e o
 //    rádio usa essas taxas.
 // 2. O PIO do arduino-pico chega às taxas de áudio com divisor FRACIONÁRIO: o
-//    BCLK treme um ciclo de 264 MHz. A própria Adafruit documenta (driver
+//    BCLK treme um ciclo de 240 MHz. A própria Adafruit documenta (driver
 //    CircuitPython do TLV320) que no Fruit Jam o PLL não trava nesse BCLK e o
 //    som sai chiado e distorcido, pior abaixo de 22050 Hz — a taxa dos vídeos.
-// 3. O MCLK por PIO do arduino-pico usa divisor INTEIRO do clk_sys; a 264 MHz
+// 3. O MCLK por PIO do arduino-pico usa divisor INTEIRO do clk_sys; a 240 MHz
 //    (DVHSTX) isso erra o MCLK em vários por cento.
 //
 // Solução: o DAC vira MESTRE do I2S.
@@ -243,7 +243,7 @@ int volumeToHalfDb(uint8_t percent) {
 // ---- MCLK ------------------------------------------------------------------
 void startMclk() {
   // Divisor 1: o cristal sai direto. Sem PLL do RP2350 no meio, sem jitter do
-  // clk_sys, e continua certo quando o DVHSTX sobe o relógio para 264 MHz.
+  // clk_sys, e continua certo quando o DVHSTX sobe o relógio para 240 MHz.
   clock_gpio_init(PIN_MCLK, CLOCKS_CLK_GPOUT3_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, 1.0f);
 }
 

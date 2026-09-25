@@ -12,7 +12,7 @@ entra como **não testado no Fruit Jam** até alguém gravar e conferir.
 
 | Função | Core2 + RCA (original) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32 240 MHz, 2 núcleos Xtensa | RP2350B, 2× Cortex-M33, **264 MHz** (o DVHSTX sobe o relógio) |
+| CPU | ESP32 240 MHz, 2 núcleos Xtensa | RP2350B, 2× Cortex-M33, **240 MHz** (o DVHSTX sobe o relógio — a mensagem de erro da lib fala em 264 MHz, mas o `clock_configure` do commit fixado dá 240) |
 | SRAM | ~320 KB | 520 KB |
 | PSRAM | 4,5 MB | 8 MB (QSPI, CS 47) |
 | Vídeo | CVBS NTSC 320×240 (M5ModuleRCA) | **DVI 640×480@60** pelo HSTX, quadro lógico 320×240 dobrado |
