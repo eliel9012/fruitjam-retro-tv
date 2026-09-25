@@ -46,25 +46,28 @@
 //   (4): entrada nunca pode competir com audio.
 //
 // - Clock: o `board_build.f_cpu` do platformio.ini fica em 150 MHz (exigencia
-//   de build do DVHSTX), mas em tempo de execucao o clk_sys passa por DOIS
-//   ajustes: um preinit generico do DVHSTX sobe para 240 MHz antes do
-//   setup() (dvhstx.cpp, display_setup_clock_preinit -- PLL USB 480 MHz / 2);
-//   display::begin() troca de novo, para o valor EXATO que o modo de video
-//   pede (DVHSTX::display_setup_clock, check_sys_clock_khz). Para
-//   640x480@60 esse valor e 126 MHz (bit_clk_khz=252000 -> /2), NAO 240 nem
-//   264 como a documentacao antiga deste port dizia -- conferido lendo
-//   dvhstx.cpp e dvi.cpp, nao suposto. 126 MHz NAO e multiplo de 12 MHz (a
-//   regra que os proprios exemplos da Adafruit para PIO-USB tratam como
-//   obrigatoria e travam o boot se nao bater). Este codigo NAO trava o boot
-//   por isso -- pararia o firmware inteiro por causa de um requisito de uma
-//   biblioteca opcional, o que AGENTS.md nao aceita (retentativa/travamento
-//   sem saida). Em vez disso `logClockFit()` mede e imprime o fato: com
-//   clk_sys=126 MHz os divisores fracionarios que o Pico-PIO-USB calcula para
-//   full/low speed (clk_sys/48e6, /96e6, /6e6, /12e6) caem em 2,625 / 1,3125 /
-//   21 / 10,5 -- todos exatos em oitavos, dentro da resolucao de 1/256 do
-//   divisor de clock do PIO (sem arredondamento). Isso sugere que funciona,
-//   mas e teoria de datasheet: o PRIMEIRO suspeito, se o teclado/gamepad
-//   piscar, travar ou perder relatorios no aparelho, e este clock.
+//   de build do DVHSTX), mas em tempo de execucao o preinit generico do
+//   DVHSTX (dvhstx.cpp, display_setup_clock_preinit, prioridade 101 -- roda
+//   antes de qualquer construtor global nosso) reprograma o clk_sys UMA VEZ
+//   para 240 MHz (PLL_USB 480 MHz / 2) e nunca mais mexe nele depois disso.
+//   O que display::begin() troca, dentro de DVHSTX::init(), e outra coisa:
+//   DVHSTX::display_setup_clock() reprograma o pll_sys e o clk_hstx (o clock
+//   de pixel/TMDS do HSTX) para o valor exato do modo de video -- 126 MHz
+//   para 640x480@60 (bit_clk_khz=252000 -> /2) -- mas o clk_sys continua
+//   vindo do PLL_USB, dominio separado que display_setup_clock() nao toca
+//   (conferido lendo dvhstx.cpp linha a linha: o clock_configure(clk_sys,...)
+//   so aparece dentro do preinit). Ou seja o clk_sys do firmware inteiro,
+//   inclusive quando o USB host roda, e 240 MHz -- nao 126. 240 MHz e
+//   multiplo exato de 12 MHz (240/12 = 20), que e a regra que os proprios
+//   exemplos da Adafruit para PIO-USB tratam como obrigatoria (Pico-PIO-USB
+//   usa clock_get_hz(clk_sys) direto em usb_tx.pio.h/usb_rx.pio.h e no
+//   comentario do proprio arquivo: "clk_sys should be multiply of 12MHz").
+//   Isto e o clk_hstx que muda por modo de video, nunca o clk_sys -- confusao
+//   ja cometida numa rodada anterior deste port; NAO reintroduzir a ideia de
+//   que o clk_sys segue o modo de video. Mesmo assim `logClockFit()` mede o
+//   clk_sys real em tempo de execucao e so imprime -- nunca trava o boot por
+//   causa de uma biblioteca opcional (AGENTS.md nao aceita travamento sem
+//   saida) -- porque isto e verificacao de hardware real, nao teoria.
 #include "fj/UsbHidMap.h"
 #include <stdint.h>
 

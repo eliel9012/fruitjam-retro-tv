@@ -133,12 +133,12 @@ void serviceRepeat(Device &d, uint32_t now) {
   }
 }
 
-// CPU real em que o firmware roda, DEPOIS de display::begin() ter reprogramado
-// o PLL do sistema para o clock exato do modo de vídeo (ver o comentário
-// grande em UsbHost.h). Só imprime o diagnóstico -- nunca trava o boot: a
-// pilha PIO-USB não tem essa exigência como um assert, é uma prática
-// recomendada dos exemplos da própria Adafruit para full/low speed ficarem
-// dentro da tolerância do padrão USB.
+// Clock que o Pico-PIO-USB realmente usa (clk_sys, fixado em 240 MHz pelo
+// preinit do DVHSTX -- display::begin() reprograma o pll_sys/clk_hstx do
+// vídeo, não o clk_sys; ver o comentário grande em UsbHost.h). Só imprime o
+// diagnóstico -- nunca trava o boot: a pilha PIO-USB não tem essa exigência
+// como um assert, é uma prática recomendada dos exemplos da própria Adafruit
+// para full/low speed ficarem dentro da tolerância do padrão USB.
 void logClockFit() {
   const uint32_t hz = clock_get_hz(clk_sys);
   const bool multipleOf12MHz = (hz % 12000000UL) == 0;

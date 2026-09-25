@@ -12,7 +12,7 @@ entra como **não testado no Fruit Jam** até alguém gravar e conferir.
 
 | Função | Core2 + RCA (original) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32 240 MHz, 2 núcleos Xtensa | RP2350B, 2× Cortex-M33, **126 MHz** em regime (o DVHSTX sobe o relógio duas vezes -- 240 MHz num preinit, depois o valor exato do modo de vídeo; ver §3.11) |
+| CPU | ESP32 240 MHz, 2 núcleos Xtensa | RP2350B, 2× Cortex-M33, **240 MHz** (o DVHSTX sobe o clk_sys uma vez, no preinit; o modo de vídeo reprograma só o pll_sys/clk_hstx, domínio separado; ver §3.11) |
 | SRAM | ~320 KB | 520 KB |
 | PSRAM | 4,5 MB | 8 MB (QSPI, CS 47) |
 | Vídeo | CVBS NTSC 320×240 (M5ModuleRCA) | **DVI 640×480@60** pelo HSTX, quadro lógico 320×240 dobrado |
@@ -175,13 +175,18 @@ porquê de cada decisão estão comentados por extenso em `include/fj/UsbHost.h`
   (independente do FreeRTOS) no núcleo que chama `USBHost.begin()`. O núcleo 0
   tem a interrupção de linha do DVI (~31,5 kHz) e não pode ganhar mais nenhum
   IRQ periódico; o núcleo 1 já absorve RCA_PCM e VIDEO_DEC.
-- **Clock: NÃO é 240 nem 264 MHz em regime.** `display::begin()` reprograma o
-  PLL do sistema para o valor exato que o modo de vídeo pede — 126 MHz para
-  640×480@60 — e isso NÃO é múltiplo de 12 MHz, a regra que os próprios
-  exemplos da Adafruit tratam como obrigatória (e travam o boot se não bater).
-  Este port não trava o boot por isso; só mede e loga (`diag usb` mostra o
-  clk_sys real). NÃO TESTADO: é o primeiro suspeito se o teclado/gamepad
-  piscar, perder relatório ou travar no aparelho.
+- **Clock: `clk_sys` continua em 240 MHz, mesmo com o DVI ativo.** O preinit do
+  DVHSTX sobe o `clk_sys` uma vez, antes do `setup()` (PLL_USB/2). O que
+  `display::begin()` reprograma dentro de `DVHSTX::init()` é outro domínio: o
+  `pll_sys`/`clk_hstx` (clock de pixel/TMDS), para o valor exato do modo de
+  vídeo — 126 MHz para 640×480@60 — sem tocar no `clk_sys`. 240 MHz É múltiplo
+  de 12 MHz (240/12 = 20), a regra que os próprios exemplos da Adafruit para
+  PIO-USB tratam como obrigatória, então essa exigência está satisfeita.
+  `logClockFit()`/`diag usb` mede o `clk_sys` real em tempo de execução mesmo
+  assim, como checagem de hardware, não porque haja motivo para esperar
+  divergência. NÃO TESTADO: o risco maior aqui é o compartilhamento do
+  núcleo 1 (RCA_PCM + VIDEO_DEC + o alarme de 1 ms do PIO-USB) e o mapeamento
+  de botões dos gamepads genéricos, não o clock.
 - **Dispositivos**: teclado HID boot, gamepad HID genérico (parser do report
   descriptor em `include/fj/UsbHidMap.h`, funções puras testadas em
   `tests/test_core.cpp`), DualShock4/DualSense por VID/PID com layout fixo.

@@ -186,9 +186,12 @@ Teclado e gamepad pelas portas USB host. Nada disto rodou num Fruit Jam ainda;
 `include/fj/UsbHost.h` tem as decisões (pilha/PIO/núcleo/clock) por extenso.
 
 - `diag usb` mostra o `clk_sys` real e se é múltiplo de 12 MHz. Em teoria
-  (contas de datasheet, não medição) é 126 MHz — NÃO é múltiplo, e essa é a
-  regra que os exemplos da Adafruit para PIO-USB tratam como obrigatória. Se o
-  teclado/gamepad piscar, perder relatório ou travar, é o primeiro suspeito.
+  (lendo `dvhstx.cpp`, não medição) é 240 MHz — o preinit do DVHSTX fixa o
+  `clk_sys` uma vez só; o modo de vídeo reprograma o `pll_sys`/`clk_hstx`
+  (clock de pixel, 126 MHz para 640×480@60), domínio separado que não afeta o
+  `clk_sys`. 240 MHz É múltiplo de 12 MHz, a regra que os exemplos da Adafruit
+  para PIO-USB tratam como obrigatória — confirmar com `diag usb` no aparelho
+  real continua valendo, mas não é o primeiro suspeito esperado.
 - Teclado USB: setas navegam, Enter seleciona, Esc/Backspace volta, Espaço
   pausa/retoma, PgUp/PgDn é anterior/próximo.
 - Gamepad genérico (HID, sem VID/PID reconhecido): d-pad ou analógico esquerdo

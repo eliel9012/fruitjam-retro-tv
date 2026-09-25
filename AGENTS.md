@@ -30,7 +30,7 @@ só fala DVI.
 
 | | Core2 + RCA (upstream) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, 126 MHz (o DVHSTX sobe o relógio duas vezes: 240 MHz num preinit, depois o valor exato do modo de vídeo -- ver fj/UsbHost.h) |
+| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, **240 MHz** (o DVHSTX sobe o relógio uma vez, no preinit; o modo de vídeo reprograma só o pll_sys/clk_hstx, dominio separado -- ver fj/UsbHost.h) |
 | SRAM / PSRAM | ~320 KB / 4,5 MB | 520 KB / 8 MB (QSPI) |
 | Vídeo | CVBS NTSC 320×240 | DVI 640×480@60, quadro lógico 320×240 |
 | Tela local | LCD 320×240 + touch | **nenhuma** |
@@ -513,11 +513,13 @@ nem sabe da fila do `loop()`. A função entra pela mesma fila do
 navegação capaz de divergir do físico. XInput (Xbox) fica de fora -- ver
 `PLANO_E_REVISAO.md`.
 
-**NÃO TESTADO NO APARELHO.** O maior risco é o clock: `display::begin()` fixa
-o `clk_sys` em 126 MHz (640×480@60), que não é múltiplo de 12 MHz -- a regra
-que os próprios exemplos da Adafruit para PIO-USB tratam como obrigatória.
-`diag usb` mostra o clock real; se o teclado/gamepad piscar, perder relatório
-ou travar, é o primeiro suspeito.
+**NÃO TESTADO NO APARELHO.** O `clk_sys` fica em 240 MHz mesmo com o DVI ativo
+(o modo de vídeo só reprograma o pll_sys/clk_hstx, nunca o clk_sys -- ver
+`fj/UsbHost.h`), e 240 MHz é múltiplo exato de 12 MHz, a regra que os próprios
+exemplos da Adafruit para PIO-USB tratam como obrigatória; `diag usb` confirma
+isso no aparelho real via `logClockFit()`. O maior risco não testado aqui não
+é o clock, e sim o compartilhamento do núcleo 1 (RCA_PCM + VIDEO_DEC + o
+alarme de 1 ms do PIO-USB) e o mapeamento de botões dos gamepads genéricos.
 
 ---
 
@@ -546,11 +548,14 @@ A plataforma é a comunitária do Max Gerhardt
 (`maxgerhardt/platform-raspberrypi`) com o core do Earle Philhower
 (arduino-pico): a plataforma oficial `raspberrypi` do PlatformIO não tem RP2350.
 `board_build.f_cpu` fica em 150 MHz no `platformio.ini` porque a biblioteca do
-DVHSTX recusa compilar com outro valor e sobe o relógio sozinha em tempo de
-execução -- para 240 MHz num preinit antes do `setup()`, depois para o valor
-exato que o modo de vídeo pede (126 MHz para 640×480@60; ver o comentário de
-clock em `include/fj/UsbHost.h`, que precisou medir isto de verdade porque o
-PIO-USB depende do clock). As bibliotecas estão fixadas por commit.
+DVHSTX recusa compilar com outro valor e sobe o `clk_sys` sozinha em tempo de
+execução, uma vez, para 240 MHz, num preinit antes do `setup()`. O modo de
+vídeo escolhido depois em `display::begin()` reprograma só o pll_sys/clk_hstx
+(o clock de pixel do HSTX, 126 MHz para 640×480@60) -- domínio separado do
+clk_sys, que seguiria 240 MHz mesmo que o modo de vídeo mudasse (ver o
+comentário de clock em `include/fj/UsbHost.h`, que precisou conferir isto
+linha a linha porque o PIO-USB depende do clk_sys ser múltiplo de 12 MHz).
+As bibliotecas estão fixadas por commit.
 
 Sem acesso ao registro do PlatformIO: clone as bibliotecas de `lib_deps` numa
 pasta e crie `platformio_local.ini` (ignorado pelo git):
