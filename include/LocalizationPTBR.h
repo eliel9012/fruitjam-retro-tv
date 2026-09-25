@@ -1,15 +1,16 @@
 #pragma once
 
-// All LCD, CRT and portal text is ASCII so the bitmap font is always legible.
+// Todo texto da TV e do portal e ASCII: as fontes bitmap nao tem acento
+// (AGENTS.md 2.7).
 namespace PTBR {
-constexpr const char *APP = "M5 RETRO TV";
+constexpr const char *APP = "FRUIT JAM RETRO TV";
 constexpr const char *INICIANDO = "INICIANDO SISTEMA...";
 constexpr const char *VERIFICANDO_SD = "VERIFICANDO CARTAO SD...";
 constexpr const char *CARREGANDO_CONFIG = "CARREGANDO CONFIGURACOES...";
 constexpr const char *CONECTANDO_WIFI = "CONECTANDO AO WI-FI...";
 constexpr const char *WIFI_CONECTADO = "WI-FI CONECTADO";
 constexpr const char *MODO_OFFLINE = "MODO OFFLINE";
-constexpr const char *INICIANDO_NTSC = "INICIANDO NTSC...";
+constexpr const char *INICIANDO_AUDIO = "INICIANDO AUDIO...";
 constexpr const char *SISTEMA_PRONTO = "SISTEMA PRONTO";
 constexpr const char *VIDEOS = "VIDEOS";
 constexpr const char *TRAFEGO = "TRAFEGO AEREO";
@@ -56,7 +57,7 @@ constexpr const char *ERRO_SD = "ERRO NO CARTAO SD";
 constexpr const char *VIDEO_CORROMPIDO = "VIDEO CORROMPIDO";
 constexpr const char *AUDIO_INVALIDO = "AUDIO INVALIDO";
 constexpr const char *MEMORIA_INSUFICIENTE = "MEMORIA INSUFICIENTE";
-constexpr const char *FALHA_NTSC = "FALHA NTSC";
+constexpr const char *FALHA_VIDEO = "FALHA NO VIDEO DVI";
 constexpr const char *FALHA_AUDIO = "FALHA AUDIO";
 constexpr const char *REDE = "REDE";
 constexpr const char *ENDERECO_IP = "ENDERECO IP";
@@ -66,7 +67,10 @@ constexpr const char *TENTANDO_NOVAMENTE = "TENTANDO NOVAMENTE...";
 constexpr const char *REPRODUZINDO = "REPRODUZINDO";
 constexpr const char *PAUSADO = "PAUSADO";
 constexpr const char *SAIDA_AUDIO = "SAIDA AUDIO";
-constexpr const char *RCA = "RCA";
+// Rotulos da saida de audio. Os nomes RCA/ALTO_FALANTE_INTERNO ficam por
+// compatibilidade com o enum AudioOutput; no Fruit Jam o "RCA" e o fone P2 do
+// DAC, que e o que vai a entrada de audio da TV (PORTING.md 3.4).
+constexpr const char *RCA = "TV (P2)";
 constexpr const char *ALTO_FALANTE_INTERNO = "ALTO-FALANTE";
 constexpr const char *MUDO = "MUDO";
 constexpr const char *OSD_ESTILO_VHS = "OSD VHS";

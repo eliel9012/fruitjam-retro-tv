@@ -1,11 +1,12 @@
-#include <M5Unified.h>
 #include "InputManager.h"
 #include "UiLogic.h"
+#include "fj/Board.h"
 
 void InputManager::begin() {
   _queued = NavAction::NONE;
   _heldZone = _highlightedButton = -1;
   _down = _longSent = _homeSent = _sideLongSent = _repeatSent = false;
+  _chord = _chordSent = false;
 }
 void InputManager::queue(NavAction action, int8_t button) {
   if (_queued == NavAction::NONE)
@@ -34,11 +35,43 @@ NavAction InputManager::getAction() {
   _queued = NavAction::NONE;
   return action;
 }
+bool InputManager::anyDown() {
+  return board::buttonDown(0) || board::buttonDown(1) || board::buttonDown(2);
+}
 
 void InputManager::update() {
   const uint32_t now = millis();
-  // BtnA/B/C are M5Unified's Core2 lower capacitive controls; LCD touch is handled separately.
-  const bool pressed[3] = {M5.BtnA.isPressed(), M5.BtnB.isPressed(), M5.BtnC.isPressed()};
+  // Botoes fisicos do Fruit Jam. O board ja desconta a logica invertida (ativos
+  // em nivel baixo) e o pull-up interno; o repique mecanico e absorvido pelos
+  // limiares de tempo abaixo, todos muito maiores que ele.
+  const bool pressed[3] = {board::buttonDown(0), board::buttonDown(1), board::buttonDown(2)};
+
+  // A+C juntos: atalho para o inicio. Vem antes do caminho de um botao so
+  // porque apertar os dois nunca e exatamente simultaneo: o primeiro a descer
+  // ja abriu um gesto de A ou de C, e ele precisa ser engolido aqui.
+  if (pressed[0] && pressed[2]) {
+    if (!_chord) {
+      _chord = true;
+      _chordSent = false;
+      _chordAt = now;
+    }
+    if (!_chordSent && now - _chordAt >= CHORD_MS) {
+      _chordSent = true;
+      queue(NavAction::HOME, 1);
+    }
+    return;
+  }
+  if (_chord) {
+    // Acorde disparado ou abortado: nada mais sai ate soltar TUDO. Sem isto,
+    // soltar o C um instante antes do A virava um LEFT depois do HOME.
+    if (!pressed[0] && !pressed[1] && !pressed[2]) {
+      _chord = _chordSent = false;
+      _down = _longSent = _homeSent = _sideLongSent = _repeatSent = false;
+      _heldZone = -1;
+    }
+    return;
+  }
+
   int8_t zone = pressed[0] ? 0 : pressed[1] ? 1 : pressed[2] ? 2 : -1;
   if (zone < 0) {
     if (_down) {

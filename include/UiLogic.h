@@ -38,6 +38,11 @@ inline UiState homeTarget(int selection) {
 inline int homeColumn(int index) { return index / HOME_ROWS; }
 inline int homeRow(int index) { return index % HOME_ROWS; }
 
+// homeHit, touchButton, isPlayerAudioButton e isBackButton sao do touch do
+// Core2. O Fruit Jam nao tem tela local nem toque, entao o firmware deixou de
+// chama-las; ficam porque tests/test_core.cpp as cobre e o fork ainda puxa
+// correcoes do upstream.
+
 // Item sob um toque no menu inicial, ou -1 fora da area dos itens.
 // `x0`/`y0` sao o canto do primeiro item, `colW`/`step` a largura da coluna e a
 // altura da linha.

@@ -41,19 +41,21 @@
 #include "SecretsManager.h"
 #include "ConfigurationPortal.h"
 
-// M5Stack Core2 + physically stacked Module13.2 RCA M125.
+// Adafruit Fruit Jam (RP2350B): DVI pelo HSTX, DAC TLV320DAC3100, Wi-Fi no
+// ESP32-C6. Fork do m5-retro-tv (M5Stack Core2 + modulo RCA); ver PORTING.md.
 
+// Os nomes e os valores de JSON ficam os do Core2 por compatibilidade com o
+// settings.json antigo. No Fruit Jam: RCA = fone P2 do DAC (vai a TV),
+// INTERNAL = alto-falante da placa (PORTING.md 3.4).
 enum class AudioOutput : uint8_t { RCA, INTERNAL, MUTED };
 
 struct Settings {
   double lat = 0, lon = 0;
   int rangeKm = 250, refreshSeconds = 10, volume = 75;
   bool vhsOsd = true;
-  // Profundidade do framebuffer do CVBS. true = RGB565 (65536 cores, ~23,5
-  // fps), false = RGB332 (256 cores, ~31 fps). Medido no aparelho: o RGB332
-  // dispensa a conversao por pixel no blit e cabe todo em SRAM, entao roda
-  // mais rapido; o RGB565 ocupa 153600 bytes e metade das linhas vai para a
-  // PSRAM, o que deixa o blit mais lento mas multiplica a cor por 256.
+  // Era a profundidade do framebuffer do CVBS (RGB565 x RGB332). O DVI do Fruit
+  // Jam e sempre RGB565: o campo continua sendo lido e gravado so para o
+  // settings.json do Core2 nao perder a chave, e e ignorado (PORTING.md 3.5).
   bool color16 = true;
   vhs::Wear vhsWear = vhs::Wear::Gasta;
   AudioOutput audioOutput = AudioOutput::RCA;
@@ -78,7 +80,6 @@ bool makeDirectories();
 bool loadConfiguration();
 void saveSettings();
 void serviceWiFi();
-bool initExternalAudio();
 bool openWavAndReadHeader();
 void audioTask(void *);
 int jpegDraw(JPEGDRAW *draw);
@@ -99,22 +100,13 @@ void drawInfo();
 void drawSetupPortal();
 void startSetupPortal();
 void portalSaved(const SecretsConfig &savedSecrets, const RadarConfig &savedSettings);
-void handleTouch();
-void drawBackButton();
 void handleNavigation(NavAction action);
 void drawControllerLabels(const char *left, const char *center, const char *right);
 void drawPlaybackOsd();
-void drawPlaybackController();
-void setBacklight(bool on);
-bool drawStaticPoster(const String &dir);
-void uiHudInit();
-void uiHudDraw();
-void uiHudClear();
-void uiHudTick(uint32_t now);
 void setAudioOutput(AudioOutput output);
-void servicePowerButton();
+void servicePowerOff();
 void requestPowerOff();
-String playbackClock();
+void stopRadio();
 String libraryRoot();
 String normalizeSdPath(const String &path);
 String libraryChildPath(const String &root, const String &entryName);
@@ -171,15 +163,9 @@ static constexpr uint16_t RCA_ACCENT = 0x96BC;
 // homeHit(), para desenho, navegacao e toque nunca discordarem.
 static constexpr int HOME_COUNT = HOME_ITEM_COUNT;
 static constexpr int HOME_POWER_OFF = HOME_COUNT - 1;
-// Duas colunas: 11 itens em uma coluna so nao cabem. No LCD seriam
-// 40 + 11*18 = 238, invadindo a faixa de botoes em 184; no CVBS, 70 + 11*16 =
-// 246, muito alem da barra em 202. Com 6 linhas para em 148 e 166.
-static constexpr int HOME_LCD_COL_W = 148;
-static constexpr int HOME_LCD_X0 = 12;
+// Duas colunas: 11 itens em uma coluna so nao cabem. Na TV seriam 70 + 11*16 =
+// 246, muito alem da barra em 202. Com 6 linhas para em 166.
 static constexpr int HOME_RCA_COL_W = 124;
-// Passo dos itens no LCD. Com 8 itens, 20 px faria o último cair sobre a faixa
-// de botões que começa em 184 e o toque em DESLIGAR teria 4 px úteis.
-static constexpr int HOME_LCD_Y0 = 40, HOME_LCD_STEP = 18;
 
 // Transferência de arquivos por Wi-Fi (include/FileTransfer.h + TransferScreen.h).
 xfer::FileTransfer fileTransfer;
@@ -189,9 +175,6 @@ static uint32_t lastTransferDraw = 0;
 static uint32_t lastClockDraw = 0;
 static constexpr int CLOCK_Y = crt::HEAD_RULE_Y + 4; // 50..66, acima dos itens
 static xfer::Stage lastTransferStage = xfer::Stage::Error; // força o 1º desenho
-// Faixa reservada no LCD do Core2 para o HUD (tempo + progresso) redesenhado a
-// 1 Hz. O vídeo nunca toca o LCD: atrás desta faixa fica apenas o pôster.
-static constexpr int HUD_W = 192, HUD_H = 16, HUD_Y = 204;
 // Weather Channel: faixa do ticker e cadências de consulta.
 static constexpr int TICKER_H = crt::TICKER_H, TICKER_Y = crt::TICKER_Y;
 static constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
@@ -243,15 +226,18 @@ size_t lastJpegUsed = 0;
 // o OSD acreditava ter imagem nova embaixo e pintava contador sobre contador.
 uint32_t renderedSeq = 0;
 // true enquanto o vídeo está atrasado em relação ao relógio de PCM. Só nesse
-// caso o loop encurta a soneca: dormir menos sempre quadruplicaria o polling
-// I2C do touch feito por M5.update() sem ganho nenhum.
+// caso o loop encurta a soneca: fora disso 4 ms sobram para 30 quadros/s e o
+// núcleo fica livre para a tarefa de áudio e a rede.
 bool videoBehind = false;
 uint64_t benchBlitUs = 0;
 uint32_t benchBlitCalls = 0;
-LGFX_Sprite uiHud(&M5.Display); // sprite minúsculo do HUD (tempo + progresso); pai = LCD
-uint32_t lastUiUpdate = 0;      // borda de 1 s que dispara o redesenho do HUD
-static bool backlightOn = true; // estado atual do backlight (DCDC3 do AXP192)
-std::atomic<bool> weatherAudio{false}; // música do Weather Channel em loop (I2S1), flag de áudio em loop
+// Ordem de bytes que o JPEGDEC entrega no quadro corrente. Big-endian é a ordem
+// que o LGFX_Sprite guarda (fj/Display.h), então o blit vira cópia; mas o filtro
+// de fita (VhsFx.h) faz conta de cor no bloco e espera RGB565 nativo. Por isso
+// o formato é escolhido por quadro, e o jpegDraw casa o tipo do ponteiro com
+// ele — o LovyanGFX decide a conversão pelo TIPO (AGENTS.md, armadilha 11).
+bool videoBigEndian = false;
+std::atomic<bool> weatherAudio{false}; // música do Weather Channel em loop, flag de áudio em loop
 
 // --- Weather Channel (Local Forecast) ---
 struct WeatherDay {
@@ -280,7 +266,7 @@ uint16_t lastWeatherBg = 0;
 String tickerPayload, tickerFull;
 int tickerOffset = 0, tickerWrapAt = 0;
 std::atomic<uint32_t> audioUnderruns{0};
-uint32_t lastTouch = 0, lastRadarDraw = 0, lastApiPoll = 0, lastApiGood = 0, lastStats = 0,
+uint32_t lastRadarDraw = 0, lastApiPoll = 0, lastApiGood = 0, lastStats = 0,
          jpegDecodeTotalMs = 0, jpegDecodeMaxMs = 0;
 String lastError, apiStatus = "NAO CONFIGURADA";
 struct RadarRequest {
@@ -399,39 +385,20 @@ static double mp3Phase = 0.0;
 static uint8_t mp3In[4096];
 static size_t mp3InLen = 0;
 
-void drawBackButton() {
-  if (state == HOME || state == BOOT)
-    return;
-  M5.Display.fillRoundRect(280, 4, 36, 30, 4, TFT_BLUE);
-  M5.Display.drawRoundRect(280, 4, 36, 30, 4, RCA_ACCENT);
-  M5.Display.fillTriangle(287, 19, 297, 10, 297, 28, TFT_WHITE);
-  M5.Display.fillRect(296, 16, 12, 6, TFT_WHITE);
-}
-void setBacklight(bool on) {
-  // O backlight do Core2 é alimentado pelo DCDC3 do AXP192; 2800 mV é o brilho
-  // padrão de fábrica. IMPORTANTE: nunca mexa no LDO2 — ele alimenta LCD e
-  // microSD juntos, e desligá-lo derrubaria o cartão.
-  if (on == backlightOn)
-    return;
-  backlightOn = on;
-  M5.Power.Axp192.setDCDC3(on ? 2800 : 0);
-}
 void dualText(const String &line1, const String &line2 = "") {
-  // Trunca as duas linhas para caber nas fontes bitmap (size 2 ~15 chars, size 1
-  // ~40 chars na fonte Courier, 320px), evitando texto vazando do LCD/RCA.
-  const String l1 = line1.length() > 17 ? line1.substring(0, 17) : line1;
+  // Trunca as duas linhas para caber na área segura com a fonte bitmap: size 2
+  // tem 12 px por letra, e 20 letras são 240 px dentro dos 272 da caixa segura
+  // (cabe "FRUIT JAM RETRO TV"); size 1, 6 px, 44 letras.
+  const String l1 = line1.length() > 20 ? line1.substring(0, 20) : line1;
   const String l2 = line2.length() > 44 ? line2.substring(0, 41) + "..." : line2;
-  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    d->fillScreen(TFT_NAVY);
-    d->setTextDatum(middle_center);
-    d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->setTextSize(2);
-    d->drawString(l1, 160, 94);
-    d->setTextColor(RCA_ACCENT, TFT_NAVY);
-    d->setTextSize(1);
-    d->drawString(l2, 160, 130);
-  }
-  drawBackButton();
+  tv.fillScreen(TFT_NAVY);
+  tv.setTextDatum(middle_center);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.setTextSize(2);
+  tv.drawString(l1, 160, 94);
+  tv.setTextColor(RCA_ACCENT, TFT_NAVY);
+  tv.setTextSize(1);
+  tv.drawString(l2, 160, 130);
 }
 void setError(const String &message) {
   if (playing || wavFile)
@@ -549,32 +516,6 @@ void serviceWiFi() {
     apiStatus = "SEM WI-FI";
 }
 
-// Troca a profundidade do framebuffer do CVBS conforme settings.color16.
-//
-// Panel_CVBS::setColorDepth faz deinit() e init(false) quando o painel ja esta
-// ativo (M5GFX 0.2.29, Panel_CVBS.inl:2277), ou seja realoca o framebuffer e o
-// sinal cai por um instante. Por isso so pode ser chamada com o video parado, e
-// quem chama precisa repintar a tela depois: o framebuffer novo vem em branco.
-//
-// Devolve true se a profundidade efetiva bate com a pedida. Se a alocacao do
-// RGB565 falhar por falta de PSRAM a biblioteca cai sozinha para 8 bits, e e
-// esse retorno que avisa.
-bool applyColorDepth() {
-  // getColorDepth devolve color_depth_t, nao um numero de bits: o byte baixo e
-  // que carrega a contagem (bit_mask = 0x00FF) e os bits altos marcam variantes
-  // como grayscale_8bit = 8|alternate = 0x1008. Comparar o enum cru com 8 ou 16
-  // funcionaria por acidente hoje, porque rgb332_1Byte = 8 e rgb565_2Byte = 16,
-  // mas erraria em qualquer variante. Mascara sempre.
-  const uint16_t desejada = settings.color16 ? 16 : 8;
-  const uint16_t atual =
-      (uint16_t)(tv.getColorDepth() & lgfx::v1::color_depth_t::bit_mask);
-  if (atual == desejada)
-    return true;
-  tv.setColorDepth(settings.color16 ? lgfx::v1::color_depth_t::rgb565_2Byte
-                                     : lgfx::v1::color_depth_t::rgb332_1Byte);
-  return (uint16_t)(tv.getColorDepth() & lgfx::v1::color_depth_t::bit_mask) == desejada;
-}
-
 void saveSettings() {
   playbackVolume = settings.volume;
   if (sdMutex)
@@ -599,17 +540,6 @@ void drawSetupPortal() {
     tv.drawString(portal.status() == PortalStatus::CONFIGURANDO ? "CONFIGURACAO ATIVA"
                                                                  : "AGUARDANDO CELULAR...",
                    SAFE_L, 180);
-    M5.Display.fillScreen(TFT_NAVY);
-    M5.Display.setTextDatum(top_left);
-    M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-    M5.Display.setTextSize(2);
-    M5.Display.drawString("M5 RETRO TV", 12, 8);
-    M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-    M5.Display.drawString("CONFIGURACAO", 12, 48);
-    M5.Display.setTextSize(1);
-    M5.Display.drawString("WI-FI: " + portal.apSsid(), 20, 88);
-    M5.Display.drawString("SENHA: " + portal.apPassword(), 20, 112);
-    M5.Display.drawString("ABRA: 192.168.4.1", 20, 136);
     drawControllerLabels("VOLTAR", "STATUS", "SAIR");
   }
 }
@@ -650,37 +580,15 @@ void portalSaved(const SecretsConfig &savedSecrets, const RadarConfig &savedSett
   secrets.token = savedSecrets.token;
   secrets.insecure = savedSecrets.allowInsecureTls;
   applySettings(savedSettings);
-  network.begin(savedSecrets);
-  WiFi.disconnect(false, false);
-  WiFi.begin(secrets.ssid.c_str(), secrets.password.c_str());
+  // O ESP32-C6 com NINA não faz ponto de acesso e estação ao mesmo tempo: a
+  // conexão com a rede nova só pode começar depois que o portal derrubar o AP.
+  // Quem faz isso é o loop(), um instante depois, para o celular ainda receber
+  // a página de "salvo" (ver o bloco SETUP_PORTAL do loop).
   networkConfigPresent = true;
   portalSavePending = true;
   portalSaveStarted = millis();
   apiStatus = "CONECTANDO WI-FI";
   dualText("CONFIGURACAO SALVA", "CONECTANDO AO WI-FI...");
-}
-
-bool initExternalAudio() {
-  i2s_config_t c = {};
-  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-  c.sample_rate = 22050;
-  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  c.dma_buf_count = 8;
-  c.dma_buf_len = 256;
-  c.use_apll = false;
-  c.tx_desc_auto_clear = true;
-  if (i2s_driver_install(I2S_NUM_1, &c, 0, nullptr) != ESP_OK)
-    return false;
-  i2s_pin_config_t p = {};
-  p.mck_io_num = I2S_PIN_NO_CHANGE;
-  p.bck_io_num = RCA_BCK;
-  p.ws_io_num = RCA_LRCK;
-  p.data_out_num = RCA_DATA;
-  p.data_in_num = I2S_PIN_NO_CHANGE;
-  return i2s_set_pin(I2S_NUM_1, &p) == ESP_OK;
 }
 
 bool openWavAndReadHeader() {
@@ -697,84 +605,77 @@ bool openWavAndReadHeader() {
   return true;
 }
 
+// Rota do DAC para cada valor do enum herdado do Core2 (PORTING.md 3.4).
+static audioout::Route audioRouteFor(AudioOutput output) {
+  return output == AudioOutput::RCA        ? audioout::Route::HEADPHONE
+         : output == AudioOutput::INTERNAL ? audioout::Route::SPEAKER
+                                           : audioout::Route::MUTED;
+}
+
+static const char *audioOutputLabel(AudioOutput output) {
+  return output == AudioOutput::RCA ? "fone P2 (TV)" : output == AudioOutput::INTERNAL ? "alto-falante" : "mudo";
+}
+
+// Espera o ritmo do relógio de amostras depois de entregar `frames` quadros à
+// taxa `rate`. O audioout::write() volta assim que o bloco cabe no buffer do
+// I2S, ANTES de ele soar; sem esta espera o samplesPlayed correria na frente do
+// som pela profundidade do buffer, e o vídeo junto (AGENTS.md 3.5).
+static void pacePcm(int64_t &pcmDueUs, uint32_t frames, uint32_t rate) {
+  if (!pcmDueUs)
+    pcmDueUs = esp_timer_get_time();
+  pcmDueUs += ((int64_t)frames * 1000000LL) / rate;
+  const int64_t waitUs = pcmDueUs - esp_timer_get_time();
+  if (waitUs > 0)
+    vTaskDelay(pdMS_TO_TICKS((waitUs + 999) / 1000));
+  else if (waitUs < -50000) {
+    pcmDueUs = esp_timer_get_time();
+    audioUnderruns++;
+  }
+}
+
 void audioTask(void *) {
-  // These buffers remain in internal RAM. The speaker queue also needs the source
-  // blocks to remain valid after playRaw returns, so three blocks are rotated.
-  uint8_t *buffers[3] = {};
-  for (auto &buffer : buffers)
-    buffer = (uint8_t *)heap_caps_malloc(AUDIO_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  if (!buffers[0] || !buffers[1] || !buffers[2]) {
-    for (auto buffer : buffers)
-      free(buffer);
+  // Um bloco só, na SRAM. O audioout::write() copia o PCM para o buffer do I2S
+  // antes de voltar, então acabou o rodízio de três blocos que o M5.Speaker do
+  // Core2 exigia (ele guardava o ponteiro até tocar).
+  uint8_t *buf = (uint8_t *)malloc(AUDIO_CHUNK);
+  if (!buf) {
     audioFailed = true;
     audioIdle = true;
     vTaskDelete(nullptr);
     return;
   }
+  int16_t *pcm = reinterpret_cast<int16_t *>(buf);
+  AudioOutput active = audioOutput.load();
+  audioout::setRoute(audioRouteFor(active));
   audioReady = true;
-  uint8_t bufferIndex = 0;
-  AudioOutput active = AudioOutput::RCA;
+  // Taxa aplicada por último ao DAC; 0 força a primeira fonte a aplicar a sua.
+  uint32_t activeRate = 0;
   bool outputPaused = false;
   int64_t pcmDueUs = 0;
   for (;;) {
     audioIdle = false;
-    AudioOutput wanted = audioOutput.load();
+    const AudioOutput wanted = audioOutput.load();
     if (wanted != active) {
-      // Core2 internal audio and the RCA module share DATA and LRCK. Stop I2S1,
-      // rather than merely filling it with zeroes, so it no longer drives those lines.
-      if (active == AudioOutput::RCA) {
-        i2s_zero_dma_buffer(I2S_NUM_1);
-        i2s_stop(I2S_NUM_1);
-        i2s_driver_uninstall(I2S_NUM_1);
-        pinMode(RCA_BCK, INPUT);
-      }
-      if (active == AudioOutput::INTERNAL)
-        if (M5.Speaker.isRunning())
-          M5.Speaker.end();
-      if (wanted == AudioOutput::INTERNAL) {
-        if (!M5.Speaker.begin()) {
-          audioFailed = true;
-          playing = false;
-          audioIdle = true;
-          vTaskDelete(nullptr);
-          return;
-        }
-        M5.Speaker.setVolume(255);
-        Serial.printf("[M5RETRO] Audio: alto-falante interno, volume:%d\n", playbackVolume.load());
-      } else if (wanted == AudioOutput::RCA) {
-        if (!initExternalAudio()) {
-          audioFailed = true;
-          playing = false;
-          audioIdle = true;
-          vTaskDelete(nullptr);
-          return;
-        }
-        Serial.println("[M5RETRO] Audio: RCA selecionado");
-      } else {
-        Serial.println("[M5RETRO] Audio: mudo selecionado");
-      }
+      // Fone e alto-falante são saídas do mesmo DAC: trocar é mudar registrador,
+      // não desmontar o I2S1 como no Core2. O I2S segue correndo.
+      audioout::setRoute(audioRouteFor(wanted));
+      Serial.printf("[M5RETRO] Audio: %s\n", audioOutputLabel(wanted));
       active = wanted;
-      outputPaused = false;
       pcmDueUs = 0;
     }
-    // Pause must silence the physical output as well as stop file reads. Clear
-    // the RCA DMA queue so a tap does not leave already-buffered PCM playing.
+    // Pausa tem de calar a saída física, não só parar de ler o cartão: o
+    // flushSilence() descarta o PCM já enfileirado no I2S.
     // `!wavFile && !mp3Mode` (e não apenas `!wavFile`) porque, no MP3, o arquivo
     // aberto é `mp3File` (wavFile fica nulo) — senão o MP3 nunca tocaria.
-    // O tom e a terceira fonte de audio, ao lado do playback e da musica do
-    // Weather. Fica ANTES da condicao de ocioso porque nao vem do cartao: nao
-    // toma o sdMutex e nao pode cair no ramo que exige wavFile ou mp3Mode.
-    // Radio e tom nao vem do cartao e por isso nao satisfazem `wavFile ||
-    // mp3Mode`: sem excluir os dois aqui, a saida era PAUSADA embaixo deles.
+    // Rádio e tom não vêm do cartão e por isso não satisfazem `wavFile ||
+    // mp3Mode`: sem excluir os dois aqui, a saída era PAUSADA embaixo deles.
+    // `paused` vale para TODAS as fontes. No Core2 o rádio pausado caía no
+    // caminho do cartão com o arquivo fechado, e o setAudioOutput() esperava
+    // um audioIdle que nunca vinha.
     const bool fonteViva = radioActive.load() || toneActive.load();
-    if (!fonteViva && ((!playing && !weatherAudio.load()) || paused || (!wavFile && !mp3Mode))) {
-      if (!outputPaused && active == AudioOutput::RCA) {
-        i2s_zero_dma_buffer(I2S_NUM_1);
-        i2s_stop(I2S_NUM_1);
-      }
-      if (!outputPaused && active == AudioOutput::INTERNAL)
-        if (M5.Speaker.isRunning())
-          M5.Speaker.end();
+    if (paused.load() || (!fonteViva && ((!playing && !weatherAudio.load()) || (!wavFile && !mp3Mode)))) {
+      if (!outputPaused)
+        audioout::flushSilence();
       outputPaused = true;
       pcmDueUs = 0;
       audioIdle = true;
@@ -782,35 +683,36 @@ void audioTask(void *) {
       continue;
     }
     if (outputPaused) {
-      if (active == AudioOutput::RCA)
-        i2s_start(I2S_NUM_1);
-      else if (active == AudioOutput::INTERNAL) {
-        if (!M5.Speaker.begin()) {
-          audioFailed = true;
-          playing = false;
-          audioIdle = true;
-          vTaskDelete(nullptr);
-          return;
-        }
-        M5.Speaker.setVolume(255);
-      }
       outputPaused = false;
       pcmDueUs = 0;
     }
-    // Radio e tom entram AQUI, depois do bloco acima, e nao antes. Chegando a
-    // essas telas vindo de ocioso, outputPaused esta true e o DMA do I2S foi
-    // zerado e parado; rodando antes, o `continue` pulava a reativacao e a
-    // escrita ia para um driver parado. Era esse o "sem som" no radio e no tom
-    // de 1 kHz do padrao de teste.
-    // Radio: como o tom, nao vem do cartao, entao nao toma o sdMutex nem passa
-    // pela condicao de ocioso que exige wavFile ou mp3Mode. readPcm devolve 0
-    // enquanto o anel nao tem pre-buffer; ai e so nao escrever nada e voltar,
-    // que o DMA repete o silencio em vez de estalar.
-    if (radioActive.load() && !paused) {
-      uint8_t *buf = buffers[bufferIndex];
+    // Rádio, tom e MP3 saem já em 22050 Hz (o MP3 passa pelo reamostrador); o
+    // WAV sai na taxa do cabeçalho. Trocar a taxa reprograma o I2S e o PLL do
+    // DAC, por isso só acontece quando a fonte muda de taxa.
+    const bool doCartao = !fonteViva;
+    const uint32_t wantRate = (doCartao && !mp3Mode) ? sampleRate : 22050;
+    if (wantRate != activeRate) {
+      if (!audioout::setRate(wantRate)) {
+        Serial.printf("[M5RETRO] ERRO: DAC recusou %lu Hz\n", (unsigned long)wantRate);
+        activeRate = 0; // a próxima fonte tenta de novo
+        if (doCartao) {
+          audioStreamError = true;
+          playbackFinished = true;
+          playing = false;
+          weatherAudio = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+        continue;
+      }
+      activeRate = wantRate;
+      pcmDueUs = 0;
+    }
+    // Rádio: como o tom, não vem do cartão, então não toma o sdMutex. readPcm
+    // devolve 0 enquanto o anel não tem pré-buffer; aí é só não escrever nada e
+    // voltar, que o I2S repete o silêncio em vez de estalar.
+    if (radioActive.load()) {
       const int64_t tDec = esp_timer_get_time();
-      const size_t amostras =
-          radioStream.readPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
+      const size_t amostras = radioStream.readPcm(pcm, AUDIO_CHUNK / sizeof(int16_t));
       {
         const uint32_t us = (uint32_t)(esp_timer_get_time() - tDec);
         radioPcmUs.fetch_add(us);
@@ -820,83 +722,34 @@ void audioTask(void *) {
         radioFramesOut.fetch_add(amostras / 2);
       }
       if (!amostras) {
-        // Anel vazio: nada foi entregue, entao nao ha o que pacear. Rebasear o
-        // relogio e essencial -- dormindo 10 ms sem mexer no pcmDueUs, o
-        // deficit se acumula, cruza os 50 ms e conta um underrun a cada ~260
-        // ms. Foram 308 em 80 s medidos assim, quase todos falsos.
+        // Anel vazio: nada foi entregue, então não há o que pacear. Rebasear o
+        // relógio é essencial -- dormindo sem mexer no pcmDueUs, o déficit se
+        // acumula, cruza os 50 ms e conta underruns falsos.
         pcmDueUs = 0;
-        // 1 tick (a granularidade minima do FreeRTOS) e nao 10 ms: cada espera
-        // dessas e tempo em que nada sai para o I2S. Faltavam ~1.100 quadros/s
-        // para os 22050, ou 50 ms por segundo -- cinco esperas de 10 ms. Com o
-        // anel quase sempre cheio, a proxima tentativa ja tem dado.
+        // 1 tick (a granularidade mínima do FreeRTOS): cada espera destas é
+        // tempo em que nada sai para o I2S.
         vTaskDelay(1);
         continue;
       }
-      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
-      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
-      const size_t bytes = amostras * sizeof(int16_t);
-      size_t written = 0;
+      playback::scalePcm(pcm, amostras, playbackVolume.load());
+      audioTap.publish(pcm, amostras, 2);
       const int64_t tW = esp_timer_get_time();
-      if (active == AudioOutput::RCA)
-        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
-      else if (active == AudioOutput::INTERNAL)
-        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
+      audioout::write(pcm, amostras / 2);
       radioWriteUs.fetch_add((uint32_t)(esp_timer_get_time() - tW));
-      // Ritmo pelo relogio de amostras, igual ao caminho de WAV/MP3 abaixo.
-      // SEM isto o laco gira o mais rapido que consegue a prioridade 4 no core
-      // 0, mata de fome o IDLE0 e a tarefa de copia de linha do CVBS, e o cao
-      // de guarda reinicia o aparelho -- foi exatamente o que aconteceu:
-      // "task_wdt: IDLE0 (CPU 0)" logo depois de "Radio: no ar".
-      {
-        const uint32_t quadros = amostras / 2; // valores int16 estereo -> quadros
-        if (!pcmDueUs)
-          pcmDueUs = esp_timer_get_time();
-        pcmDueUs += ((int64_t)quadros * 1000000LL) / 22050;
-        const int64_t faltaUs = pcmDueUs - esp_timer_get_time();
-        if (faltaUs > 0)
-          vTaskDelay(pdMS_TO_TICKS((faltaUs + 999) / 1000));
-        else if (faltaUs < -50000) {
-          pcmDueUs = esp_timer_get_time();
-          audioUnderruns++;
-        }
-      }
-      bufferIndex = (bufferIndex + 1) % 3;
+      // Sem o ritmo o laço gira o mais rápido que a prioridade 4 deixa e mata de
+      // fome as tarefas de menor prioridade (no Core2, o cão de guarda
+      // reiniciava o aparelho logo depois de "Radio: no ar").
+      pacePcm(pcmDueUs, amostras / 2, 22050);
       continue;
     }
-    if (toneActive.load() && !paused) {
-      uint8_t *buf = buffers[bufferIndex];
-      const size_t amostras =
-          testTone.fillPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / sizeof(int16_t));
-      const size_t bytes = amostras * sizeof(int16_t);
-      playback::scalePcm(reinterpret_cast<int16_t *>(buf), amostras, playbackVolume.load());
-      audioTap.publish(reinterpret_cast<int16_t *>(buf), amostras, 2);
-      size_t written = 0;
-      if (active == AudioOutput::RCA)
-        i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
-      else if (active == AudioOutput::INTERNAL)
-        M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(buf), amostras, 22050, true, 1, -1);
-      // Ritmo pelo relogio de amostras, igual ao caminho de WAV/MP3 abaixo.
-      // SEM isto o laco gira o mais rapido que consegue a prioridade 4 no core
-      // 0, mata de fome o IDLE0 e a tarefa de copia de linha do CVBS, e o cao
-      // de guarda reinicia o aparelho -- foi exatamente o que aconteceu:
-      // "task_wdt: IDLE0 (CPU 0)" logo depois de "Radio: no ar".
-      {
-        const uint32_t quadros = amostras / 2; // valores int16 estereo -> quadros
-        if (!pcmDueUs)
-          pcmDueUs = esp_timer_get_time();
-        pcmDueUs += ((int64_t)quadros * 1000000LL) / 22050;
-        const int64_t faltaUs = pcmDueUs - esp_timer_get_time();
-        if (faltaUs > 0)
-          vTaskDelay(pdMS_TO_TICKS((faltaUs + 999) / 1000));
-        else if (faltaUs < -50000) {
-          pcmDueUs = esp_timer_get_time();
-          audioUnderruns++;
-        }
-      }
-      bufferIndex = (bufferIndex + 1) % 3;
+    if (toneActive.load()) {
+      const size_t amostras = testTone.fillPcm(pcm, AUDIO_CHUNK / sizeof(int16_t));
+      playback::scalePcm(pcm, amostras, playbackVolume.load());
+      audioTap.publish(pcm, amostras, 2);
+      audioout::write(pcm, amostras / 2);
+      pacePcm(pcmDueUs, amostras / 2, 22050);
       continue;
     }
-    uint8_t *buf = buffers[bufferIndex];
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
       audioUnderruns++;
       continue;
@@ -904,7 +757,7 @@ void audioTask(void *) {
     size_t bytes;
     if (mp3Mode) {
       // MP3: decodifica para PCM 22050 Hz estéreo (resampler linear).
-      const size_t samps = mp3ReadPcm(reinterpret_cast<int16_t *>(buf), AUDIO_CHUNK / 2);
+      const size_t samps = mp3ReadPcm(pcm, AUDIO_CHUNK / 2);
       bytes = samps * sizeof(int16_t);
       xSemaphoreGive(sdMutex);
       if (!bytes) {
@@ -955,58 +808,51 @@ void audioTask(void *) {
         continue;
       }
     }
-    playback::scalePcm(reinterpret_cast<int16_t *>(buf), bytes / sizeof(int16_t), playbackVolume.load());
-    audioTap.publish(reinterpret_cast<int16_t *>(buf), bytes / sizeof(int16_t), wavChannels);
-    size_t delivered = bytes;
-    if (active == AudioOutput::RCA) {
-      size_t written = 0;
-      esp_err_t ok = i2s_write(I2S_NUM_1, buf, bytes, &written, pdMS_TO_TICKS(100));
-      if (ok != ESP_OK || written != bytes) {
-        audioUnderruns++;
-        audioStreamError = true;
-        playbackFinished = true;
-        playing = false;
-      }
-      delivered = written;
-    } else if (active == AudioOutput::INTERNAL) {
-      if (!M5.Speaker.playRaw((const int16_t *)buf, bytes / sizeof(int16_t), sampleRate, true, 1, 0, false)) {
-        audioUnderruns++;
-        audioStreamError = true;
-        playbackFinished = true;
-        playing = false;
-      }
-    }
-    // i2s_write and playRaw may accept a block before it has physically played.
-    // Pace every destination from the PCM sample count, so the video clock is
-    // 15 FPS for this file instead of running at the SD/queue feed rate.
-    const uint32_t frames = delivered / wavBlockAlign;
-    if (!pcmDueUs)
-      pcmDueUs = esp_timer_get_time();
-    pcmDueUs += ((int64_t)frames * 1000000LL) / sampleRate;
-    const int64_t waitUs = pcmDueUs - esp_timer_get_time();
-    if (waitUs > 0)
-      vTaskDelay(pdMS_TO_TICKS((waitUs + 999) / 1000));
-    else if (waitUs < -50000) {
-      pcmDueUs = esp_timer_get_time();
+    playback::scalePcm(pcm, bytes / sizeof(int16_t), playbackVolume.load());
+    audioTap.publish(pcm, bytes / sizeof(int16_t), wavChannels);
+    // O readWav() só aceita PCM 16 bits estéreo, então um bloco do arquivo já é
+    // o formato intercalado L, R que o audioout::write() recebe.
+    const size_t frames = bytes / wavBlockAlign;
+    const size_t delivered = audioout::write(pcm, frames);
+    if (delivered != frames) {
       audioUnderruns++;
+      audioStreamError = true;
+      playbackFinished = true;
+      playing = false;
     }
-    // Advance the player clock only after this PCM block has had time to leave
-    // the selected output. A queued block must not make the timer/video jump.
+    // Relógio do player pelo PCM ENTREGUE, não por millis(): é ele que dita o
+    // quadro alvo no videoTick() (AGENTS.md 3.5).
+    pacePcm(pcmDueUs, delivered, sampleRate);
+    // O relógio só avança depois que o bloco teve tempo de sair: bloco apenas
+    // enfileirado não pode fazer o contador e o vídeo pularem.
     if (playing)
-      samplesPlayed.fetch_add(frames);
-    bufferIndex = (bufferIndex + 1) % 3;
+      samplesPlayed.fetch_add(delivered);
   }
 }
 
+// Escolhe a ordem de bytes do próximo decode (ver videoBigEndian). Chamar entre
+// o jpeg.openRAM() e o jpeg.decode(): o jpegDraw lê a mesma flag, então formato
+// entregue e tipo do ponteiro nunca discordam.
+static void selectVideoPixelType() {
+  videoBigEndian = !vhsFilter.config().enabled;
+  jpeg.setPixelType(videoBigEndian ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
+}
+
 int jpegDraw(JPEGDRAW *draw) {
-  // Saída de vídeo SOMENTE na RCA (composta). Nenhum pixel de frame é espelhado
-  // no LCD: isso libera a banda do barramento SPI compartilhado com o microSD.
+  // Escreve direto no `tv`, que é o próprio framebuffer do DVI: não há cópia
+  // depois, nem espelho em outra tela.
   const int64_t t0 = benchActive ? esp_timer_get_time() : 0;
-  // O filtro de fita fica DENTRO do medicao do bench de proposito: o custo dele
-  // e custo de blit, e esconder isso faria o diag bench mentir.
-  vhsFilter.pushBlock(&tv, draw->x + (CRT_W - videoWidth) / 2,
-                      draw->y + (CRT_H - videoHeight) / 2, draw->iWidth, draw->iHeight,
-                      draw->pPixels);
+  const int x = draw->x + (CRT_W - videoWidth) / 2, y = draw->y + (CRT_H - videoHeight) / 2;
+  if (videoBigEndian) {
+    // Filtro de fita desligado: o bloco já vem na ordem do sprite, e o tipo
+    // swap565_t diz isso ao LovyanGFX, que então só copia.
+    tv.pushImage(x, y, draw->iWidth, draw->iHeight,
+                 reinterpret_cast<const lgfx::swap565_t *>(draw->pPixels));
+  } else {
+    // O filtro de fita fica DENTRO da medição do bench de propósito: o custo
+    // dele é custo de blit, e esconder isso faria o diag bench mentir.
+    vhsFilter.pushBlock(&tv, x, y, draw->iWidth, draw->iHeight, draw->pPixels);
+  }
   if (benchActive) {
     benchBlitUs += uint64_t(esp_timer_get_time() - t0);
     ++benchBlitCalls;
@@ -1052,15 +898,15 @@ bool readAndShowOneFrame(bool render) {
     jpegErrors++;
     return false;
   }
-  // A prévia no LCD foi removida. Mantém-se apenas a limpeza da RCA no primeiro
-  // frame (ou quando a resolução muda), para o CRT iniciar sem lixo.
+  // Limpa a tela no primeiro quadro (ou quando a resolução muda), para o
+  // letterbox em volta de um vídeo menor que 320x240 começar preto.
   const bool firstFrame = (videoFrameIndex == 0);
   if (width != videoWidth || height != videoHeight || firstFrame) {
     videoWidth = width;
     videoHeight = height;
     tv.fillScreen(TFT_BLACK);
   }
-  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  selectVideoPixelType();
   // Sorteia os artefatos deste quadro antes de decodificar: o pushBlock consulta
   // a tabela de deslocamento por linha enquanto os blocos chegam.
   vhsFilter.beginFrame(millis(), (CRT_W - videoWidth) / 2, (CRT_H - videoHeight) / 2, videoWidth,
@@ -1086,96 +932,22 @@ bool readAndShowOneFrame(bool render) {
   return true;
 }
 
-// Alvo temporário do callback de decodificação do pôster. JPEGDEC exige um
-// ponteiro de função (não aceita lambda com captura), então o sprite-alvo é
-// guardado aqui somente durante o jpeg.decode() do pôster.
-static LGFX_Sprite *posterSprite = nullptr;
-
-int posterDraw(JPEGDRAW *draw) {
-  if (posterSprite)
-    posterSprite->pushImage(draw->x, draw->y, draw->iWidth, draw->iHeight,
-                            reinterpret_cast<const lgfx::rgb565_t *>(draw->pPixels));
-  return 1;
-}
-
-bool drawStaticPoster(const String &dir) {
-  // Pôster do programa (opcional): tenta "poster.jpg" na pasta do vídeo e, na
-  // ausência, um pôster global em /M5RETRO/config. O decodificador desenha em
-  // um sprite do tamanho nativo e depois escala/centraliza para 320x240.
-  String posterPath = dir + "/poster.jpg";
-  if (!SD.exists(posterPath))
-    posterPath = String(CONFIG) + "/poster.jpg";
-
-  bool drew = false;
-  File poster = SD.open(posterPath, FILE_READ);
-  if (poster) {
-    const size_t size = poster.size();
-    // Limita a leitura para não atrasar o PLAY: pôsteres ~320x240 cabem com
-    // folga em 128 KB. Arquivos maiores ou inválidos caem no fallback sólido.
-    if (size && size <= MAX_JPEG) {
-      uint8_t *buf = (uint8_t *)ps_malloc(size);
-      if (buf) {
-        if (poster.read(buf, size) == size && jpeg.openRAM(buf, size, posterDraw)) {
-          const int w = jpeg.getWidth(), h = jpeg.getHeight();
-          if (w >= 1 && h >= 1 && w <= 320 && h <= 240) {
-            LGFX_Sprite sprite;
-            sprite.setPsram(true);
-            sprite.setColorDepth(16);
-            if (sprite.createSprite(w, h)) {
-              posterSprite = &sprite;
-              jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-              const bool decoded = jpeg.decode(0, 0, 0);
-              posterSprite = nullptr;
-              if (decoded) {
-                // Mantém a proporção (letterbox) e centraliza em 320x240.
-                M5.Display.fillScreen(TFT_BLACK);
-                const float scale = min(320.0f / w, 240.0f / h);
-                sprite.setPivot(w / 2.0f, h / 2.0f);
-                sprite.pushRotateZoom(&M5.Display, 160, 120, 0, scale, scale);
-                drew = true;
-              }
-              sprite.deleteSprite();
-            }
-          }
-          jpeg.close();
-        }
-        free(buf);
-      }
-    }
-    poster.close();
-  }
-
-  if (!drew) {
-    // Fallback sem arquivo: fundo sólido + título, usando só primitivas M5GFX.
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.drawString(currentTitle, 160, 100);
-  }
-  // O pôster nunca bloqueia o PLAY: retorna true até no fallback. (false só
-  // caberia se o LCD estivesse inacessível, o que não ocorre após M5.begin.)
-  return true;
-}
-
 // ============================================================================
-// Benchmark do caminho de vídeo da RCA ("diag bench")
+// Benchmark do caminho de vídeo ("diag bench")
 //
 // Responde na bancada a pergunta que nenhum simulador de PC responde: até que
-// resolução e taxa ESTE aparelho sustenta na saída composta. Mede as três
-// etapas separadamente, em microssegundos (millis() tem resolução grossa demais
-// para um quadro de ~20 ms), rodando o mais rápido possível, sem cadência de
-// áudio e sem descarte de quadros:
+// resolução e taxa ESTE aparelho sustenta. Mede as três etapas separadamente,
+// em microssegundos (millis() tem resolução grossa demais para um quadro de
+// ~20 ms), rodando o mais rápido possível, sem cadência de áudio e sem descarte
+// de quadros:
 //
 //   leitura   -> tirar o JPEG do cartão (mjpegReader.next)
 //   decode    -> JPEGDEC, já descontado o blit
-//   blit      -> pushImage no framebuffer CVBS, cronometrado dentro do jpegDraw
+//   blit      -> pushImage no framebuffer do DVI, cronometrado dentro do jpegDraw
 //
-// O teto real não é do aparelho e sim do sinal: o NTSC entrega 59,94 campos por
-// segundo e a luminância tem ~4,2 MHz de banda, o que equivale a ~330 pontos por
-// linha. Acima de 320x240 a 30 quadros/s não há qualidade a ganhar no tubo, só
-// trabalho a mais. Este benchmark serve para saber se o Core2 alcança esse teto
-// com a mídia que você preparou.
+// O DVI varre 60 quadros/s, mas o conteúdo foi pensado para TV: acima de
+// 320x240 a 30 quadros/s não há o que ganhar. Este benchmark diz se o RP2350
+// alcança esse teto com a mídia que você preparou.
 // ============================================================================
 static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   stopProgram(); // nada de áudio ou reprodução competindo pelo cartão
@@ -1212,7 +984,8 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   }
 
   // Reaproveita o leitor global: um MjpegReader local são 4104 bytes, e esta
-  // função roda na pilha do loopTask (8 KB), que ainda precisa de FATFS,
+  // função roda na pilha do loop() (a tarefa CORE0 do arduino-pico tem só 4 KB),
+  // que ainda precisa do FAT,
   // deserializeJson e dos printf com float do relatório. O stopProgram() acima
   // já resetou o leitor.
   playback::MjpegReader &reader = mjpegReader;
@@ -1276,7 +1049,7 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
     }
     videoWidth = w; // o jpegDraw centraliza a partir destes
     videoHeight = h;
-    jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+    selectVideoPixelType();
     const bool ok = jpeg.decode(0, 0, 0);
     jpeg.close();
     const uint32_t dUs = uint32_t(esp_timer_get_time() - d0);
@@ -1323,21 +1096,22 @@ static void runVideoBenchmark(const String &dir, uint32_t maxFrames) {
   Serial.printf("[BENCH] leitura SD     : medio %lu us   maximo %lu us   %.2f MB/s\n", avgRead,
                 maxReadUs, mibPerS);
   Serial.printf("[BENCH] decode JPEG    : medio %lu us   maximo %lu us\n", avgDecode, maxDecodeUs);
-  Serial.printf("[BENCH] blit CVBS      : medio %lu us   (%lu blocos)\n", avgBlit, benchBlitCalls);
+  Serial.printf("[BENCH] blit DVI       : medio %lu us   (%lu blocos, %s)\n", avgBlit, benchBlitCalls,
+                videoBigEndian ? "copia direta" : "filtro de fita");
   Serial.printf("[BENCH] quadro inteiro : medio %lu us   pior caso %lu us\n", avgTotal, maxTotalUs);
   Serial.printf("[BENCH] FPS sustentado : %.1f   pior caso %.1f\n", sustainedFps, peakFps);
-  // O NTSC entrega 59,94 campos/s; acima disso a TV nao tem como mostrar.
-  const float ceiling = min(sustainedFps, 59.94f);
+  // O DVI varre 60 quadros/s; acima disso o monitor nao tem como mostrar.
+  const float ceiling = min(sustainedFps, 60.0f);
   Serial.printf("[BENCH] teto util      : %.1f fps (limitado por %s)\n", ceiling,
-                sustainedFps < 59.94f ? "decodificacao/cartao" : "taxa de campo do NTSC");
+                sustainedFps < 60.0f ? "decodificacao/cartao" : "varredura do DVI");
   if (sustainedFps < metaFps)
     Serial.printf("[BENCH] ATENCAO: abaixo dos %.2f fps do meta.json; havera descarte de quadros\n",
                   metaFps);
   Serial.println("[BENCH] ----------------------------------------");
 
   // stopProgram() já levou o estado para VIDEO_LIBRARY; sem redesenhar, a TV
-  // ficava preta enquanto o LCD mostrava a tela anterior e os botões passavam a
-  // agir como se estivessem na biblioteca.
+  // ficava com o último quadro do teste e os botões passavam a agir como se
+  // estivessem na biblioteca.
   videoFrameIndex = 0;
   lastJpegUsed = 0;
   state = VIDEO_LIBRARY;
@@ -1394,13 +1168,10 @@ bool startProgram(const String &dir) {
   videoReadError = false;
   paused = false;
   state = VIDEO_PLAYBACK;
-  setBacklight(true); // LCD visível por padrão, mostrando o pôster + HUD
   tv.fillScreen(TFT_BLACK);
   osdUntil = millis() + 3000;
-  Serial.printf("[M5RETRO] Reproduzindo: %s video:%lu bytes wav:%lu bytes\n", dir.c_str(), mjpegFile.size(),
-                wavDataEnd - wavDataStart);
-  drawStaticPoster(dir);
-  drawBackButton(); // botão voltar (canto sup. direito) sobre o pôster no LCD
+  Serial.printf("[M5RETRO] Reproduzindo: %s video:%lu bytes wav:%lu bytes\n", dir.c_str(),
+                (unsigned long)mjpegFile.size(), (unsigned long)(wavDataEnd - wavDataStart));
   if (!readAndShowOneFrame()) {
     stopProgram();
     return false;
@@ -1419,7 +1190,6 @@ bool startProgram(const String &dir) {
       Serial.printf("[M5RETRO] Legenda: %s\n", srtOpen ? caminho : "falhou ao abrir");
     }
   }
-  drawPlaybackController();
   playing = true;
   // Registro do canal DEPOIS de playing: startProgram() comeca chamando
   // stopProgram(), entao registrar antes seria apagado. Pelo mesmo motivo
@@ -1440,8 +1210,11 @@ void stopProgram() {
   // ligada, a condição de ocioso do audioTask nunca vale e a espera abaixo não
   // termina nunca. Tem que cair ANTES do while, não depois.
   weatherAudio = false;
-  // Wait for the consumer to acknowledge idle before closing or replacing files.
-  while (audioReady && !audioIdle)
+  // Espera o consumidor confirmar ocioso antes de fechar ou trocar arquivos.
+  // Rádio e tom também seguram o áudio fora do ocioso, mas não tocam em arquivo
+  // nenhum: esperar por eles aqui congelava o aparelho (mesma armadilha 3 da
+  // música do Weather), e um desligamento vindo da tela do rádio nunca voltava.
+  while (audioReady && !audioIdle && !radioActive.load() && !toneActive.load())
     vTaskDelay(pdMS_TO_TICKS(1));
   if (sdMutex)
     xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -1453,7 +1226,6 @@ void stopProgram() {
   mjpegReader.reset();
   if (sdMutex)
     xSemaphoreGive(sdMutex);
-  uiHudClear(); // apaga só o HUD; o pôster permanece intacto no LCD
   playbackFinished = false;
   // Sem isto o "pausado" vazava para a próxima tela: entrar no Weather depois de
   // pausar um programa deixava o audioTask no ramo de pausa e a música nunca
@@ -1796,74 +1568,6 @@ String libraryProgramAt(int wantedIndex) {
   return (wantedIndex >= 0 && wantedIndex < libraryCount) ? libraryPaths[wantedIndex] : String("");
 }
 
-String playbackClock() {
-  uint32_t seconds = sampleRate ? samplesPlayed / sampleRate : 0;
-  char text[12];
-  snprintf(text, sizeof(text), "%02lu:%02lu:%02lu", seconds / 3600UL, (seconds / 60UL) % 60UL,
-           seconds % 60UL);
-  return String(text);
-}
-
-void uiHudInit() {
-  // Sprite do HUD criado UMA vez (fora do hot path). Cabe folgadamente no PSRAM
-  // e é reaproveitado por toda a vida útil do programa.
-  uiHud.setPsram(true);
-  uiHud.setColorDepth(16);
-  uiHud.createSprite(HUD_W, HUD_H);
-}
-
-void uiHudDraw() {
-  if (!uiHud.getBuffer())
-    return; // sprite indisponível (PSRAM esgotada): não há HUD a desenhar
-  const uint32_t bytesPerSecond = sampleRate * 4UL;
-  const uint32_t total = bytesPerSecond ? (wavDataEnd - wavDataStart) / bytesPerSecond : 0;
-  char totalText[12];
-  snprintf(totalText, sizeof(totalText), "%02lu:%02lu:%02lu", total / 3600UL, (total / 60UL) % 60UL,
-           total % 60UL);
-  const bool isPaused = paused.load();
-
-  uiHud.fillRect(0, 0, HUD_W, HUD_H, TFT_BLACK);
-  uiHud.setTextDatum(top_left);
-  uiHud.setTextSize(1);
-  uiHud.setTextColor(TFT_WHITE, TFT_BLACK);
-  uiHud.drawString(String(isPaused ? "PAUSA " : "PLAY  ") + playbackClock() + " / " + totalText, 4, 1);
-
-  // Barra de progresso proporcional a samplesPlayed (1 px de preenchimento).
-  const int barX = 4, barY = 12, barW = HUD_W - 8;
-  uiHud.drawRect(barX, barY, barW, 3, RCA_ACCENT);
-  const int progress =
-      total ? constrain(int((samplesPlayed.load() / float(sampleRate)) * barW / total), 0, barW) : 0;
-  if (progress)
-    uiHud.fillRect(barX + 1, barY + 1, progress, 1, TFT_YELLOW);
-
-  uiHud.pushSprite(0, HUD_Y); // uma única transferência SPI por redesenho
-}
-
-void uiHudClear() {
-  // Apaga apenas a faixa do HUD, sem tocar no pôster que ocupa o restante.
-  M5.Display.fillRect(0, HUD_Y, HUD_W, HUD_H, TFT_BLACK);
-}
-
-void uiHudTick(uint32_t now) {
-  // Borda de 1 s baseada em millis() (sem FreeRTOS timer). Redesenha quando a
-  // borda vence ou a pausa muda, para exibir "PAUSA" imediatamente.
-  static bool lastPausedUi = false;
-  const bool isPaused = paused.load();
-  if (now - lastUiUpdate >= 1000 || isPaused != lastPausedUi) {
-    lastPausedUi = isPaused;
-    lastUiUpdate = now;
-    uiHudDraw();
-  }
-}
-
-void drawPlaybackController() {
-  // A prévia no LCD foi removida para liberar o barramento SPI compartilhado.
-  // O Core2 mostra apenas pôster + HUD mínimo, desenhado pelo sprite de 1 Hz
-  // (uiHudDraw). Redesenhos por aqui são pontuais (início/toggle), nunca a cada
-  // 250 ms; o OSD completo continua saindo exclusivamente pela RCA.
-  uiHudDraw();
-}
-
 // Apaga, dentro da faixa do OSD, só o que fica FORA do retângulo do vídeo (o
 // letterbox preto). A parte sobre a imagem é restaurada pelo próximo quadro,
 // ou por redrawCurrentFrame() com o vídeo pausado — assim o OSD some sem
@@ -1889,14 +1593,14 @@ static void clearOsdLetterbox() {
 }
 
 // Redecodifica o quadro atual a partir do jpegBuffer (sem tocar no cartão).
-// Custa um decode (~10-20 ms em 240x160) e só roda com o vídeo pausado, a
-// cada meio segundo, para o PAUSE piscar sobre a imagem parada.
+// Custa um decode e só roda com o vídeo pausado, a cada meio segundo, para o
+// PAUSE piscar sobre a imagem parada.
 static bool redrawCurrentFrame() {
   if (!jpegBuffer || !lastJpegUsed)
     return false;
   if (!jpeg.openRAM(jpegBuffer, lastJpegUsed, jpegDraw))
     return false;
-  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  selectVideoPixelType();
   const bool ok = jpeg.decode(0, 0, 0);
   jpeg.close();
   return ok;
@@ -1956,9 +1660,10 @@ void drawPlaybackOsd() {
 }
 
 void setAudioOutput(AudioOutput output) {
-  // Let the current PCM block finish before persisting to the shared SD card.
-  // The audio task changes I2S ownership while paused, keeping file position and
-  // the video clock stable instead of starving a live SD read during the save.
+  // Deixa o bloco de PCM corrente terminar antes de gravar no cartão, que o
+  // audioTask disputa pelo sdMutex. Com o áudio pausado a posição no arquivo e
+  // o relógio do vídeo ficam parados durante a gravação; a troca de rota em si
+  // é só um registrador do DAC, feita pelo audioTask na volta seguinte.
   const bool wasPaused = paused.load();
   paused = true;
   while (audioReady && !audioIdle && !audioFailed)
@@ -1970,68 +1675,71 @@ void setAudioOutput(AudioOutput output) {
   osdUntil = millis() + 3000;
 }
 
-// Encerra podcast/video/audio, desconecta do Wi-Fi e prepara o Core2 para ser
-// desligado pelo AXP192. Usado tanto pelo botão físico Power quanto pelo item
-// "DESLIGAR" do menu inicial.
+// DESLIGAR. O Fruit Jam não tem PMIC para cortar a própria alimentação (o Core2
+// tinha o AXP192), então é um desligamento suave: encerra o que estiver
+// tocando, derruba o Wi-Fi, cala o DAC, apaga a tela e dorme até um botão, que
+// reinicia a placa (PORTING.md 3.2). Os NeoPixels não precisam ser apagados:
+// o firmware nunca os acende. Usado pelo item DESLIGAR do menu inicial e pelo
+// temporizador de desligar.
 void requestPowerOff() {
   if (powerOffPending)
     return;
   powerOffPending = true;
   powerOffAt = millis() + 120;
+  // Rádio, tom e música do Weather seguram o áudio fora do ocioso: caem antes
+  // de qualquer espera por audioIdle (AGENTS.md, armadilha 3).
+  if (radioActive.load())
+    stopRadio();
+  toneActive = false;
+  weatherAudio = false;
   playing = false;
   paused = true;
   if (portal.active())
     portal.stop();
-  WiFi.disconnect(false, false);
+  network.disconnect();
   Serial.println("[M5RETRO] Desligamento solicitado");
-  dualText("DESLIGANDO...", "APERTE POWER PARA LIGAR");
+  dualText("DESLIGANDO...", "APERTE UM BOTAO PARA LIGAR");
 }
 
-void servicePowerButton() {
-  // M5.BtnPWR is M5Unified's debounced event for the Core2 side Power key.
-  // M5.update() runs before this function, so one physical press becomes one
-  // shutdown request. The AXP192 then restores power on the next Power press.
-  if (!powerOffPending && M5.BtnPWR.wasClicked()) {
-    requestPowerOff();
+// Conclui o desligamento pedido por requestPowerOff(). Os 120 ms de folga deixam
+// a mensagem aparecer e o audioTask ver a pausa. Daqui não se volta: o botão
+// que acorda a placa chama rp2040.reboot(), e o boot refaz tudo do zero, na
+// ordem certa do DAC e do rádio (PORTING.md 2.1).
+void servicePowerOff() {
+  if (!powerOffPending || !timeReached(millis(), powerOffAt))
     return;
-  }
-  if (powerOffPending && (int32_t)(millis() - powerOffAt) >= 0) {
-    stopProgram();
-    Serial.println("[M5RETRO] Alimentacao do Core2 desligada pelo AXP192");
-    Serial.flush();
-    // audioTask acknowledged idle and stopped its current output.
-    M5.Power.powerOff();
-  }
+  stopProgram();
+  audioout::setRoute(audioout::Route::MUTED);
+  audioout::flushSilence();
+  tv.fillScreen(TFT_BLACK);
+  Serial.println("[M5RETRO] Desligamento suave: tela preta, audio mudo, Wi-Fi fora");
+  Serial.flush();
+  // Primeiro espera soltar o botão que escolheu DESLIGAR, senão ele mesmo
+  // religaria a placa na hora. O delay() do FreeRTOS entrega o núcleo à tarefa
+  // ociosa, que dorme em WFI: é esse o "dormir" possível sem PMIC.
+  while (InputManager::anyDown())
+    delay(20);
+  delay(50); // repique do contato ao soltar
+  while (!InputManager::anyDown())
+    delay(20);
+  Serial.println("[M5RETRO] Botao apertado: reiniciando");
+  Serial.flush();
+  rp2040.reboot();
 }
 
 void drawControllerLabels(const char *left, const char *center, const char *right) {
-  const char *labels[3] = {left, center, right};
-  M5.Display.fillRect(0, 184, 320, 56, TFT_NAVY);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.setTextSize(1);
-  for (int i = 0; i < 3; ++i) {
-    const int x = i == 0 ? 6 : i == 1 ? 110 : 214;
-    const int w = i == 1 ? 100 : 100;
-    const bool hot = input.highlightActive() && input.highlightedButton() == i;
-    uint32_t fill = hot ? RCA_ACCENT : TFT_BLUE;
-    uint32_t ink = hot ? TFT_NAVY : TFT_WHITE;
-    M5.Display.fillRoundRect(x, 190, w, 43, 4, fill);
-    M5.Display.drawRoundRect(x, 190, w, 43, 4, TFT_WHITE);
-    M5.Display.setTextColor(ink, fill);
-    M5.Display.drawString(labels[i], x + w / 2, 211);
-  }
-  // Antes isto dependia do osdUntil do player, então a barra sumia sozinha em
-  // telas que nada têm a ver com reprodução — e no boot nem aparecia. Durante o
-  // playback quem manda é o OSD de videocassete, que tem legendas próprias.
+  // Legenda dos três botões na faixa de baixo da TV. Antes isto dependia do
+  // osdUntil do player, então a barra sumia sozinha em telas que nada têm a ver
+  // com reprodução — e no boot nem aparecia. Durante o playback quem manda é o
+  // OSD de videocassete, que tem legendas próprias.
   if (state != VIDEO_PLAYBACK) {
     tv.fillRect(0, BAR_Y, CRT_W, BAR_H, TFT_NAVY);
     tv.setTextDatum(middle_center);
     tv.setTextSize(1);
     tv.setTextColor(RCA_ACCENT, TFT_NAVY);
     tv.drawString(String("[ ") + left + " ]  [ " + center + " ]  [ " + right + " ]", CRT_W / 2,
-                   BAR_Y + BAR_H / 2);
+                  BAR_Y + BAR_H / 2);
   }
-  drawBackButton();
 }
 // ============================================================================
 // Player de música (F1): navegação por pastas estilo iPod + reprodução de WAV.
@@ -4140,106 +3848,15 @@ void handleNavigation(NavAction a) {
 void togglePlayerAudio() {
   if (state != VIDEO_PLAYBACK)
     return;
+  // setAudioOutput() já reabre o OSD por 3 s: é na TV que se vê a troca.
   setAudioOutput(audioOutput == AudioOutput::INTERNAL ? AudioOutput::RCA : AudioOutput::INTERNAL);
-  if (state == VIDEO_PLAYBACK)
-    drawPlaybackController();
-}
-void handleTouch() {
-  if (M5.Touch.getCount())
-    idleMgr.notifyActivity(millis());
-  static bool down = false;
-  static int8_t button = -1;
-  static uint32_t downAt = 0;
-  const uint32_t now = millis();
-  if (!M5.Touch.getCount()) {
-    if (down && button >= 0) {
-      uint32_t held = now - downAt;
-      NavAction action = (button == 0               ? NavAction::LEFT
-                          : button == 2             ? NavAction::RIGHT
-                          : held >= 1500            ? NavAction::HOME
-                          : held >= 700             ? NavAction::BACK
-                          : state == VIDEO_PLAYBACK ? NavAction::PLAY_PAUSE
-                                                    : NavAction::SELECT);
-      input.inject(action, InputSource::LCD_BUTTON);
-    }
-    down = false;
-    button = -1;
-    return;
-  }
-  const auto &p = M5.Touch.getDetail();
-  if (!p.isPressed())
-    return;
-  // Um toque físico durante o playback também religa o backlight (idem à
-  // navegação por botões), caso "diag backlight" o tenha desligado.
-  if (state == VIDEO_PLAYBACK)
-    setBacklight(true);
-  if (!down) {
-    down = true;
-    downAt = now;
-    if (p.y >= 240) {
-      down = false;
-      return;
-    }
-    if (state != HOME && isBackButton(p.x, p.y)) {
-      button = -1;
-      input.inject(NavAction::BACK, InputSource::LCD_BUTTON);
-      return;
-    }
-    if (state == VIDEO_PLAYBACK && isPlayerAudioButton(p.x, p.y)) {
-      button = -1;
-      togglePlayerAudio();
-      return;
-    }
-    if (p.y >= 184)
-      button = touchButton(p.x, p.y);
-    else {
-      button = -1;
-      if (state == HOME) {
-        const int hit = homeHit(p.x, p.y, HOME_LCD_X0, HOME_LCD_Y0, HOME_LCD_COL_W,
-                                HOME_LCD_STEP);
-        if (hit >= 0) {
-          homeSelection = hit;
-          input.inject(NavAction::SELECT, InputSource::LCD_BUTTON);
-        }
-      } else if (state == MUSIC_NOW_PLAYING && p.y >= BODY_Y + 8 && p.y < BODY_Y + 96 &&
-                 p.x >= SAFE_L && p.x < SAFE_L + 88) {
-        // Toque na capa (no LCD) alterna o visualizador do tubo: OSCILOSCOPIO ->
-        // ESPECTRO -> VU, e um quarto toque desliga e devolve capa e metadados
-        // ao CRT. Os tres botoes ja estao tomados nesta tela (voltar, pausa,
-        // faixa anterior/proxima), entao a zona da arte e o lugar que sobrou --
-        // e tocar a arte para mudar o que a TV mostra se explica sozinho.
-        if (!musicScopeOn) {
-          musicScopeOn = true;
-          audioscope::setMode(audioScope, audioscope::SCOPE);
-        } else if (audioScope.mode == audioscope::MODE_COUNT - 1) {
-          musicScopeOn = false;
-        } else {
-          audioscope::cycleMode(audioScope);
-        }
-        drawMusicNowPlaying();
-      } else if (state == MUSIC_NOW_PLAYING && p.y >= 166 && p.y < 192 && p.x >= 16 && p.x < 304) {
-        // Toque na região do progresso: alterna NORMAL -> SHUFFLE -> REPETIR -> NORMAL.
-        if (musicRepeat) {
-          musicShuffle = false;
-          musicRepeat = false;
-        } else if (musicShuffle) {
-          musicShuffle = false;
-          musicRepeat = true;
-        } else {
-          musicShuffle = true;
-          musicRepeat = false;
-        }
-        drawMusicNowPlaying();
-      } else if (state == VIDEO_PLAYBACK)
-        input.inject(NavAction::PLAY_PAUSE, InputSource::LCD_BUTTON);
-    }
-  }
 }
 
-// Local USB diagnostics. Commands never print credentials or persist test settings.
+// Diagnóstico pela USB. Os comandos nunca imprimem credenciais nem gravam
+// ajustes de teste.
 void diagnosticStatus() {
   JsonDocument d;
-  d["build"] = "core2-2026-09-20";
+  d["build"] = "fruitjam-2026-09-25";
   d["uptime_ms"] = millis();
   d["state"] = int(state);
   d["ready"] = bootReady;
@@ -4259,15 +3876,20 @@ void diagnosticStatus() {
   d["jpeg_errors"] = jpegErrors;
   d["dropped"] = droppedFrames;
   d["underruns"] = audioUnderruns.load();
+  // SRAM e PSRAM pela camada fj/Platform.h. O arduino-pico não guarda o mínimo
+  // histórico da heap, então "min_heap" saiu: repetiria o livre atual.
   d["heap"] = ESP.getFreeHeap();
-  d["min_heap"] = ESP.getMinFreeHeap();
+  d["heap_total"] = ESP.getHeapSize();
   d["psram"] = ESP.getFreePsram();
+  d["psram_total"] = ESP.getPsramSize();
+  d["cpu_mhz"] = ESP.getCpuFreqMHz();
   d["audio_output"] = int(audioOutput.load());
+  d["audio_rate"] = audioout::rate();
   d["volume"] = playbackVolume.load();
   d["title"] = currentTitle;
   d["error"] = lastError;
   d["wifi_connected"] = network.connected();
-  d["ip"] = network.connected() ? WiFi.localIP().toString() : "";
+  d["ip"] = network.connected() ? network.ip() : String();
   d["api_status"] = apiStatus;
   d["aircraft_count"] = aircraftCount;
   d["clock_ready"] = time(nullptr) >= 1704067200;
@@ -4319,17 +3941,32 @@ void provisionDevice(const String &payload) {
   drawHome();
   Serial.println("[DIAG] Provisioning saved; secrets redacted");
 }
+// Confere os dois caminhos de cor do jpegDraw: RGB565 nativo (rgb565_t, com o
+// filtro de fita) e RGB565 com os bytes trocados (swap565_t, o
+// RGB565_BIG_ENDIAN do JPEGDEC). Os dois têm de chegar ao sprite com a mesma
+// cor; se só o segundo falhar, o tipo do ponteiro e o formato do JPEGDEC
+// discordam (AGENTS.md, armadilhas 10 e 11).
 void testPixelColors() {
-  M5Canvas sample;
+  LGFX_Sprite sample;
   sample.setColorDepth(16);
-  sample.createSprite(3, 1);
+  if (!sample.createSprite(3, 2)) {
+    Serial.println("[DIAG] RGB565 colors FAIL (sem memoria)");
+    return;
+  }
   uint16_t values[] = {0xf800, 0x07e0, 0x001f};
-  sample.pushImage(0, 0, 3, 1, reinterpret_cast<const lgfx::rgb565_t *>(values));
-  bool correct = true;
+  uint16_t swapped[3];
   for (int i = 0; i < 3; ++i)
-    correct = correct && sample.readPixel(i, 0) == values[i];
+    swapped[i] = (uint16_t)((values[i] >> 8) | (values[i] << 8));
+  sample.pushImage(0, 0, 3, 1, reinterpret_cast<const lgfx::rgb565_t *>(values));
+  sample.pushImage(0, 1, 3, 1, reinterpret_cast<const lgfx::swap565_t *>(swapped));
+  bool nativo = true, trocado = true;
+  for (int i = 0; i < 3; ++i) {
+    nativo = nativo && sample.readPixel(i, 0) == values[i];
+    trocado = trocado && sample.readPixel(i, 1) == values[i];
+  }
   sample.deleteSprite();
-  Serial.println(correct ? "[DIAG] RGB565 colors PASS" : "[DIAG] RGB565 colors FAIL");
+  Serial.printf("[DIAG] RGB565 colors %s (nativo:%s big-endian:%s)\n", nativo && trocado ? "PASS" : "FAIL",
+                nativo ? "ok" : "ERRO", trocado ? "ok" : "ERRO");
 }
 void serviceDiagnostics() {
   static char line[4096];
@@ -4370,18 +4007,14 @@ void serviceDiagnostics() {
       continue;
     }
     if (command == "diag mem") {
-      // O que decide a criacao de uma tarefa nao e o total livre: e o MAIOR
-      // BLOCO CONTIGUO. A pilha de 8192 B da WEATHER_HTTP precisa sair inteira
-      // de um bloco so, e heap fragmentado com 34 KB livres pode nao ter 8 KB
-      // seguidos.
-      Serial.printf("[MEM] livre=%u minimo=%u maior_bloco=%u  interno_livre=%u "
-                    "interno_maior=%u  psram=%u  previsao=%s\n",
-                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
-                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                                               MALLOC_CAP_8BIT),
-                    (unsigned)ESP.getFreePsram(), weatherStatus.load());
+      // SRAM e PSRAM livres pela camada fj/Platform.h. O arduino-pico não expõe
+      // o maior bloco contíguo nem o mínimo histórico, então este comando não
+      // os imprime: um palpite aqui já decidiria errado se a pilha de uma
+      // tarefa cabe.
+      Serial.printf("[MEM] sram_livre=%u de %u  psram_livre=%u de %u  cpu=%u MHz  previsao=%s\n",
+                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
+                    (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
+                    (unsigned)ESP.getCpuFreqMHz(), weatherStatus.load());
       return;
     }
     if (command == "diag radio") {
@@ -4412,9 +4045,9 @@ void serviceDiagnostics() {
       char sl[32], su[32];
       strftime(sl, sizeof(sl), "%Y-%m-%d %H:%M:%S", &local);
       strftime(su, sizeof(su), "%Y-%m-%d %H:%M:%S", &utc);
-      Serial.printf("[HORA] local=%s  utc=%s  fonte=%s  TZ=%s  offset=%lds  bateria_fraca=%d\n", sl,
-                    su, rtcclock::sourceLabel(), rtcclock::timezoneString(),
-                    rtcclock::utcOffsetSeconds(), (int)rtcclock::batteryLow());
+      // Sem RTC no Fruit Jam: a fonte é o NTP do ESP32-C6 ou nenhuma.
+      Serial.printf("[HORA] local=%s  utc=%s  fonte=%s  TZ=%s  offset=%lds\n", sl, su,
+                    rtcclock::sourceLabel(), rtcclock::timezoneString(), rtcclock::utcOffsetSeconds());
       return;
     }
     if (command == "diag fb") {
@@ -4425,10 +4058,8 @@ void serviceDiagnostics() {
       continue;
     }
     if (command == "diag cores") {
-      // Conta cores RGB565 distintas no framebuffer inteiro. Responde onde a cor
-      // se perde: se o valor bater com o do arquivo, o caminho digital está
-      // intacto e o que reduz cor é o elo analógico (largura de banda de croma
-      // do NTSC), não o MJPEG.
+      // Conta cores RGB565 distintas no framebuffer inteiro. Se o valor bater
+      // com o do arquivo, o caminho digital (cartão, JPEGDEC, blit) está intacto.
       static uint16_t linha[CRT_W];
       static uint8_t vistos[8192]; // bitmap de 65536 valores
       memset(vistos, 0, sizeof(vistos));
@@ -4523,11 +4154,7 @@ void serviceDiagnostics() {
       memset(line, 0, sizeof(line));
       continue;
     }
-    if (command == "diag backlight") {
-      // Alterna o backlight (ligado <-> desligado) para inspeção. O próximo
-      // botão/toque físico durante o playback religa o backlight sozinho.
-      setBacklight(!backlightOn);
-    } else if (command == "diag audio toggle") {
+    if (command == "diag audio toggle") {
       togglePlayerAudio();
     } else if (command == "diag radar") {
       stopProgram();
@@ -4571,11 +4198,13 @@ void serviceDiagnostics() {
       handleNavigation(NavAction::LEFT);
     else if (command == "diag right")
       handleNavigation(NavAction::RIGHT);
-    else if (command == "diag audio tv")
+    // "rca"/"internal" ficam pelos scripts do Core2; "fone"/"alto" são os
+    // nomes do Fruit Jam. Nada disto é gravado no cartão.
+    else if (command == "diag audio rca" || command == "diag audio tv" || command == "diag audio fone")
       audioOutput = AudioOutput::RCA;
-    else if (command == "diag audio internal")
+    else if (command == "diag audio internal" || command == "diag audio alto")
       audioOutput = AudioOutput::INTERNAL;
-    else if (command == "diag audio mute")
+    else if (command == "diag audio mute" || command == "diag audio mudo")
       audioOutput = AudioOutput::MUTED;
     else {
       Serial.println("[DIAG] ERROR unknown command");
@@ -4586,81 +4215,46 @@ void serviceDiagnostics() {
   }
 }
 
-void *tlsCalloc(size_t count, size_t size) {
-  // Keep certificate and TLS record buffers out of the DMA-capable SRAM used
-  // by continuous CVBS. Core2 PSRAM is suitable for these CPU-only buffers.
-  void *memory = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  return memory ? memory : heap_caps_calloc(count, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-}
-
 void setup() {
-  Serial.setRxBufferSize(4096);
+  // USB CDC: quando o buffer da placa enche, o host segura o envio, então o
+  // JSON de provisionamento (com o ca.pem) não se perde. No ESP32 a UART
+  // precisava de setRxBufferSize(4096); aqui não existe nem faz falta.
   Serial.begin(115200);
-  auto cfg = M5.config();
-  // Let M5Unified configure Core2 pins and its amplifier callback. End the
-  // speaker before installing RCA; the audio task owns I2S1 from then on.
-  cfg.internal_spk = true; // Configure Core2 pins and amplifier callback; playback starts later.
-  cfg.external_spk = false;
-  M5.begin(cfg);
-  // O Core2 tem um BM8563 com bateria que o firmware nunca usava: a hora vinha
-  // so do NTP, entao sem Wi-Fi o relogio da tela inicial ficava errado. Isto
-  // aplica o fuso e semeia o relogio do sistema com o chip, antes da rede e do
-  // cartao. Nao bloqueia: chip mudo apenas deixa a fonte em SEM HORA.
-  rtcclock::begin();
-  // Semente do modo aleatorio. millis() aqui e baixo e pouco variado; o relogio
-  // do RTC, ja lido acima, da uma semente diferente a cada ligada.
-  tvChannel.seed((uint32_t)time(nullptr) ^ (uint32_t)esp_random());
-  if (psramFound())
-    mbedtls_platform_set_calloc_free(tlsCalloc, heap_caps_free);
-  if (M5.Speaker.isRunning())
-    M5.Speaker.end();
-  auto speakerConfig = M5.Speaker.config();
-  speakerConfig.i2s_port = I2S_NUM_1; // I2S0 belongs to CVBS.
-  speakerConfig.sample_rate = 22050;
-  M5.Speaker.config(speakerConfig);
-  M5.Display.setRotation(1);
-  input.begin();
-  input.setAutoRepeat(true);
-  uiHudInit(); // sprite do HUD criado uma única vez, fora do hot path
-  jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
-  if (!tv.init()) {
-    M5.Display.println(PTBR::FALHA_NTSC);
+  // Ordem FIXA (PORTING.md 2.1). O reset limpo dos periféricos vem antes de
+  // tudo; o DVI sobe antes de qualquer tarefa, porque a interrupção de linha
+  // fica no núcleo que chamou; e o DAC só é configurado DEPOIS de acordar o
+  // ESP32-C6, que pulsa o GPIO 22 e zera o TLV320 junto — ao contrário, o áudio
+  // morre mudo sem erro nenhum.
+  board::begin();
+  if (!display::begin()) {
+    // Sem framebuffer não há tela onde mostrar o erro: sobra o serial.
+    lastError = PTBR::FALHA_VIDEO;
     state = ERROR_SCREEN;
-    drawBackButton();
+    Serial.printf("[M5RETRO] ERRO: %s\n", PTBR::FALHA_VIDEO);
     return;
   }
-  // RGB565. O padrão do Panel_CVBS é RGB332, de 256 cores: medido no aparelho,
-  // um quadro com 5.584 cores no arquivo chegava ao framebuffer com 74 a 98. E
-  // como a JPEGDEC entrega RGB565, cada pixel ainda pagava uma conversão — o
-  // blit custava 193 ns/pixel, 46 ciclos a 240 MHz, para o que deveria ser
-  // cópia. Com psram_half_use o consumo de SRAM interna continua o mesmo
-  // (76.800 B), porque metade das linhas vai para a PSRAM com cache de linha.
-  tv.setColorDepth(16);
-  tv.setOutputBoost(true);
+  // Aplica o fuso de Brasília. Sem RTC no Fruit Jam, a hora fica desconhecida
+  // até o NTP do ESP32-C6 responder, e a interface mostra --:--.
+  rtcclock::begin();
+  // Semente do modo aleatório. Sem RTC o time() do boot é sempre o mesmo; quem
+  // varia a cada ligada é o gerador de hardware.
+  tvChannel.seed((uint32_t)time(nullptr) ^ (uint32_t)esp_random());
+  input.begin();
+  input.setAutoRepeat(true);
+  jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
   dualText(PTBR::APP, PTBR::INICIANDO);
   if (!jpegBuffer) {
     setError(PTBR::MEMORIA_INSUFICIENTE);
     return;
   }
   dualText(PTBR::APP, PTBR::VERIFICANDO_SD);
-
-  // Core2 TF card wiring: SCK=18, MISO=38, MOSI=23, CS=4. GPIO19 is
-  // deliberately not used by SPI: the stacked M125 RCA module owns it for PCM BCK.
-  // Explicit setup avoids GPIO19, which is reserved for RCA audio.
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  // Try the normal 25 MHz rate first, then the conservative 4 MHz rate used by
-  // marginal/older FAT32 cards before reporting a real card error.
-  bool sdMounted = SD.begin(SD_CS, SPI, 25000000);
-  if (!sdMounted) {
-    SD.end();
-    delay(30);
-    sdMounted = SD.begin(SD_CS, SPI, 4000000);
-  }
-  if (!sdMounted) {
+  // SDIO próprio: o cartão não divide barramento com nada, ao contrário do
+  // Core2, onde o VSPI era do LCD também.
+  if (!storage::begin()) {
     setError(PTBR::CARTAO_SD_NAO_ENCONTRADO);
     return;
   }
-  Serial.println("[M5RETRO] SD mounted on Core2 TF bus (CS4 SCK18 MISO38 MOSI23)");
+  Serial.println("[M5RETRO] SD montado (SDIO)");
   sdMutex = xSemaphoreCreateMutex();
   if (!sdMutex) {
     setError(PTBR::ERRO_SD);
@@ -4673,24 +4267,26 @@ void setup() {
   // Always inspect the card at boot. This keeps the video library usable when
   // Wi-Fi has not been configured and leaves serial evidence of the detected path.
   libraryProgramCount();
-  dualText(PTBR::APP, PTBR::CARREGANDO_CONFIG);
-  // O painel subiu em 16 bits la em cima porque a preferencia mora no cartao e
-  // o cartao so foi montado agora. Se o usuario tinha escolhido 8 bits, a troca
-  // acontece aqui, uma vez, antes de qualquer video.
-  if (!loadConfiguration()) {
-    apiStatus = PTBR::CONFIG_REDE_AUSENTE;
-    dualText(PTBR::CONFIG_REDE_AUSENTE, PTBR::EDITE_SECRETS);
-  } else {
-    dualText(PTBR::APP, PTBR::CONECTANDO_WIFI);
-    // NetworkManager retries without blocking the UI.
-  }
-  dualText(PTBR::APP, PTBR::INICIANDO_NTSC);
-  if (!initExternalAudio()) {
+  // Rádio antes do DAC (ver acima). Falhar aqui não impede o uso offline: o
+  // NetworkManager só vai continuar sem conectar.
+  dualText(PTBR::APP, PTBR::CONECTANDO_WIFI);
+  if (!net::beginRadio())
+    Serial.println("[M5RETRO] ERRO: ESP32-C6 nao respondeu; seguindo sem rede");
+  dualText(PTBR::APP, PTBR::INICIANDO_AUDIO);
+  if (!audioout::begin(22050)) {
     setError(PTBR::FALHA_AUDIO);
     return;
   }
+  dualText(PTBR::APP, PTBR::CARREGANDO_CONFIG);
+  if (!loadConfiguration()) {
+    apiStatus = PTBR::CONFIG_REDE_AUSENTE;
+    dualText(PTBR::CONFIG_REDE_AUSENTE, PTBR::EDITE_SECRETS);
+  }
+  // NetworkManager tenta conectar sem travar a interface.
   audioOutput = settings.audioOutput;
-  if (xTaskCreatePinnedToCore(audioTask, "RCA_PCM", 4096, nullptr, 4, &audioTaskHandle, 0) != pdPASS) {
+  // Núcleo 1: o loop() (decodificação e desenho) roda no 0, junto da interrupção
+  // de linha do DVI. Pilha em bytes, como no ESP-IDF (fj/Platform.h).
+  if (xTaskCreatePinnedToCore(audioTask, "RCA_PCM", 4096, nullptr, 4, &audioTaskHandle, 1) != pdPASS) {
     setError(PTBR::FALHA_AUDIO);
     return;
   }
@@ -4732,20 +4328,23 @@ static void redrawCurrentScreen() {
 }
 
 void loop() {
-  M5.update();
-  servicePowerButton();
+  if (state == ERROR_SCREEN && !display::ready()) {
+    // Boot parou antes do vídeo: não há tela nem cartão, só o serial.
+    delay(100);
+    return;
+  }
+  servicePowerOff();
   if (powerOffPending)
     return;
   serviceDiagnostics();
   input.setAutoRepeat(state != VIDEO_PLAYBACK);
   input.update();
-  // Grava no BM8563 quando o NTP chega (e a cada 6 h). Limitado a 1 Hz e sem
-  // I2C fora deste ponto.
+  // Acompanha a hora do NTP (limitado a 1 Hz por dentro).
   rtcclock::poll();
   // Temporizador de desligar, como o dos videocassetes. timeReached() por
   // dentro, entao a volta do millis() nao adia o desligamento por 49 dias.
   // Relogio do radio: so os digitos que mudaram, uma vez por segundo. Repintar
-  // a tela inteira a cada segundo num CVBS de 23 fps pisca e gasta a toa.
+  // a tela inteira a cada segundo pisca e gasta a toa.
   if (state == RADIO) {
     const uint32_t agora = millis();
     if (!radioLastDraw || agora - radioLastDraw >= 250) {
@@ -4771,7 +4370,6 @@ void loop() {
       drawHome();
       return;
     }
-    handleTouch();
     NavAction portalAction = input.getAction();
     if (portalAction == NavAction::BACK || portalAction == NavAction::LEFT ||
         portalAction == NavAction::RIGHT || portalAction == NavAction::HOME) {
@@ -4783,31 +4381,27 @@ void loop() {
     } else if (portalAction != NavAction::NONE) {
       drawSetupPortal();
     }
-    if (portalSavePending) {
-      if (WiFi.status() == WL_CONNECTED) {
-        portalSavePending = false;
-        portal.stop();
-        network.begin(currentSecrets());
-        apiStatus = "CONECTADA";
-        dualText(PTBR::WIFI_CONECTADO, WiFi.localIP().toString());
-        state = HOME;
-        drawHome();
-      } else if (millis() - portalSaveStarted >= 10000) {
-        portalSavePending = false;
-        apiStatus = "SEM WI-FI";
-        drawSetupPortal();
-      }
+    // Configuração salva: o NINA não faz ponto de acesso e estação juntos, então
+    // o AP cai antes de a rede nova ser tentada. 1,5 s de folga para o celular
+    // receber a página de "salvo"; depois disso o NetworkManager conecta (com
+    // o próprio backoff) e o resultado aparece no menu e em SISTEMA.
+    if (portalSavePending && millis() - portalSaveStarted >= 1500) {
+      portalSavePending = false;
+      portal.stop();
+      network.begin(currentSecrets());
+      apiStatus = "CONECTANDO WI-FI";
+      state = HOME;
+      drawHome();
     }
   } else {
     serviceWiFi();
-    handleTouch();
     handleNavigation(input.getAction());
   }
   if (state == VIDEO_PLAYBACK) {
     videoTick();
     // Vinheta entre programas do modo canal. drawBumper() so repinta o cartao
     // inteiro na primeira chamada de cada vinheta; depois so a barra cresce,
-    // entao chamar a cada volta do loop nao pisca no CVBS.
+    // entao chamar a cada volta do loop nao pisca.
     if (tvChannel.bumperActive()) {
       const uint32_t agora = millis();
       tvChannel.drawBumper(&tv, 0, 0, nullptr, agora);
@@ -4819,7 +4413,6 @@ void loop() {
       }
     }
     drawPlaybackOsd();
-    uiHudTick(millis()); // HUD a 1 Hz; a leitura do SD nunca espera este desenho
     if (playbackFinished) {
       playbackFinished = false;
       stopProgram();
@@ -4877,18 +4470,21 @@ void loop() {
   if (millis() - lastStats >= 1000) {
     lastStats = millis();
     uint32_t avg = decodedFrames ? jpegDecodeTotalMs / decodedFrames : 0;
+    // RSSI só com a rede de pé: cada leitura é uma transação no SPI do ESP32-C6,
+    // disputada com as tarefas de rede (net::Lock).
+    const int rssi = network.connected() ? network.rssi() : 0;
     Serial.printf(
-        "[M5RETRO] FPS RCA:%lu FPS JPEG:%lu frames descartados:%lu JPEG medio:%lu JPEG "
-        "maximo:%lu underruns audio:%lu heap livre:%u heap minimo:%u PSRAM livre:%u RSSI:%d API:%s\n",
-        renderedFrames, decodedFrames, droppedFrames, avg, jpegDecodeMaxMs,
-        audioUnderruns.load(), ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getFreePsram(), WiFi.RSSI(),
-        apiStatus.c_str());
+        "[M5RETRO] FPS TV:%lu FPS JPEG:%lu frames descartados:%lu JPEG medio:%lu JPEG "
+        "maximo:%lu underruns audio:%lu SRAM livre:%u PSRAM livre:%u RSSI:%d API:%s\n",
+        (unsigned long)renderedFrames, (unsigned long)decodedFrames, (unsigned long)droppedFrames,
+        (unsigned long)avg, (unsigned long)jpegDecodeMaxMs, (unsigned long)audioUnderruns.load(),
+        (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(), rssi, apiStatus.c_str());
     renderedFrames = decodedFrames = 0;
     jpegDecodeTotalMs = jpegDecodeMaxMs = 0;
   }
   // Soneca adaptativa. A cadência normal de 4 ms é folgada para 30 quadros/s
-  // (33 ms cada) e mantém baixo o polling I2C do touch que o M5.update() faz.
-  // Só quando o vídeo já está atrás do relógio de PCM é que 4 ms de latência
-  // passam a custar quadro, e aí o loop praticamente não dorme.
+  // (33 ms cada) e devolve o núcleo às outras tarefas. Só quando o vídeo já está
+  // atrás do relógio de PCM é que 4 ms de latência passam a custar quadro, e aí
+  // o loop praticamente não dorme.
   delay(state == VIDEO_PLAYBACK && videoBehind ? 1 : 4);
 }
