@@ -87,7 +87,7 @@ $(BUILD)/probe_%: probes/%.cpp $(LGFX_OBJ) $(SHARED_HDRS) | $(BUILD)
 CXX11_HDRS := VcrFont.h VcrOsd.h WeatherIcons.h ScreenFx.h SafeArea.h TransferScreen.h \
               ChannelMode.h TestPattern.h Subtitles.h PhotoShow.h RtcClock.h \
               RadioStream.h RadioScreen.h DiarioLogo.h AudioScope.h BurnIn.h VhsFx.h \
-              Ascii.h PlaybackIO.h Id3.h SafeStorage.h
+              Ascii.h PlaybackIO.h Id3.h SafeStorage.h BootSplash.h
 ifneq ($(HAVE_SDL),)
 CXX11_FLAGS := $(filter-out -std=c++17,$(CXXFLAGS))
 else
