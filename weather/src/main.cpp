@@ -1,23 +1,22 @@
 // ============================================================================
 //  The Weather Channel — Local Forecast (clone anos 80)
-//  M5Stack Core2 + módulo RCA (M125) — vídeo composto NTSC + áudio I2S
+//  Adafruit Fruit Jam (RP2350B) — DVI 640x480 + áudio pelo TLV320DAC3100
 //
-//  PINOS DO I2S (áudio do RCA) :
-//      BCK  = GPIO 19
-//      DATA = GPIO  2
-//      LRCK = GPIO  0
-//      MCK  = NÃO USADO (NONE)
-//
-//  VÍDEO COMPOSTO (CVBS)      : GPIO 26 (periférico I2S0 reservado ao vídeo)
+//  VÍDEO                      : DVI pelo HSTX (GPIO 12..19), quadro lógico de
+//                               320x240 RGB565 dobrado nos dois eixos. O canvas
+//                               global `tv` (fj/Display.h) É o framebuffer.
 //  ÁUDIO EM LOOP CONTÍNUO     : /M5RETRO/weather_music.wav
-//                               (PCM 16-bit estéreo 22050 Hz — já confirmado)
-//
-//  WI-FI (TODO: preencher)    : WIFI_SSID / WIFI_PASS abaixo
+//                               (PCM 16-bit estéreo 22050 Hz) -> TLV320DAC3100,
+//                               saída P2 (fone), que é a que vai à TV. O DVI
+//                               não leva áudio.
+//  CARTÃO                     : microSD em SDIO próprio (fj/Storage.h)
+//  WI-FI (TODO: preencher)    : WIFI_SSID / WIFI_PASS abaixo; ESP32-C6 com
+//                               firmware NINA, TLS feito dentro dele
 //  LOCALIDADE                 : Franca - SP (Open-Meteo, API pública sem chave)
 //
-//  OBSERVAÇÃO DE HARDWARE: o cartão TF do Core2 usa o barramento VSPI
-//  (SCK=18, MISO=38, MOSI=23, CS=4). O GPIO 19 NÃO pode ser usado no SPI
-//  porque pertence ao BCK do módulo RCA empilhado.
+//  A camada de plataforma (include/fj, src/fj) é a mesma do firmware principal,
+//  compilada a partir da raiz — ver platformio.ini. O resto deste arquivo
+//  duplica de propósito rotinas do principal (AGENTS.md §1).
 // ============================================================================
 
 #include <Arduino.h>
@@ -26,20 +25,15 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <SD.h>
-#include <SPI.h>
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <SD.h>
 
-#include <M5Unified.h>
-#include <M5GFX.h>
-#include <M5ModuleRCA.h>
-
-#include <driver/i2s.h>
-#include <esp_heap_caps.h>
-#include <esp_timer.h>
+#include "fj/AudioOut.h"
+#include "fj/Board.h"
+#include "fj/Display.h"
+#include "fj/Net.h"
+#include "fj/Platform.h"
+#include "fj/Storage.h"
 
 // ----------------------------------------------------------------------------
 //  Configurações fixas
@@ -58,28 +52,21 @@ static const char *WEATHER_URL =
     "wind_direction_10m&daily=weather_code,temperature_2m_max,temperature_2m_min"
     "&timezone=America%2FSao_Paulo&forecast_days=3";
 
-// ---- Áudio (I2S1) ----
-static constexpr uint8_t RCA_BCK  = 19;   // BCK do RCA (I2S1)
-static constexpr uint8_t RCA_DATA = 2;    // DATA do RCA (I2S1)
-static constexpr uint8_t RCA_LRCK = 0;    // LRCK/WS do RCA (I2S1)
+// ---- Áudio (TLV320DAC3100) ----
 static const char *WAV_PATH = "/M5RETRO/weather_music.wav";
+// Volume em duas etapas, como no firmware principal: o DAC no máximo e a
+// atenuação em software sobre o PCM (scalePcm), que é linear em amplitude —
+// o volume do DAC é em dB e não daria os mesmos 80% do original.
 static constexpr int AUDIO_VOLUME = 80;   // 0..100
-
-// ---- Vídeo (CVBS) ----
-static constexpr uint8_t CVBS_PIN = 26;
-
-// ---- SD (VSPI — GPIO19 NÃO pode ser usado) ----
-static constexpr uint8_t SD_CS   = 4;
-static constexpr uint8_t SD_SCK  = 18;
-static constexpr uint8_t SD_MISO = 38;
-static constexpr uint8_t SD_MOSI = 23;
+// P2 é a saída que vai à entrada de áudio da TV; o original só tocava pelo RCA.
+static constexpr audioout::Route AUDIO_ROUTE = audioout::Route::HEADPHONE;
 
 // ---- Dimensões e cadências ----
-static constexpr int CRT_W = 320, CRT_H = 240;
-// Área segura do tubo: uma TV CRT corta cerca de 7% de cada borda (overscan),
-// então o raster inteiro nunca aparece. Era isso que cortava o cabeçalho e o
-// ticker no aparelho. O fundo continua sangrando até a borda; texto, linhas e
-// faixas ficam dentro desta caixa.
+static constexpr int CRT_W = display::W, CRT_H = display::H;
+// Área segura: uma TV CRT corta cerca de 7% de cada borda (overscan). No DVI um
+// monitor mostra o raster inteiro, mas TV ligada por HDMI costuma reaplicar o
+// overscan; por isso a caixa segura continua valendo. O fundo continua
+// sangrando até a borda; texto, linhas e faixas ficam dentro desta caixa.
 static constexpr int SAFE_X = 24, SAFE_Y = 18;
 static constexpr int SAFE_L = SAFE_X;          // 24
 static constexpr int SAFE_T = SAFE_Y;          // 18
@@ -87,6 +74,11 @@ static constexpr int SAFE_R = CRT_W - SAFE_X;  // 296
 static constexpr int SAFE_B = CRT_H - SAFE_Y;  // 222
 static constexpr int SAFE_W = SAFE_R - SAFE_L; // 272
 static constexpr size_t AUDIO_CHUNK = 1024;          // bytes por bloco PCM
+// Quanto a tarefa de áudio pode correr à frente do relógio PCM. O ritmo de
+// verdade vem do audioout::write(), que bloqueia com o buffer do I2S cheio; este
+// teto só pega o caso em que ele não bloqueia (DAC fora, implementação
+// provisória) e impede a tarefa de ler o cartão em laço apertado.
+static constexpr int64_t AUDIO_LEAD_US = 100000;
 static constexpr uint32_t WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL; // 10 min
 static constexpr uint32_t WEATHER_RETRY_MS = 30UL * 1000UL;          // retenta falha
 static constexpr uint32_t TICKER_INTERVAL_MS = 33;  // ~30 fps para o ticker
@@ -171,14 +163,11 @@ inline void scalePcm(int16_t *samples, size_t count, int volume) {
 //  Estado compartilhado
 // ----------------------------------------------------------------------------
 
-// NTSC (525/59,94 Hz, preto em 7,5 IRE). O modo PAL_M do M5GFX monta a linha
-// com 908 amostras, mas 4x3,57561149 MHz x 63,5556 us dá 909,02 — a linha sai
-// ~0,11% curta e a fase da burst anda a cada linha, produzindo a faixa de cor
-// diagonal que caminha pela tela. A tabela NTSC usa 910 amostras, valor exato
-// para 4x3,579545 MHz, então a burst fica estável.
-M5ModuleRCA rca(CRT_W, CRT_H, CRT_W, CRT_H, M5ModuleRCA::signal_type_t::NTSC,
-                M5ModuleRCA::use_psram_t::psram_no_use, CVBS_PIN, 200);
-LGFX_Sprite ticker(&rca);
+// Sprite do ticker, desenhado fora da tela e copiado para o `tv` de uma vez:
+// o `tv` é o framebuffer que o DVI está varrendo, e apagar a faixa e escrever
+// o texto direto nele faria o ticker piscar. Mesma profundidade do painel
+// (RGB565), senão a cor sai errada em silêncio (AGENTS.md §7, armadilha 10).
+LGFX_Sprite ticker(&tv);
 
 SemaphoreHandle_t sdMutex = nullptr;
 File wavFile;
@@ -187,8 +176,11 @@ TaskHandle_t audioTaskHandle = nullptr;
 uint32_t sampleRate = 22050, wavDataStart = 0, wavDataEnd = 0;
 uint16_t wavBlockAlign = 4;
 
-std::atomic<bool> audioReady{false};
-std::atomic<bool> audioFailed{false};
+// Bloco PCM da tarefa de áudio. Global, e não local da tarefa: 1 KB a menos na
+// pilha dela. O audioout::write() copia para o buffer do I2S, então um bloco só
+// basta (o original girava três porque o i2s_write do ESP-IDF pedia memória DMA).
+int16_t audioBlock[AUDIO_CHUNK / sizeof(int16_t)];
+
 std::atomic<uint32_t> audioUnderruns{0};
 
 // Dados meteorológicos em buffer duplo. A tarefa HTTP escreve no buffer
@@ -215,10 +207,13 @@ std::atomic<uint32_t> weatherVersion{0};
 std::atomic<bool> weatherValid{false};
 std::atomic<bool> weatherBusy{false};
 
-// Escrita apenas pela tarefa HTTP (core 1), lida pelo loop (core 1).
-char weatherStatus[32] = "CARREGANDO...";
-uint32_t lastWeatherAttempt = 0;
-uint32_t lastWeatherGood = 0;
+// Escritos pela tarefa HTTP e lidos pelo loop(), que aqui rodam em núcleos
+// diferentes (no Core2 os dois ficavam no core 1). Por isso o status virou um
+// ponteiro atômico para literal, em vez de um char[] reescrito por snprintf que
+// o loop poderia ler pela metade.
+std::atomic<const char *> weatherStatus{"CARREGANDO..."};
+std::atomic<uint32_t> lastWeatherGood{0};
+uint32_t lastWeatherAttempt = 0;   // só o loop() mexe
 
 uint32_t lastDrawnVersion = UINT32_MAX;
 uint32_t lastStatusRedraw = 0;
@@ -348,94 +343,81 @@ static bool parseWeather(JsonDocument &doc, WeatherData &out) {
   return true;
 }
 
+// Conecta ao Wi-Fi se preciso. Só roda na tarefa HTTP: o WiFi.begin() do
+// WiFiNINA bloqueia até ~50 s (10 tentativas de 5 s) esperando o ESP32-C6
+// associar, e no loop() isso congelaria o ticker. O net::Lock fica tomado a
+// espera inteira — não há outro usuário do SPI1 neste projeto.
+static bool ensureWiFi() {
+  if (!net::radioReady())
+    return false;
+  net::Lock lock;
+  if (WiFi.status() == WL_CONNECTED)
+    return true;
+  Serial.println("[WEATHER] conectando Wi-Fi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  return WiFi.status() == WL_CONNECTED;
+}
+
 static bool fetchWeather(WeatherData &out) {
-  WiFiClientSecure client;
-  client.setInsecure();   // sem CA (economiza RAM)
-
-  HTTPClient http;
-  http.useHTTP10(true);
-  http.setConnectTimeout(5000);
-  http.setTimeout(5000);
-
-  bool ok = false;
-  if (http.begin(client, WEATHER_URL)) {
-    int code = http.GET();
-    if (code == HTTP_CODE_OK) {
-      // ~800 bytes: lê tudo para um buffer contíguo (o leitor Stream do
-      // ArduinoJson 7.4.2 descarta escalares no ESP32) e rejeita corpo
-      // truncado em vez de publicar dados pela metade.
-      // O buffer fica na PSRAM, não na pilha: esta função roda na tarefa
-      // WEATHER_HTTP, que tem 8 KB de pilha e ainda precisa acomodar os quadros
-      // do HTTPClient e do mbedTLS. 4 KB de array local comiam metade dela.
-      constexpr int cap = 4096;
-      char *buf = (char *)ps_malloc(cap);
-      if (!buf) {
-        Serial.println("[WEATHER] sem memoria para a resposta");
-        http.end();
-        return false;
-      }
-      size_t len = 0;
-      uint32_t quiet = 0;
-      Stream &st = http.getStream();
-      while (len < cap - 1 && quiet < 3000) {
-        int avail = st.available();
-        if (avail > 0) {
-          int n = st.readBytes(buf + len, min(avail, cap - 1 - (int)len));
-          if (n <= 0)
-            break;
-          len += n;
-          quiet = 0;
-        } else if (!http.connected()) {
-          break;
-        } else {
-          delay(5);
-          quiet += 5;
-        }
-      }
-      buf[len] = 0;
-      if (len >= cap - 1) {
-        Serial.println("[WEATHER] resposta maior que o buffer");
-      } else if (len) {
-        JsonDocument doc;
-        DeserializationError err =
-            deserializeJson(doc, buf, DeserializationOption::NestingLimit(8));
-        if (!err)
-          ok = parseWeather(doc, out);
-        else
-          Serial.printf("[WEATHER] parse %s (%u bytes)\n", err.c_str(), (unsigned)len);
-      } else {
-        Serial.println("[WEATHER] corpo vazio");
-      }
-      free(buf);
-    } else {
-      Serial.printf("[WEATHER] HTTP %d\n", code);
-    }
-  } else {
-    Serial.println("[WEATHER] falha em http.begin");
+  // ~800 bytes: o net::httpGet lê tudo para um buffer contíguo (o leitor Stream
+  // do ArduinoJson 7.4.2 descartava escalares no ESP32) e marca `truncated`
+  // quando não coube — aí a resposta é rejeitada em vez de publicar dados pela
+  // metade. O buffer fica na PSRAM, não na pilha da tarefa (AGENTS.md §2.3).
+  constexpr size_t cap = 4096;
+  char *buf = (char *)ps_malloc(cap);
+  if (!buf) {
+    Serial.println("[WEATHER] sem memoria para a resposta");
+    return false;
   }
-  http.end();
+  bool ok = false;
+  // TLS dentro do ESP32-C6, validado pelo bundle de raízes do NINA; o RP2350
+  // não faz handshake nenhum (fj/Net.h).
+  const net::HttpResult r = net::httpGet(WEATHER_URL, buf, cap, 10000);
+  if (r.status != 200) {
+    Serial.printf("[WEATHER] HTTP %d\n", r.status);
+  } else if (r.truncated) {
+    Serial.println("[WEATHER] resposta maior que o buffer");
+  } else if (r.length) {
+    JsonDocument doc;
+    DeserializationError err =
+        deserializeJson(doc, buf, r.length, DeserializationOption::NestingLimit(8));
+    if (!err)
+      ok = parseWeather(doc, out);
+    else
+      Serial.printf("[WEATHER] parse %s (%u bytes)\n", err.c_str(), (unsigned)r.length);
+  } else {
+    Serial.println("[WEATHER] corpo vazio");
+  }
+  free(buf);
   return ok;
 }
 
-// Tarefa de baixa prioridade no core 1: faz o GET e publica o resultado.
+// Tarefa de baixa prioridade no core 1: conecta se preciso, faz o GET e
+// publica o resultado.
 static void weatherTask(void *arg) {
   int writeIndex = (int)(intptr_t)arg;
   WeatherData local;
   memset(&local, 0, sizeof(local));
 
-  bool ok = fetchWeather(local);
+  bool ok = false;
+  const char *failure = "ERRO NA CONSULTA";
+  if (!ensureWiFi())
+    failure = net::radioReady() ? "SEM WI-FI" : "SEM RADIO WI-FI";
+  else
+    ok = fetchWeather(local);
+
   if (ok) {
     weatherShadows[writeIndex] = local;   // escreve no buffer não exibido
     weatherActive.store(writeIndex);      // publica
     weatherValid.store(true);
     weatherVersion.fetch_add(1);
-    lastWeatherGood = millis();
-    snprintf(weatherStatus, sizeof(weatherStatus), "ATUALIZADO");
+    lastWeatherGood.store(millis());
+    weatherStatus.store("ATUALIZADO");
     Serial.printf("[WEATHER] atualizado: %dC %d%% %s\n", local.tempC,
                   local.humidity, local.cond);
   } else {
-    snprintf(weatherStatus, sizeof(weatherStatus), "ERRO NA CONSULTA");
-    Serial.println("[WEATHER] falha na consulta");
+    weatherStatus.store(failure);
+    Serial.printf("[WEATHER] falha: %s\n", failure);
     if (!weatherValid.load())
       weatherVersion.fetch_add(1);   // força redesenho do estado de erro
   }
@@ -446,11 +428,10 @@ static void weatherTask(void *arg) {
 static void pollWeather() {
   if (weatherBusy.load())
     return;
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!weatherValid.load())
-      snprintf(weatherStatus, sizeof(weatherStatus), "SEM WI-FI");
-    return;
-  }
+  // Sem consulta ao WiFi.status() aqui: toda chamada WiFiNINA precisa do
+  // net::Lock, que a tarefa HTTP segura durante a conexão e o GET inteiros, e o
+  // loop() ficaria parado atrás dela. A tarefa descobre sozinha que não há rede
+  // e publica "SEM WI-FI"; o backoff abaixo evita que isso vire laço.
   const uint32_t now = millis();
   // O backoff vale para toda tentativa, não só antes da primeira que der certo.
   // Antes, com dados já em mãos, o único portão era lastWeatherGood: se a
@@ -458,67 +439,36 @@ static void pollWeather() {
   // criava outra tarefa HTTP de 8 KB — dezenas por segundo com o roteador fora.
   if (lastWeatherAttempt != 0 && now - lastWeatherAttempt < WEATHER_RETRY_MS)
     return;
-  if (weatherValid.load() && now - lastWeatherGood < WEATHER_REFRESH_MS)
+  if (weatherValid.load() && now - lastWeatherGood.load() < WEATHER_REFRESH_MS)
     return;   // cadência normal de 10 minutos
   lastWeatherAttempt = now;
   weatherBusy.store(true);
   int next = 1 - weatherActive.load();   // buffer oposto ao exibido
+  // 8 KB de pilha (em bytes; fj/Platform.h converte para palavras). O TLS saiu
+  // do processador, então o aperto do mbedTLS não existe mais, mas o parse do
+  // ArduinoJson e os printf ainda empilham quadros, e a SRAM do RP2350 tem folga.
+  // Core 1: o 0 fica com o loop() e com a interrupção de linha do DVI.
   if (xTaskCreatePinnedToCore(weatherTask, "WEATHER_HTTP", 8192,
-                              (void *)(intptr_t)next, 0, nullptr, 1) != pdPASS) {
+                              (void *)(intptr_t)next, 1, nullptr, 1) != pdPASS) {
     weatherBusy.store(false);
-    snprintf(weatherStatus, sizeof(weatherStatus), "SEM MEMORIA");
+    weatherStatus.store("SEM MEMORIA");
   }
 }
 
-static void serviceWiFi() {
-  static uint32_t lastTry = 0;
-  if (WiFi.status() == WL_CONNECTED)
-    return;
-  if (millis() - lastTry < 10000)
-    return;
-  lastTry = millis();
-  Serial.println("[WEATHER] reconectando Wi-Fi...");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-}
-
 // ----------------------------------------------------------------------------
-//  Áudio (I2S1, core 0) — WAV em loop contínuo, ritmado pelo relógio PCM
+//  Áudio (TLV320DAC3100, core 1) — WAV em loop contínuo
 // ----------------------------------------------------------------------------
-
-static bool initAudio() {
-  i2s_config_t c = {};
-  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-  c.sample_rate = 22050;
-  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  c.dma_buf_count = 8;
-  c.dma_buf_len = 256;
-  c.use_apll = false;
-  c.tx_desc_auto_clear = true;
-  if (i2s_driver_install(I2S_NUM_1, &c, 0, nullptr) != ESP_OK)
-    return false;
-  i2s_pin_config_t p = {};
-  p.mck_io_num = I2S_PIN_NO_CHANGE;   // MCK não é usado
-  p.bck_io_num = RCA_BCK;
-  p.ws_io_num = RCA_LRCK;
-  p.data_out_num = RCA_DATA;
-  p.data_in_num = I2S_PIN_NO_CHANGE;
-  return i2s_set_pin(I2S_NUM_1, &p) == ESP_OK;
-}
 
 static bool openWav() {
   wavFile = SD.open(WAV_PATH, FILE_READ);
   if (!wavFile) {
-    Serial.printf("[WEATHER] WAV não abriu: %s\n", WAV_PATH);
+    Serial.printf("[WEATHER] WAV nao abriu: %s\n", WAV_PATH);
     return false;
   }
   playback::WavInfo info;
   if (!playback::readWav(wavFile, info)) {
     wavFile.close();
-    Serial.println("[WEATHER] WAV inválido (use PCM 16-bit stereo 22050 Hz)");
+    Serial.println("[WEATHER] WAV invalido (use PCM 16-bit stereo 22050 Hz)");
     return false;
   }
   sampleRate = info.rate;
@@ -529,22 +479,6 @@ static bool openWav() {
 }
 
 void audioTask(void *) {
-  // Três blocos rotativos em SRAM interna (DMA). O i2s_write copia o bloco
-  // para a fila DMA, mas o padrão validado mantém 3 buffers.
-  uint8_t *buffers[3];
-  for (auto &b : buffers)
-    b = (uint8_t *)heap_caps_malloc(AUDIO_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  if (!buffers[0] || !buffers[1] || !buffers[2]) {
-    for (auto b : buffers)
-      free(b);
-    audioFailed = true;
-    audioReady = true;
-    vTaskDelete(nullptr);
-    return;
-  }
-  audioReady = true;
-
-  int idx = 0;
   int64_t pcmDueUs = 0;
   for (;;) {
     if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -563,7 +497,7 @@ void audioTask(void *) {
       pos = wavDataStart;
     }
     uint32_t remaining = wavDataEnd - pos;
-    size_t bytes = wavFile.read(buffers[idx],
+    size_t bytes = wavFile.read(reinterpret_cast<uint8_t *>(audioBlock),
                                 (AUDIO_CHUNK < remaining) ? AUDIO_CHUNK : remaining);
     xSemaphoreGive(sdMutex);
 
@@ -572,30 +506,29 @@ void audioTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
-    playback::scalePcm(reinterpret_cast<int16_t *>(buffers[idx]),
-                       bytes / sizeof(int16_t), AUDIO_VOLUME);
+    playback::scalePcm(audioBlock, bytes / sizeof(int16_t), AUDIO_VOLUME);
 
-    size_t written = 0;
-    esp_err_t r = i2s_write(I2S_NUM_1, buffers[idx], bytes, &written, pdMS_TO_TICKS(100));
-    if (r != ESP_OK || written != bytes) {
+    // O WAV já é estéreo intercalado de 16 bits, exatamente o que o DAC recebe.
+    // write() bloqueia até caber: é ele quem dita o ritmo normalmente.
+    const size_t frames = bytes / wavBlockAlign;
+    if (audioout::write(audioBlock, frames) != frames) {
       audioUnderruns.fetch_add(1);
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
 
-    // Ritmo pelo relógio de amostras PCM, para não encher a fila do DMA.
-    const uint32_t frames = written / wavBlockAlign;
+    // Teto pelo relógio de amostras PCM: se o write() não bloqueou, a tarefa
+    // não pode passar de AUDIO_LEAD_US à frente do tempo real.
     if (!pcmDueUs)
       pcmDueUs = esp_timer_get_time();
     pcmDueUs += ((int64_t)frames * 1000000LL) / (int64_t)sampleRate;
-    const int64_t waitUs = pcmDueUs - esp_timer_get_time();
-    if (waitUs > 0)
-      vTaskDelay(pdMS_TO_TICKS((waitUs + 999) / 1000));
-    else if (waitUs < -100000) {
+    const int64_t aheadUs = pcmDueUs - esp_timer_get_time();
+    if (aheadUs > AUDIO_LEAD_US)
+      vTaskDelay(pdMS_TO_TICKS((aheadUs - AUDIO_LEAD_US + 999) / 1000));
+    else if (aheadUs < -100000) {
       pcmDueUs = esp_timer_get_time();
       audioUnderruns.fetch_add(1);
     }
-    idx = (idx + 1) % 3;
   }
 }
 
@@ -635,53 +568,52 @@ static void maybeRebuildTicker() {
 }
 
 static void drawScreen() {
-  rca.startWrite();
-  rca.fillScreen(TFT_NAVY);
+  // Sem startWrite/endWrite: o `tv` é memória, não há barramento a reservar.
+  tv.fillScreen(TFT_NAVY);
 
   // Cabeçalho (amarelo, tipo teletexto). Tudo dentro da área segura: antes o
   // título ficava em y=6 e o ticker em y=224, ambos dentro do overscan da TV.
-  rca.setFont(&fonts::Font4);
-  rca.setTextDatum(top_center);
-  rca.setTextColor(TFT_YELLOW, TFT_NAVY);
-  rca.setTextSize(1);
-  rca.drawString("FRANCA - SP", CRT_W / 2, SAFE_T);
-  rca.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
+  tv.setFont(&fonts::Font4);
+  tv.setTextDatum(top_center);
+  tv.setTextColor(TFT_YELLOW, TFT_NAVY);
+  tv.setTextSize(1);
+  tv.drawString("FRANCA - SP", CRT_W / 2, SAFE_T);
+  tv.drawFastHLine(SAFE_L, SAFE_T + 30, SAFE_W, TFT_CYAN);
 
   if (weatherValid.load()) {
     const WeatherData &w = weatherShadows[weatherActive.load()];
     char buf[64];
 
     // Condição atual
-    rca.setFont(&fonts::Font4);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    rca.drawString(w.cond, CRT_W / 2, SAFE_T + 40);
+    tv.setFont(&fonts::Font4);
+    tv.setTextSize(1);
+    tv.setTextColor(TFT_WHITE, TFT_NAVY);
+    tv.drawString(w.cond, CRT_W / 2, SAFE_T + 40);
 
     // Temperatura grande
     snprintf(buf, sizeof(buf), "%d C", w.tempC);
-    rca.setTextSize(2);
-    rca.setTextColor(TFT_YELLOW, TFT_NAVY);
-    rca.drawString(buf, CRT_W / 2, SAFE_T + 76);
+    tv.setTextSize(2);
+    tv.setTextColor(TFT_YELLOW, TFT_NAVY);
+    tv.drawString(buf, CRT_W / 2, SAFE_T + 76);
 
     // Umidade + vento (fonte menor: Font2)
-    rca.setFont(&fonts::Font2);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, TFT_NAVY);
+    tv.setFont(&fonts::Font2);
+    tv.setTextSize(1);
+    tv.setTextColor(TFT_WHITE, TFT_NAVY);
     snprintf(buf, sizeof(buf), "UMIDADE  %d%%", w.humidity);
-    rca.drawString(buf, CRT_W / 2, SAFE_T + 138);
+    tv.drawString(buf, CRT_W / 2, SAFE_T + 138);
     snprintf(buf, sizeof(buf), "VENTO  %d KM/H  %s", w.windKmph, w.windDir);
-    rca.drawString(buf, CRT_W / 2, SAFE_T + 158);
+    tv.drawString(buf, CRT_W / 2, SAFE_T + 158);
   } else {
-    rca.setFont(&fonts::Font4);
-    rca.setTextSize(1);
-    rca.setTextColor(TFT_WHITE, TFT_NAVY);
-    rca.drawString(weatherStatus, CRT_W / 2, SAFE_T + 86);
+    tv.setFont(&fonts::Font4);
+    tv.setTextSize(1);
+    tv.setTextColor(TFT_WHITE, TFT_NAVY);
+    tv.drawString(weatherStatus.load(), CRT_W / 2, SAFE_T + 86);
   }
 
   // Faixa do ticker (rodapé)
-  rca.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
-  rca.fillRect(0, TICKER_Y, CRT_W, TICKER_H, TFT_BLACK);
-  rca.endWrite();
+  tv.drawFastHLine(SAFE_L, TICKER_Y - 4, SAFE_W, TFT_CYAN);
+  tv.fillRect(0, TICKER_Y, CRT_W, TICKER_H, TFT_BLACK);
 
   maybeRebuildTicker();
 }
@@ -695,23 +627,27 @@ static void drawTicker() {
   ticker.setTextDatum(top_left);
   ticker.setTextColor(TFT_WHITE, TFT_BLACK);
   ticker.drawString(tickerFull.c_str(), -tickerOffsetPx, 0);
-
-  rca.startWrite();
   ticker.pushSprite(0, TICKER_Y);
-  rca.endWrite();
+}
+
+// Sem LCD, a tela de erro vai para a TV; sem display::begin() nem isso — aí só
+// resta o serial.
+static void halt(const char *why) {
+  Serial.printf("[WEATHER] %s\n", why);
+  for (;;)
+    delay(1000);
 }
 
 static void fatal(const char *title, const char *detail) {
-  rca.startWrite();
-  rca.fillScreen(TFT_NAVY);
-  rca.setFont(&fonts::Font4);
-  rca.setTextDatum(middle_center);
-  rca.setTextColor(TFT_YELLOW, TFT_NAVY);
-  rca.setTextSize(1);
-  rca.drawString(title, CRT_W / 2, CRT_H / 2 - 20);
-  rca.setTextColor(TFT_WHITE, TFT_NAVY);
-  rca.drawString(detail, CRT_W / 2, CRT_H / 2 + 20);
-  rca.endWrite();
+  Serial.printf("[WEATHER] %s: %s\n", title, detail);
+  tv.fillScreen(TFT_NAVY);
+  tv.setFont(&fonts::Font4);
+  tv.setTextDatum(middle_center);
+  tv.setTextColor(TFT_YELLOW, TFT_NAVY);
+  tv.setTextSize(1);
+  tv.drawString(title, CRT_W / 2, CRT_H / 2 - 20);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.drawString(detail, CRT_W / 2, CRT_H / 2 + 20);
   for (;;)
     delay(1000);
 }
@@ -723,43 +659,27 @@ static void fatal(const char *title, const char *detail) {
 void setup() {
   Serial.begin(115200);
 
-  // Core2: AXP192 + I2C (usado na detecção do módulo RCA). Sem alto-falante
-  // interno — o áudio sai apenas pelo RCA (I2S1).
-  auto cfg = M5.config();
-  cfg.internal_spk = false;
-  cfg.external_spk = false;
-  M5.begin(cfg);
+  // Ordem de boot FIXA (PORTING.md §2.1). O que importa: net::beginRadio()
+  // pulsa o GPIO 22, que zera o ESP32-C6 *e* o DAC; configurar o DAC antes
+  // deixaria o áudio mudo sem erro nenhum.
+  board::begin();
 
-  // Vídeo composto (CVBS, I2S0 reservado ao DAC do painel).
-  if (!rca.init()) {
-    Serial.println("[WEATHER] falha ao iniciar NTSC (CVBS)");
-    for (;;)
-      delay(1000);
-  }
-  rca.setColorDepth(8);   // RGB332: 1 byte/pixel (320x240 = 76.800 bytes em SRAM)
-  rca.setOutputBoost(true);
+  // DVI antes de qualquer tarefa: a interrupção de linha fica no núcleo que
+  // chamou (o 0, o do loop()).
+  if (!display::begin())
+    halt("falha ao iniciar o DVI (sem memoria para o framebuffer)");
 
-  // Sprite do ticker (SRAM, RGB332) — usa a rca como destino do pushSprite.
+  // Sprite do ticker na SRAM: 320x16 em RGB565 são 10 KB, e o pushSprite a
+  // cada 33 ms não deve passar pelo cache da PSRAM.
   ticker.setPsram(false);
-  ticker.setColorDepth(8);
-  if (!ticker.createSprite(CRT_W, TICKER_H)) {
-    Serial.println("[WEATHER] falha ao criar sprite do ticker");
-    for (;;)
-      delay(1000);
-  }
+  ticker.setColorDepth(16);
+  if (!ticker.createSprite(CRT_W, TICKER_H))
+    fatal("SEM MEMORIA", "sprite do ticker");
   ticker.setFont(&fonts::Font2);
 
-  // Cartão TF no VSPI. GPIO19 está reservado ao BCK do RCA (não entra no SPI).
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  bool sdMounted = SD.begin(SD_CS, SPI, 25000000);
-  if (!sdMounted) {
-    SD.end();
-    delay(30);
-    sdMounted = SD.begin(SD_CS, SPI, 4000000);
-  }
-  if (!sdMounted)
+  if (!storage::begin())
     fatal("SEM CARTAO SD", WAV_PATH);
-  Serial.println("[WEATHER] SD montado (CS4 SCK18 MISO38 MOSI23)");
+  Serial.println("[WEATHER] SD montado (SDIO)");
 
   sdMutex = xSemaphoreCreateMutex();
   if (!sdMutex)
@@ -768,31 +688,33 @@ void setup() {
   if (!openWav())
     fatal("WAV INVALIDO", WAV_PATH);
 
-  snprintf(weatherStatus, sizeof(weatherStatus), "CARREGANDO...");
+  weatherStatus.store("CARREGANDO...");
   drawScreen();
   lastDrawnVersion = weatherVersion.load();
 
-  // Wi-Fi (conexão assíncrona; serviceWiFi() cuida da reconexão).
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Acorda o ESP32-C6. A conexão ao Wi-Fi fica para a tarefa HTTP (ensureWiFi),
+  // porque o WiFi.begin() do NINA bloqueia dezenas de segundos.
+  if (!net::beginRadio())
+    Serial.println("[WEATHER] ESP32-C6 nao respondeu; sem previsao");
 
-  // Áudio RCA (I2S1) no core 0.
-  if (!initAudio())
-    fatal("FALHA AUDIO", "I2S1");
-  if (xTaskCreatePinnedToCore(audioTask, "RCA_MUSIC", 4096, nullptr, 4,
-                              &audioTaskHandle, 0) != pdPASS)
-    fatal("FALHA AUDIO", "sem tarefa");
-  while (!audioReady && !audioFailed)
-    delay(1);
-  if (audioFailed)
-    fatal("FALHA AUDIO", "sem memoria DMA");
+  // Só agora o DAC. Sem ele a previsão segue muda: a música é enfeite, e parar
+  // a tela por causa dela seria pior que o original, que só tinha o RCA.
+  if (audioout::begin(sampleRate)) {
+    audioout::setVolume(100);
+    audioout::setRoute(AUDIO_ROUTE);
+    // Core 1, prioridade acima da tarefa HTTP: o write() passa quase todo o
+    // tempo bloqueado, então sobra CPU para ela no mesmo núcleo.
+    if (xTaskCreatePinnedToCore(audioTask, "RCA_MUSIC", 4096, nullptr, 4,
+                                &audioTaskHandle, 1) != pdPASS)
+      Serial.println("[WEATHER] sem memoria para a tarefa de audio");
+  } else {
+    Serial.println("[WEATHER] DAC TLV320 nao iniciou; seguindo sem musica");
+  }
 
-  Serial.println("[WEATHER] Local Forecast iniciado (NTSC + RCA audio)");
+  Serial.println("[WEATHER] Local Forecast iniciado (DVI + TLV320)");
 }
 
 void loop() {
-  serviceWiFi();
   pollWeather();
 
   // Redesenha a tela estática quando houver dados novos (ou estado de erro).
