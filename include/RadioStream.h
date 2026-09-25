@@ -1,25 +1,31 @@
 #pragma once
 // ============================================================================
-// RadioStream — cliente de rádio pela internet (Icecast/Shoutcast) do M5 RETRO TV.
+// RadioStream — cliente de rádio pela internet (Icecast/Shoutcast) do Fruit Jam
+// Retro TV (fork do M5 RETRO TV).
 //
 // Entrega PCM 22050 Hz estéreo pelo MESMO contrato do mp3ReadPcm() do
-// src/main.cpp, para que a tarefa de áudio (RCA_PCM, core 0) não precise de um
-// segundo caminho de saída: quem integra troca a fonte do bloco e o resto do
-// audioTask — escala de volume, i2s_write, ritmo pelo relógio de amostras —
+// src/main.cpp, para que a tarefa de áudio não precise de um segundo caminho
+// de saída: quem integra troca a fonte do bloco e o resto do audioTask —
+// escala de volume, audioout::write(), ritmo pelo relógio de amostras —
 // continua igual.
 //
 // ---------------------------------------------------------------------------
 //  Por que cada decisão deste arquivo é assim
 // ---------------------------------------------------------------------------
 //
-// 1. WiFiClient, NUNCA WiFiClientSecure. A estação é HTTP puro. Um cliente TLS
-//    custa dezenas de KB de SRAM (buffers de record de 16 KB + contexto do
-//    mbedTLS) e a SRAM é o recurso escasso deste aparelho: o framebuffer do
-//    CVBS já leva 153.600 B e o mínimo de heap livre medido aqui foi de 28 a
-//    38 KB. Uma alocação de 5 KB de sprite já causou falta de memória dura.
+// 1. Rede pelo WiFiNINA (fj/Net.h): o Wi-Fi é o ESP32-C6 da placa, falando por
+//    SPI1. http:// usa WiFiClient; https:// usa o TLS que roda DENTRO do C6
+//    (connectSSL), sem custo de SRAM nem de pilha no RP2350 — ao contrário do
+//    ESP32 original, onde um cliente TLS custava dezenas de KB de SRAM e por
+//    isso era proibido aqui. A estação da tabela continua http://.
 //
-// 2. O buffer circular mora na PSRAM. São ~3,8 MB livres lá contra dezenas de
-//    KB na SRAM. Ele é o ÚNICO bloco grande deste módulo e é alocado com
+//    O SPI1 é um barramento só, disputado pelo loop(), pela previsão, pelo
+//    radar e pelo relógio. TODA chamada WiFiNINA daqui roda com net::Lock
+//    tomado, e o lock é tomado POR BLOCO lido, nunca pelo stream inteiro:
+//    segurá-lo por uma sessão de rádio mataria de fome todo o resto da rede.
+//
+// 2. O buffer circular mora na PSRAM (QSPI, 8 MB, atrás de um cache de 16 KB).
+//    Ele é o ÚNICO bloco grande deste módulo e é alocado com
 //    heap_caps_malloc(MALLOC_CAP_SPIRAM); se a alocação falhar o módulo entra
 //    em Conn::NoMemory e NÃO tenta a SRAM — cair de pé é melhor do que derrubar
 //    o aparelho inteiro.
@@ -34,20 +40,28 @@
 //    que só avançava no sucesso virava laço apertado criando tarefas HTTP
 //    quando a rede caía.
 //
-// 5. A leitura da rede roda numa tarefa própria PINADA NO CORE 0
-//    (xTaskCreatePinnedToCore(..., 8192, ..., 0, nullptr, 1)), como as tarefas
-//    WEATHER_HTTP e RADAR_HTTPS. O core 1 é do loop() e do desenho; um
-//    client.read() bloqueante lá dentro travaria o raster. Duas tarefas já
-//    estouraram 8 KB de pilha neste repositório (armadilha 2), então aqui o
-//    maior local da tarefa tem 512 bytes e todo o resto é estado da classe.
+// 5. A leitura da rede roda numa tarefa própria (RADIO_ICY) pinada no núcleo 1.
+//    No arduino-pico o loop() é uma tarefa FreeRTOS presa ao núcleo 0, junto
+//    com a interrupção de linha do DVI; uma chamada WiFiNINA espera o C6 em
+//    laço ativo (SpiDrv::waitForSlaveReady não tem prazo nem cede a CPU), e
+//    isso não pode acontecer no núcleo do desenho. A pilha é de 8 KB (em BYTES,
+//    ver fj/Platform.h) e o maior local da tarefa tem 512 bytes; todo o resto
+//    é estado da classe (armadilha 2 do AGENTS.md).
+//
+// 7. Redirecionamento: 301/302/303/307/308 com Location são seguidos até
+//    MAX_REDIRECTS saltos dentro da mesma tentativa, inclusive de http:// para
+//    https:// (o TLS é do C6). Cada reconexão recomeça da URL da TABELA, e não
+//    do destino do último redirecionamento: servidores de rádio redirecionam
+//    para URLs com token que expiram.
 //
 // 6. A lógica pura (parse de URL, parse de cabeçalho, de-interleave, parse do
 //    StreamTitle, backoff) vive fora do #if defined(ARDUINO) e não depende de
 //    Arduino, WiFi nem FreeRTOS. É isso que permite testá-la nativamente em
 //    sim/probes/radio_stream.cpp com g++ -std=gnu++11.
 //
-// Compila em -std=gnu++11 (arduino-esp32 2.x): todo corpo de constexpr aqui é
-// um único return, sem laço e sem variável local (armadilha 1 do AGENTS.md).
+// A parte pura compila em -std=gnu++11 (o upstream m5-retro-tv ainda é C++11 e
+// este fork quer continuar puxando correções de lá): todo corpo de constexpr
+// aqui é um único return, sem laço e sem variável local (armadilha 1).
 // ============================================================================
 
 #include <stddef.h>
@@ -71,7 +85,7 @@ namespace radio {
 
 struct Station {
   const char *name; // rótulo curto, ASCII, para a tela quando não houver logo
-  const char *url;  // http:// apenas — ver a nota 1 no cabeçalho
+  const char *url;  // http:// ou https:// (o TLS roda no ESP32-C6; nota 1)
 };
 
 constexpr Station STATIONS[] = {
@@ -160,23 +174,30 @@ struct Url {
   char host[80];
   char path[144];
   uint16_t port;
+  bool tls; // https://: a conexão é aberta por connectSSL, com o TLS no C6
 };
 
-// Aceita "http://host[:porta][/caminho]". Recusa https:// de propósito: este
-// módulo não abre TLS (ver nota 1). Caminho vazio vira "/".
+// Aceita "http[s]://host[:porta][/caminho]". Sem esquema vale http://. No
+// ESP32 original https:// era recusado (TLS custava SRAM demais); no Fruit Jam
+// quem faz o TLS é o ESP32-C6, então ele passa a valer — é o que permite seguir
+// um redirecionamento para https. Caminho vazio vira "/".
 inline bool parseUrl(const char *url, Url &out) {
   out.host[0] = 0;
   out.path[0] = 0;
   out.port = 80;
+  out.tls = false;
   if (!url)
     return false;
   const char *p = url;
-  if (strncmp(p, "http://", 7) == 0)
+  if (strncmp(p, "http://", 7) == 0) {
     p += 7;
-  else if (strncmp(p, "https://", 8) == 0)
-    return false; // sem TLS aqui
-  else if (strstr(url, "://"))
+  } else if (strncmp(p, "https://", 8) == 0) {
+    p += 8;
+    out.port = 443;
+    out.tls = true;
+  } else if (strstr(url, "://")) {
     return false; // esquema desconhecido
+  }
   // Authority vai até '/', '?' ou fim.
   size_t h = 0;
   for (; *p && *p != '/' && *p != '?'; ++p) {
@@ -221,7 +242,11 @@ struct IcyInfo {
   int32_t metaint; // -1 quando o servidor não manda icy-metaint
   char name[40];   // icy-name  (ex.: "DIARIO FM")
   char desc[80];   // icy-description, quando houver
-  bool audio;      // Content-Type é audio/mpeg (ou mp3)
+  // Location de um 3xx, CRU (não normalizado: é URL, não texto de tela). Vazio
+  // quando não veio ou quando não coube inteiro — URL truncada é URL errada, e
+  // seguir uma URL errada é pior do que desistir e cair no backoff.
+  char location[sizeof(Url::host) + sizeof(Url::path) + 16];
+  bool audio; // Content-Type é audio/mpeg (ou mp3)
 };
 
 inline void icyInfoInit(IcyInfo &i) {
@@ -229,7 +254,14 @@ inline void icyInfoInit(IcyInfo &i) {
   i.metaint = -1;
   i.name[0] = 0;
   i.desc[0] = 0;
+  i.location[0] = 0;
   i.audio = false;
+}
+
+// Códigos que mandam seguir o Location. 300 e 304 ficam de fora: não dizem
+// para onde ir.
+inline bool isRedirectStatus(int32_t status) {
+  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
 namespace detail {
@@ -293,7 +325,39 @@ inline void parseHeaderLine(const char *line, IcyInfo &out) {
   } else if (detail::iEqPrefix(line, "content-type:")) {
     out.audio = detail::iEqPrefix(value, "audio/mpeg") || detail::iEqPrefix(value, "audio/mp3") ||
                 detail::iEqPrefix(value, "application/octet-stream");
+  } else if (detail::iEqPrefix(line, "location:")) {
+    size_t n = strlen(value);
+    while (n && (value[n - 1] == ' ' || value[n - 1] == '\t'))
+      --n;
+    if (n && n < sizeof(out.location)) {
+      memcpy(out.location, value, n);
+      out.location[n] = 0;
+    } else {
+      out.location[0] = 0; // longa demais: não segue (ver IcyInfo::location)
+    }
   }
+}
+
+// Resolve o Location de um redirecionamento contra a URL atual. Aceita URL
+// absoluta (http:// ou https://) e caminho absoluto ("/novo"), que mantém
+// host, porta e esquema. Recusa o resto (relativo sem barra, "//host", vazio):
+// é raro em servidor de rádio e errar aqui seria conectar no lugar errado.
+inline bool resolveRedirect(const Url &current, const char *location, Url &out) {
+  if (!location || !*location)
+    return false;
+  if (location[0] == '/') {
+    if (location[1] == '/')
+      return false; // "//host/caminho": sem esquema, não arrisca
+    out = current;
+    size_t j = 0;
+    for (const char *p = location; *p && j + 1 < sizeof(out.path); ++p)
+      out.path[j++] = *p;
+    out.path[j] = 0;
+    return location[j] == 0; // caminho truncado = recusa
+  }
+  if (strncmp(location, "http://", 7) != 0 && strncmp(location, "https://", 8) != 0)
+    return false;
+  return parseUrl(location, out);
 }
 
 // Consome bytes do socket até o fim do cabeçalho (CRLF CRLF ou LF LF).
@@ -305,8 +369,10 @@ class HeaderParser {
 public:
   void reset() {
     len_ = 0;
+    cut_ = false;
     done_ = false;
     ok_ = false;
+    redirect_ = false;
     icyInfoInit(info_);
   }
 
@@ -319,8 +385,10 @@ public:
       if (c == '\r')
         continue; // CR é ignorado: trata CRLF e LF do mesmo jeito
       if (c != '\n') {
-        if (len_ + 1 < sizeof(line_))
+        if (size_t(len_) + 1 < sizeof(line_))
           line_[len_++] = c;
+        else
+          cut_ = true;
         continue;
       }
       line_[len_] = 0;
@@ -328,10 +396,16 @@ public:
         // Linha vazia: fim do cabeçalho.
         done_ = true;
         ok_ = (info_.status == 200) && info_.audio;
+        redirect_ = isRedirectStatus(info_.status) && info_.location[0];
         ++i;
         break;
       }
       parseHeaderLine(line_, info_);
+      // Linha cortada: icy-name e afins perdem so o fim, mas uma URL cortada
+      // e uma URL ERRADA. Location truncado e descartado (ver IcyInfo).
+      if (cut_ && detail::iEqPrefix(line_, "location:"))
+        info_.location[0] = 0;
+      cut_ = false;
       len_ = 0;
     }
     return i;
@@ -339,16 +413,20 @@ public:
 
   bool done() const { return done_; }
   bool ok() const { return ok_; }
+  // 3xx com Location utilizável: o chamador resolve com resolveRedirect().
+  bool redirect() const { return redirect_; }
   const IcyInfo &info() const { return info_; }
 
 private:
-  // 200 bytes: cabe icy-url, icy-genre e afins. Uma linha mais longa é truncada
-  // — o que se perde é o fim do valor, nunca o sincronismo do fluxo, porque o
-  // corte é só na cópia e o byte continua sendo consumido.
-  char line_[200];
+  // 256 bytes: cabe icy-url, icy-genre e um Location com token. Uma linha mais
+  // longa é truncada — o que se perde é o fim do valor, nunca o sincronismo do
+  // fluxo, porque o corte é só na cópia e o byte continua sendo consumido.
+  char line_[256];
   uint16_t len_ = 0;
+  bool cut_ = false; // a linha em curso passou de line_ e foi truncada
   bool done_ = false;
   bool ok_ = false;
+  bool redirect_ = false;
   IcyInfo info_;
 };
 
@@ -468,7 +546,7 @@ public:
         // mas o StreamTitle vem primeiro e um título maior que isto não cabe na
         // tela de qualquer jeito. O RESTO CONTINUA SENDO CONSUMIDO — é isso que
         // mantém o de-interleave correto sem gastar 4 KB de SRAM.
-        if (bufLen_ + 1 < sizeof(buf_))
+        if (size_t(bufLen_) + 1 < sizeof(buf_))
           buf_[bufLen_++] = (char)in[i + j];
       }
       i += k;
@@ -520,7 +598,7 @@ private:
 //  Anel produtor-consumidor (um escritor, um leitor)
 // ---------------------------------------------------------------------------
 //
-// A tarefa de rede (core 0) escreve; a tarefa de áudio (core 0) lê. Um índice
+// A tarefa de rede (RADIO_ICY) escreve; a tarefa de áudio lê. Um índice
 // por lado, cada um escrito por um único dono: não precisa de mutex, e não usar
 // mutex aqui é de propósito — o áudio não pode nunca ficar esperando a rede.
 class Ring {
@@ -595,8 +673,13 @@ private:
 #if defined(ARDUINO)
 
 #include <Arduino.h>
-#include <WiFi.h> // WiFiClient — NUNCA WiFiClientSecure aqui (ver nota 1)
-#include <esp_heap_caps.h>
+
+// NUNCA <WiFi.h> aqui: o arduino-pico traz uma biblioteca WiFi própria (lwIP,
+// para o CYW43 do Pico W) com classes WiFiClient/WiFiServer de mesmo nome. Com
+// lib_ldf_mode = chain+, incluir as duas quebra o link em símbolo duplicado. A
+// rede do Fruit Jam é o WiFiNINA, e ele chega por fj/Net.h.
+#include "fj/Net.h"      // WiFiClient do WiFiNINA + net::Lock
+#include "fj/Platform.h" // heap_caps_*, xTaskCreatePinnedToCore (pilha em BYTES)
 
 #include "libhelix-mp3/mp3dec.h"
 
@@ -604,16 +687,41 @@ namespace radio {
 
 // Timeouts. Todos comparados com timeReached() (aritmética sem sinal): o
 // millis() é de 32 bits e dá a volta em ~49 dias (AGENTS.md 3.3).
-constexpr uint32_t CONNECT_TIMEOUT_MS = 8000;
+//
+// Não há timeout de conexão aqui: o connect do WiFiNINA é UMA transação SPI
+// síncrona — o C6 resolve o nome, abre o TCP (e faz o handshake TLS, se for
+// https) e só então responde. O prazo é o do firmware NINA (~3 s de TCP, mais o
+// DNS). Não dá para cortar essa transação no meio: fj/Net.h explica por quê.
 constexpr uint32_t HEADER_TIMEOUT_MS = 6000;
 constexpr uint32_t STALL_TIMEOUT_MS = 6000; // socket aberto mas mudo: derruba
 
+// Saltos de redirecionamento por tentativa (nota 7). Quatro cobrem http->https
+// mais um balanceador; mais que isso é laço de configuração do servidor.
+constexpr int MAX_REDIRECTS = 4;
+
+// Leitura por bloco. O WiFiNINA traz até 1500 B do C6 por transação para um
+// buffer próprio (WiFiSocketBuffer); ler 512 de cada vez esvazia esse buffer em
+// três voltas sem SPI novo, e cada volta devolve o net::Lock a quem espera.
+constexpr size_t NET_CHUNK = 512;
+
+// Espera quando o socket está vazio. 96 kbps são 12 KB/s: 15 ms de sono ainda
+// deixam o buffer do socket longe de encher, e cada consulta vazia a menos é
+// uma transação SPI a menos na frente do loop() e das outras tarefas de rede.
+constexpr uint32_t IDLE_POLL_MS = 15;
+
+// Tarefa de rede. Pilha em BYTES (fj/Platform.h). Núcleo 1: o 0 é do loop() e
+// da interrupção de linha do DVI, e o WiFiNINA espera o C6 em laço ativo.
+// Prioridade 1: acima das tarefas ociosas e das de prioridade 0 (previsão,
+// radar), abaixo do loop() e do áudio; o mutex do net::Lock herda prioridade,
+// então o loop() nunca fica atrás desta tarefa por mais de um bloco.
+constexpr uint32_t NET_TASK_STACK = 8192;
+constexpr UBaseType_t NET_TASK_PRIO = 1;
+constexpr BaseType_t NET_TASK_CORE = 1;
+
 class Stream {
 public:
-  // -- ciclo de vida (chamado pelo loop(), core 1) --------------------------
+  // -- ciclo de vida (chamado pelo loop()) ----------------------------------
 
-  // Aloca a PSRAM, inicializa o libhelix e cria a tarefa de rede no core 0.
-  // Não bloqueia esperando a conexão: a tela mostra CONECTANDO enquanto isso.
   // Empresta buffers de trabalho em SRAM para o decodificador. `in` precisa de
   // MP3_IN_BYTES bytes e `pcm` de MP3_PCM_SHORTS int16. Chamar ANTES de
   // begin(). Sem isto os dois caem na PSRAM e o audio arrasta.
@@ -622,9 +730,20 @@ public:
     extPcm_ = (pcm && pcmShorts >= MP3_PCM_SHORTS) ? pcm : nullptr;
   }
 
+  // Aloca a PSRAM, inicializa o libhelix e cria a tarefa de rede.
+  // Não bloqueia esperando a conexão: a tela mostra CONECTANDO enquanto isso.
   bool begin(int stationIndex) {
     if (running_)
       return true;
+    if (netAlive_.load()) {
+      // A tarefa da sessão anterior ainda está presa numa transação do NINA
+      // (ver end()) e continua dona dos buffers. Recomeçar agora faria duas
+      // tarefas escreverem no mesmo anel. A tela mostra SEM SINAL; entrar de
+      // novo na tela daqui a pouco funciona.
+      conn_.store((uint8_t)Conn::NoSignal);
+      Serial.println("[M5RETRO] Radio: sessao anterior ainda encerrando");
+      return false;
+    }
     if (stationIndex < 0 || stationIndex >= STATION_COUNT)
       return false;
     station_ = stationIndex;
@@ -635,10 +754,10 @@ public:
     // O ANEL pode ficar na PSRAM: e escrito e lido em blocos grandes, e o
     // custo por byte da PSRAM se dilui na cópia. Os buffers de TRABALHO do
     // decodificador, nao: o libhelix le o fluxo de bits byte a byte da entrada
-    // e escreve 4.608 B de PCM por quadro, e na PSRAM (varias vezes mais lenta,
-    // atras de cache) ele nao acompanha 44100 Hz estereo. Era essa a causa do
-    // audio arrastado -- o player de MP3 local toca liso com o MESMO decoder
-    // justamente porque os buffers dele sao estaticos em SRAM.
+    // e escreve 4.608 B de PCM por quadro, e na PSRAM (acesso aleatorio atras
+    // de um cache de 16 KB) ele nao acompanha 44100 Hz estereo. Era essa a
+    // causa do audio arrastado no aparelho original -- o player de MP3 local
+    // toca liso com o MESMO decoder porque os buffers dele sao estaticos em SRAM.
     //
     // Quem chama empresta os buffers do player local por useWorkBuffers(): os
     // dois nunca tocam ao mesmo tempo, entao custa zero de SRAM nova. Sem esse
@@ -660,30 +779,33 @@ public:
       mp3Pcm_ = (int16_t *)(psram_ + RING_BYTES + MP3_IN_BYTES);
       Serial.println("[M5RETRO] Radio: buffers de trabalho na PSRAM (vai arrastar)");
     }
-    // O allocador do libhelix (AllocatorExt) já tenta ps_malloc primeiro, então
-    // os ~25 KB de estado do decodificador também caem na PSRAM.
+    // No RP2350 o alocador do libhelix (AllocatorExt) cai no malloc comum: os
+    // ~25 KB de estado do decodificador ficam na SRAM, o que ajuda a vazão.
     dec_ = MP3InitDecoder();
     if (!dec_) {
       heap_caps_free(psram_);
       psram_ = nullptr;
+      mp3In_ = nullptr;
+      mp3Pcm_ = nullptr;
+      ring_.attach(nullptr, 0);
       conn_.store((uint8_t)Conn::NoMemory);
       Serial.println("[M5RETRO] Radio: sem memoria para o decodificador MP3");
       return false;
     }
     resetDecoder();
     ascii::normalize(name_, sizeof(name_), STATIONS[station_].name);
+    icyName_[0] = 0;
     title_[0] = 0;
     conn_.store((uint8_t)Conn::Connecting);
     stop_.store(false);
+    orphan_.store(false);
     netAlive_.store(true);
     running_ = true;
-    if (xTaskCreatePinnedToCore(netTaskEntry, "RADIO_ICY", 8192, this, 0, nullptr, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(netTaskEntry, "RADIO_ICY", NET_TASK_STACK, this, NET_TASK_PRIO,
+                                nullptr, NET_TASK_CORE) != pdPASS) {
       netAlive_.store(false);
       running_ = false;
-      MP3FreeDecoder(dec_);
-      dec_ = nullptr;
-      heap_caps_free(psram_);
-      psram_ = nullptr;
+      releaseBuffers();
       conn_.store((uint8_t)Conn::NoMemory);
       return false;
     }
@@ -695,6 +817,12 @@ public:
   //
   // Todas as esperas aqui têm prazo. A armadilha 3 do AGENTS.md foi exatamente
   // uma espera sem prazo que congelou o aparelho para sempre.
+  //
+  // O prazo de 3 s pode vencer com a tarefa ainda presa num connect do NINA
+  // (DNS + TCP + TLS podem passar disso). Liberar os buffers nesse caso seria
+  // uso depois de liberar quando a tarefa voltasse: então ela vira "órfã" e
+  // libera sozinha ao sair. O acordo é um exchange atômico em `orphan_`, que
+  // garante que exatamente um dos dois lados libera.
   void end() {
     if (!running_)
       return;
@@ -706,21 +834,20 @@ public:
     while (pcmBusy_.load() && !timeReached(millis(), limit2))
       delay(5);
     running_ = false;
-    if (dec_) {
-      MP3FreeDecoder(dec_);
-      dec_ = nullptr;
-    }
-    if (psram_) {
-      heap_caps_free(psram_);
-      psram_ = nullptr;
-    }
-    mp3In_ = nullptr;
-    mp3Pcm_ = nullptr;
-    ring_.attach(nullptr, 0);
     conn_.store((uint8_t)Conn::Idle);
+    if (netAlive_.load()) {
+      orphan_.store(true);
+      // Segunda olhada: a tarefa pode ter saído entre o load e o store. Quem
+      // ganhar o exchange libera; se a tarefa já levou, não há o que fazer.
+      if (netAlive_.load() || !orphan_.exchange(false)) {
+        Serial.println("[M5RETRO] Radio: tarefa presa no NINA; ela libera ao sair");
+        return;
+      }
+    }
+    releaseBuffers();
   }
 
-  // -- consumo de áudio (chamado pela tarefa RCA_PCM, core 0) ---------------
+  // -- consumo de áudio (chamado pela tarefa de áudio) ----------------------
 
   // MESMO contrato do mp3ReadPcm() do src/main.cpp: escreve `samples` shorts
   // (pares L/R) a 22050 Hz e devolve quantos escreveu.
@@ -738,17 +865,17 @@ public:
     // o que REALMENTE foi produzido -- nao `samples`.
     //
     // Devolver o total pedido fazia o chamador pacear um bloco inteiro mesmo
-    // quando o decodificador tinha entregue um pedaco, e a diferenca ia para o
-    // I2S como SILENCIO no meio do som. Era isso que se ouvia como arrasto. Um
-    // retorno honesto deixa o chamador escrever menos e esperar menos, e faz o
-    // ramo `if (!amostras)` dele finalmente existir.
+    // quando o decodificador tinha entregue um pedaco, e a diferenca ia para a
+    // saida como SILENCIO no meio do som. Era isso que se ouvia como arrasto.
+    // Um retorno honesto deixa o chamador escrever menos e esperar menos, e faz
+    // o ramo `if (!amostras)` dele finalmente existir.
     for (size_t i = produced; i < samples; ++i)
       dst[i] = 0;
     pcmBusy_.store(false);
     return produced;
   }
 
-  // -- leitura de estado (qualquer core) ------------------------------------
+  // -- leitura de estado (qualquer núcleo) ----------------------------------
 
   Conn state() const { return (Conn)conn_.load(); }
   const char *stateLabel() const { return connLabel(state()); }
@@ -781,6 +908,20 @@ public:
   int bitrateKbps() const { return bitrate_; }
 
 private:
+  void releaseBuffers() {
+    if (dec_) {
+      MP3FreeDecoder(dec_);
+      dec_ = nullptr;
+    }
+    if (psram_) {
+      heap_caps_free(psram_);
+      psram_ = nullptr;
+    }
+    mp3In_ = nullptr;
+    mp3Pcm_ = nullptr;
+    ring_.attach(nullptr, 0);
+  }
+
   // -- decodificação (espelha mp3ReadPcm do src/main.cpp) -------------------
 
   void resetDecoder() {
@@ -868,7 +1009,7 @@ private:
     return produced;
   }
 
-  // -- tarefa de rede (core 0) ----------------------------------------------
+  // -- tarefa de rede -------------------------------------------------------
 
   static void netTaskEntry(void *self) {
     static_cast<Stream *>(self)->netTask();
@@ -893,76 +1034,166 @@ private:
       reconnects_.fetch_add(1);
     }
     netAlive_.store(false);
+    // end() desistiu de esperar e deixou a limpeza para cá (ver end()).
+    if (orphan_.exchange(false))
+      releaseBuffers();
     vTaskDelete(nullptr);
+  }
+
+  // Fecha o socket no NINA. Sem isto o C6 fica com o slot ocupado — ele tem
+  // poucos (CONFIG_LWIP_MAX_SOCKETS), divididos com a previsão e o radar. Se
+  // connected() já tinha visto a queda, stop() não faz nada: o próprio NINA
+  // liberou o slot naquela consulta.
+  static void closeClient(WiFiClient &client) {
+    net::Lock lock;
+    client.stop();
+  }
+
+  // Lê um bloco com o lock tomado SÓ durante a leitura. `alive` diz se o socket
+  // continua de pé. Depois de alive == false o WiFiClient não pode mais ser
+  // lido: o connected() do WiFiNINA já pôs o socket em 255, e read() não confere
+  // isso (indexaria o WiFiSocketBuffer fora da tabela).
+  static int readBlock(WiFiClient &client, uint8_t *buf, size_t cap, bool &alive) {
+    net::Lock lock;
+    const int n = client.read(buf, cap);
+    alive = n > 0 || client.connected();
+    return n;
+  }
+
+  enum class Header : uint8_t { Audio, Redirect, Fail };
+
+  // Conecta em cur_, manda o GET e consome o cabeçalho. Em Header::Audio o
+  // socket fica aberto e a sobra do último read já foi para o anel; nos outros
+  // casos ele já foi fechado.
+  Header openAndReadHeader(WiFiClient &client, uint8_t *buf) {
+    header_.reset();
+    int ok;
+    {
+      // O lock fica tomado durante o connect inteiro (DNS + TCP + TLS no C6):
+      // entre reservar o socket e abri-lo nenhuma outra tarefa pode falar com o
+      // NINA, senao ela pegaria o mesmo numero de socket.
+      net::Lock lock;
+      ok = cur_.tls ? client.connectSSL(cur_.host, cur_.port) : client.connect(cur_.host, cur_.port);
+      if (!ok)
+        client.stop(); // se o NINA chegou a reservar o socket, devolve
+    }
+    if (!ok) {
+      Serial.printf("[M5RETRO] Radio: falha ao conectar em %s:%u%s\n", cur_.host,
+                    (unsigned)cur_.port, cur_.tls ? " (TLS)" : "");
+      return Header::Fail;
+    }
+    // Host leva a porta quando ela não é a padrão do esquema (RFC 9110 7.2).
+    char hostPort[8] = {0};
+    if (cur_.port != (cur_.tls ? 443 : 80))
+      snprintf(hostPort, sizeof(hostPort), ":%u", (unsigned)cur_.port);
+    // Icy-MetaData: 1 pede o título da música. Connection: close porque não há
+    // reuso a fazer — este socket fica aberto até cair. O pedido é montado no
+    // próprio buffer de leitura: um local a menos na pilha da tarefa.
+    const int len = snprintf((char *)buf, NET_CHUNK,
+                             "GET %s HTTP/1.1\r\n"
+                             "Host: %s%s\r\n"
+                             "User-Agent: RetroTV/1.0 (Fruit Jam)\r\n"
+                             "Icy-MetaData: 1\r\n"
+                             "Connection: close\r\n"
+                             "\r\n",
+                             cur_.path, cur_.host, hostPort);
+    if (len <= 0 || (size_t)len >= NET_CHUNK) {
+      closeClient(client);
+      return Header::Fail;
+    }
+    size_t sent;
+    {
+      net::Lock lock;
+      sent = client.write(buf, (size_t)len);
+    }
+    if (sent != (size_t)len) {
+      closeClient(client);
+      return Header::Fail;
+    }
+
+    const uint32_t hdrDeadline = millis() + HEADER_TIMEOUT_MS;
+    while (!stop_.load() && !header_.done()) {
+      if (timeReached(millis(), hdrDeadline)) {
+        closeClient(client);
+        return Header::Fail;
+      }
+      bool alive = false;
+      const int n = readBlock(client, buf, NET_CHUNK, alive);
+      if (n <= 0) {
+        if (!alive) {
+          closeClient(client);
+          return Header::Fail;
+        }
+        vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_MS));
+        continue;
+      }
+      const size_t used = header_.feed(buf, (size_t)n);
+      if (!header_.done())
+        continue;
+      if (header_.redirect()) {
+        closeClient(client);
+        return Header::Redirect;
+      }
+      if (!header_.ok()) {
+        Serial.printf("[M5RETRO] Radio: resposta invalida (status %ld)\n",
+                      (long)header_.info().status);
+        closeClient(client);
+        return Header::Fail;
+      }
+      const IcyInfo &icy = header_.info();
+      if (icy.name[0]) {
+        strncpy(icyName_, icy.name, sizeof(icyName_) - 1);
+        icyName_[sizeof(icyName_) - 1] = 0;
+      }
+      splitter_.begin(icy.metaint);
+      Serial.printf("[M5RETRO] Radio: %s metaint:%ld\n", stationName(), (long)icy.metaint);
+      // A sobra do MESMO read já é corpo: passa pelo de-interleave in-place.
+      if ((size_t)n > used) {
+        const size_t got = splitter_.split(buf + used, (size_t)n - used, buf);
+        ring_.write(buf, got);
+        bytesIn_.fetch_add((uint32_t)got);
+      }
+      return Header::Audio;
+    }
+    closeClient(client); // end() pediu para parar
+    return Header::Fail;
   }
 
   // Uma sessão HTTP completa. Devolve true se chegou a entrar no ar.
   //
-  // Locais: só `buf[256]`. A pilha desta tarefa é de 8 KB e duas tarefas já a
-  // estouraram neste repositório (AGENTS.md 2.3) — nada de array grande aqui.
+  // Locais: `buf[512]` e uma Url. A pilha desta tarefa é de 8 KB e duas tarefas
+  // já a estouraram no upstream (AGENTS.md 2.3) — nada de array grande aqui.
   bool sessionOnce() {
     conn_.store((uint8_t)Conn::Connecting);
     ring_.clear();
     resetDecoder();
-    header_.reset();
+    // Sempre da tabela: um redirecionamento anterior pode ter levado a uma URL
+    // com token que já expirou (nota 7).
+    cur_ = url_;
     WiFiClient client;
-    client.setTimeout(5); // segundos: o WiFiClient do arduino-esp32 usa segundos
-    if (!client.connect(url_.host, url_.port, CONNECT_TIMEOUT_MS)) {
-      Serial.printf("[M5RETRO] Radio: falha ao conectar em %s:%u\n", url_.host, (unsigned)url_.port);
-      return false;
-    }
-    // Icy-MetaData: 1 pede o título da música. Connection: close porque não há
-    // reuso a fazer — este socket fica aberto até cair.
-    client.printf("GET %s HTTP/1.1\r\n"
-                  "Host: %s\r\n"
-                  "User-Agent: M5RetroTV/1.0\r\n"
-                  "Icy-MetaData: 1\r\n"
-                  "Connection: close\r\n"
-                  "\r\n",
-                  url_.path, url_.host);
-
-    uint8_t buf[256]; // único local grande da tarefa
-    // --- cabeçalho ---
-    const uint32_t hdrDeadline = millis() + HEADER_TIMEOUT_MS;
-    bool started = false;
-    while (!stop_.load() && !header_.done()) {
-      if (timeReached(millis(), hdrDeadline)) {
-        client.stop();
+    uint8_t buf[NET_CHUNK]; // único local grande da tarefa
+    for (int hop = 0;; ++hop) {
+      const Header h = openAndReadHeader(client, buf);
+      if (h == Header::Audio)
+        break;
+      if (h != Header::Redirect || stop_.load())
+        return false;
+      if (hop >= MAX_REDIRECTS) {
+        Serial.println("[M5RETRO] Radio: redirecionamentos demais");
         return false;
       }
-      const int n = client.read(buf, sizeof(buf));
-      if (n <= 0) {
-        if (!client.connected() && !client.available()) {
-          client.stop();
-          return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
+      Url next;
+      if (!resolveRedirect(cur_, header_.info().location, next)) {
+        Serial.printf("[M5RETRO] Radio: redirecionamento recusado (%ld)\n",
+                      (long)header_.info().status);
+        return false;
       }
-      const size_t used = header_.feed(buf, (size_t)n);
-      if (header_.done()) {
-        if (!header_.ok()) {
-          Serial.printf("[M5RETRO] Radio: resposta invalida (status %ld)\n",
-                        (long)header_.info().status);
-          client.stop();
-          return false;
-        }
-        const IcyInfo &icy = header_.info();
-        if (icy.name[0])
-          strncpy(icyName_, icy.name, sizeof(icyName_) - 1);
-        splitter_.begin(icy.metaint);
-        Serial.printf("[M5RETRO] Radio: %s metaint:%ld\n", stationName(), (long)icy.metaint);
-        started = true;
-        // A sobra do MESMO read já é corpo: passa pelo de-interleave in-place.
-        if ((size_t)n > used) {
-          const size_t got = splitter_.split(buf + used, (size_t)n - used, buf);
-          ring_.write(buf, got);
-          bytesIn_.fetch_add((uint32_t)got);
-        }
-      }
+      cur_ = next;
+      Serial.printf("[M5RETRO] Radio: redirecionado para %s%s:%u%s\n",
+                    cur_.tls ? "https://" : "http://", cur_.host, (unsigned)cur_.port, cur_.path);
     }
-    if (!started || stop_.load()) {
-      client.stop();
+    if (stop_.load()) {
+      closeClient(client);
       return false;
     }
 
@@ -970,21 +1201,24 @@ private:
     uint32_t lastData = millis();
     bool onAir = false;
     while (!stop_.load()) {
-      if (!client.connected() && !client.available())
-        break;
       if (timeReached(millis(), lastData + STALL_TIMEOUT_MS)) {
         Serial.println("[M5RETRO] Radio: fluxo mudo, derrubando");
         break;
       }
       // Anel quase cheio: o decodificador está atrasado. Espera em vez de
-      // descartar, porque descartar byte de MP3 é estalo garantido.
-      if (ring_.space() < sizeof(buf)) {
+      // descartar, porque descartar byte de MP3 é estalo garantido. O prazo de
+      // silêncio é renovado aqui: quem parou foi o consumidor, não o servidor.
+      if (ring_.space() < NET_CHUNK) {
+        lastData = millis();
         vTaskDelay(pdMS_TO_TICKS(20));
         continue;
       }
-      const int n = client.read(buf, sizeof(buf));
+      bool alive = false;
+      const int n = readBlock(client, buf, NET_CHUNK, alive);
       if (n <= 0) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+        if (!alive)
+          break; // o NINA já soltou o socket; closeClient abaixo é inócuo
+        vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_MS));
         continue;
       }
       lastData = millis();
@@ -1001,7 +1235,7 @@ private:
         Serial.println("[M5RETRO] Radio: no ar");
       }
     }
-    client.stop();
+    closeClient(client);
     return onAir;
   }
 
@@ -1018,7 +1252,8 @@ private:
 
   // -- estado ---------------------------------------------------------------
 
-  Url url_{};
+  Url url_{};  // da tabela
+  Url cur_{};  // da tentativa em curso (pode ser destino de redirecionamento)
   int station_ = 0;
   bool running_ = false;
 
@@ -1030,14 +1265,11 @@ private:
   HMP3Decoder dec_ = nullptr;
   size_t mp3InLen_ = 0, mp3PcmCount_ = 0;
   int mp3Rate_ = 44100, mp3Chans_ = 2, bitrate_ = 0;
-  // Fase e passo do reamostrador em Q16. Eram `double`: o ESP32 nao tem FPU de
-  // precisao dupla, e o laco fazia uma DIVISAO dupla por amostra de saida
-  // (22.050 por segundo), emulada em software. Era isso que nao cabia nos
-  // 11,6 ms de cada volta do audioTask.
   // Buffers de trabalho emprestados pelo chamador (SRAM). Nao sao liberados
   // aqui: o dono e quem emprestou.
   uint8_t *extIn_ = nullptr;
   int16_t *extPcm_ = nullptr;
+  // Fase e passo do reamostrador em Q16 (eram `double`; ver decodeInto).
   uint32_t phaseQ16_ = 0;
   uint32_t stepQ16_ = 1u << 16;
 
@@ -1051,6 +1283,7 @@ private:
   std::atomic<uint8_t> conn_{(uint8_t)Conn::Idle};
   std::atomic<bool> stop_{false};
   std::atomic<bool> netAlive_{false};
+  std::atomic<bool> orphan_{false}; // end() desistiu de esperar: a tarefa libera
   std::atomic<bool> pcmBusy_{false};
   mutable std::atomic<bool> titleLock_{false};
   std::atomic<uint32_t> reconnects_{0};

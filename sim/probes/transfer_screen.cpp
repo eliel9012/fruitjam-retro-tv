@@ -7,7 +7,11 @@
 //  as fontes bitmap so tem ASCII). Grava um PNG de cada e, no fim, confere
 //  pixel a pixel que nada de conteudo caiu fora da area segura do tubo.
 //
-//    make -C sim probes && ./sim/build/probe_transfer_screen
+//    make -C sim probes && (cd sim && ./build/probe_transfer_screen)
+//
+//  Desenha num LGFX_Sprite, como o canvas `tv` do firmware, entao nao abre
+//  janela nem precisa de SDL em tempo de execucao. Roda de dentro de sim/: os
+//  PNGs vao para build/ (armadilha 14 do AGENTS.md).
 //
 //  Sai com 1 se algum pixel escapar, para servir de porta em CI.
 //
@@ -16,8 +20,7 @@
 //  do make.
 // ============================================================================
 
-#include <SDL2/SDL.h> // antes do M5GFX: define SDL_h_
-#include <M5GFX.h>
+#include "fj/Gfx.h" // LovyanGFX, a mesma porta de entrada do firmware (PORTING.md 3.1)
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,8 +28,11 @@
 #include "SafeArea.h"
 #include "TransferScreen.h"
 
-static lgfx::Panel_sdl panel;
-static M5GFX rca;
+// Um LGFX_Sprite 320x240, e nao um painel SDL: no Fruit Jam o canvas `tv` E um
+// LGFX_Sprite (o framebuffer do DVI, fj/Display.h), entao desenhar num sprite
+// aqui e desenhar exatamente como o aparelho desenha — e sem janela nenhuma,
+// o que deixa o probe rodar em CI. O nome `rca` fica por historia.
+static LGFX_Sprite rca;
 
 static void savePng(const char *name) {
   size_t len = 0;
@@ -38,6 +44,11 @@ static void savePng(const char *name) {
   char path[256];
   snprintf(path, sizeof(path), "build/%s", name);
   FILE *f = fopen(path, "wb");
+  if (!f) { // rodado fora de sim/: sem isto o fwrite abaixo e segfault mudo
+    printf("nao abriu %s (rode de dentro de sim/)\n", path);
+    free(png);
+    return;
+  }
   fwrite(png, 1, len, f);
   fclose(f);
   free(png);
@@ -57,8 +68,9 @@ static void shot(const char *name, const xfer::State &s) {
 // area segura permite. Entao "conteudo" aqui e todo pixel que NAO ficou da cor
 // de fundo — e nenhum deles pode estar fora da caixa segura.
 //
-// A referencia e lida do framebuffer, nao do literal RGB565: o painel esta em
-// RGB332 e a cor volta quantizada do readPixel.
+// A referencia e lida do framebuffer, nao do literal RGB565: assim a conferencia
+// vale em qualquer profundidade de cor, inclusive quando a cor volta quantizada
+// do readPixel.
 static int checkSafeArea(const char *what, const xfer::State &s) {
   rca.fillScreen(xfer::kBg);
   const uint16_t bg = rca.readPixel(0, 0);
@@ -94,11 +106,11 @@ static int checkSafeArea(const char *what, const xfer::State &s) {
 }
 
 int main(int, char **) {
-  panel.setScaling(3, 3);
-  rca.setPanel(&panel);
-  if (!rca.init())
+  // RGB565, igual ao canvas do DVI (fj/Display.h). O RGB332 do composto
+  // do Core2 nao existe mais neste fork (PORTING.md 3.5).
+  rca.setColorDepth(16);
+  if (!rca.createSprite(crt::W, crt::H))
     return 1;
-  rca.setColorDepth(8); // RGB332, igual ao firmware na saida composta
 
   // Caso base: o que a pessoa ve assim que o servidor sobe.
   xfer::State waiting;
@@ -155,13 +167,14 @@ int main(int, char **) {
   unknown.bytesReceived = 3u * 1024u * 1024u + 512u * 1024u;
   shot("probe_transfer_unknown.png", unknown);
 
-  // O mesmo desenho num painel de 16 bits, que e o caso do LCD do Core2. A
-  // tela usa as mesmas coordenadas nos dois destinos (o LCD so ganha uma
-  // margem maior, por nao ter overscan); este PNG existe para conferir que
-  // nenhuma cor dependia da quantizacao do RGB332 do composto.
-  rca.setColorDepth(16);
-  shot("probe_transfer_lcd.png", recv);
+  // O mesmo desenho num painel de 8 bits (RGB332), que era a saida composta do
+  // Core2. O fork so usa RGB565, mas o upstream ainda desenha esta tela em
+  // RGB332: este PNG confere que nenhuma cor depende da profundidade.
   rca.setColorDepth(8);
+  rca.createSprite(crt::W, crt::H);
+  shot("probe_transfer_rgb332.png", recv);
+  rca.setColorDepth(16);
+  rca.createSprite(crt::W, crt::H);
 
   printf("\nconferencia da area segura:\n");
   int outside = 0;

@@ -1,9 +1,10 @@
 // ============================================================================
 //  Probe da logica de rede do radio (include/RadioStream.h).
 //
-//  Bancada NATIVA: nao usa SDL, nao usa M5GFX, nao usa Arduino. So a parte pura
-//  do header — parse de URL, parse de cabecalho, de-interleave do icy-metaint,
-//  parse do StreamTitle, anel e backoff. E justamente essa parte que nao da
+//  Bancada NATIVA: nao usa SDL, nao usa LovyanGFX, nao usa Arduino. So a parte
+//  pura do header — parse de URL (http e https), parse de cabecalho,
+//  redirecionamento, de-interleave do icy-metaint, parse do StreamTitle, anel e
+//  backoff. E justamente essa parte que nao da
 //  para conferir no aparelho sem uma TV, um roteador e paciencia.
 //
 //  O teste que importa e o do icy-metaint: a stream sintetica tem audio com
@@ -17,8 +18,8 @@
 //
 //  Ou, sem o simulador (e assim que o C++11 do firmware e conferido):
 //
-//    g++ -std=gnu++11 -I include -o /tmp/probe_radio_stream \
-//        sim/probes/radio_stream.cpp && /tmp/probe_radio_stream
+//    g++ -std=gnu++11 -I include -o /tmp/probe_radio_stream sim/probes/radio_stream.cpp
+//    /tmp/probe_radio_stream
 //
 //  Sai com 1 se algum caso falhar, para servir de porta em CI.
 // ============================================================================
@@ -89,6 +90,7 @@ static void testUrl() {
   checkStr(u.host, "51-222-26-208.webnow.com.br", "host da estacao");
   checkStr(u.path, "/diario.mp3", "caminho da estacao");
   check(u.port == 80, "porta padrao 80");
+  check(!u.tls, "estacao da tabela e http puro");
 
   check(radio::parseUrl("http://exemplo.com:8000/live", u), "com porta");
   checkStr(u.host, "exemplo.com", "host com porta");
@@ -104,8 +106,15 @@ static void testUrl() {
   check(radio::parseUrl("http://a.b/c?d=1", u), "com query");
   checkStr(u.path, "/c?d=1", "query vai junto no caminho");
 
-  // O modulo nao abre TLS de proposito (SRAM). Tem de recusar, nao tentar.
-  check(!radio::parseUrl("https://exemplo.com/x", u), "https e recusado");
+  // No Fruit Jam o TLS roda no ESP32-C6: https passa a valer, com porta 443.
+  check(radio::parseUrl("https://exemplo.com/x", u), "https e aceito (TLS no C6)");
+  check(u.tls, "https liga o TLS");
+  check(u.port == 443, "https usa a porta 443");
+  checkStr(u.path, "/x", "caminho do https");
+  check(radio::parseUrl("https://exemplo.com:8443/y", u) && u.tls && u.port == 8443,
+        "https com porta propria");
+  check(radio::parseUrl("http://exemplo.com/x", u) && !u.tls, "http desliga o TLS");
+  check(!radio::parseUrl("ftp://exemplo.com/x", u), "esquema desconhecido e recusado");
   check(!radio::parseUrl("", u), "string vazia e recusada");
   check(!radio::parseUrl(0, u), "nulo e recusado");
   check(!radio::parseUrl("http://exemplo.com:0/x", u), "porta 0 e recusada");
@@ -118,6 +127,104 @@ static void testUrl() {
   radio::parseUrl(big.c_str(), u);
   check(strlen(u.host) < sizeof(u.host), "host longo e truncado sem estouro");
   printf("  estacao: %s:%u%s\n", "51-222-26-208.webnow.com.br", 80u, "/diario.mp3");
+}
+
+// ---------------------------------------------------------------------------
+//  2b. Redirecionamento (3xx + Location)
+// ---------------------------------------------------------------------------
+
+static void testRedirect() {
+  printf("\n[2b] redirecionamento\n");
+  // Cabecalho 302 tipico de balanceador de Icecast, em varios cortes de leitura.
+  const char *h302 = "HTTP/1.1 302 Found\r\n"
+                     "Location: https://edge2.exemplo.com.br:8443/diario.mp3?tok=abc\r\n"
+                     "Content-Length: 0\r\n\r\n";
+  const size_t cortes[] = {1, 5, 64, 4096};
+  for (size_t ci = 0; ci < 4; ++ci) {
+    radio::HeaderParser hp;
+    hp.reset();
+    size_t bodyStart = 0;
+    for (size_t pos = 0; pos < strlen(h302);) {
+      size_t take = cortes[ci];
+      if (pos + take > strlen(h302))
+        take = strlen(h302) - pos;
+      const size_t used = hp.feed((const uint8_t *)h302 + pos, take);
+      pos += used;
+      bodyStart = pos;
+      if (used < take || hp.done())
+        break;
+    }
+    check(hp.done(), "302 termina o cabecalho");
+    check(!hp.ok(), "302 nao e audio");
+    check(hp.redirect(), "302 com Location pede redirecionamento");
+    check(bodyStart == strlen(h302), "302 consumido inteiro");
+    checkStr(hp.info().location, "https://edge2.exemplo.com.br:8443/diario.mp3?tok=abc",
+             "Location capturado cru (sem normalizar)");
+  }
+
+  radio::Url cur, next;
+  radio::parseUrl(radio::STATIONS[0].url, cur);
+
+  // Absoluto, com troca para https: o TLS e do C6.
+  check(radio::resolveRedirect(cur, "https://edge2.exemplo.com.br:8443/diario.mp3?tok=abc", next),
+        "absoluto https resolvido");
+  checkStr(next.host, "edge2.exemplo.com.br", "host do destino");
+  check(next.port == 8443 && next.tls, "porta e TLS do destino");
+  checkStr(next.path, "/diario.mp3?tok=abc", "caminho com token");
+
+  // Caminho absoluto: mantem host, porta e esquema.
+  check(radio::resolveRedirect(cur, "/outro.mp3", next), "caminho absoluto resolvido");
+  checkStr(next.host, cur.host, "caminho absoluto mantem o host");
+  check(next.port == cur.port && next.tls == cur.tls, "caminho absoluto mantem porta e esquema");
+  checkStr(next.path, "/outro.mp3", "caminho novo");
+
+  // Recusas: seguir errado e pior que cair no backoff.
+  check(!radio::resolveRedirect(cur, "", next), "Location vazio recusado");
+  check(!radio::resolveRedirect(cur, "outro.mp3", next), "relativo sem barra recusado");
+  check(!radio::resolveRedirect(cur, "//cdn.exemplo.com/x", next), "sem esquema recusado");
+  check(!radio::resolveRedirect(cur, "ftp://x/y", next), "esquema estranho recusado");
+  std::string longo = "/";
+  longo.append(300, 'a');
+  check(!radio::resolveRedirect(cur, longo.c_str(), next), "caminho que nao cabe recusado");
+
+  // Location que cabe segue; o que nao cabe (na linha OU no campo) fica vazio,
+  // e sem Location nao ha redirecionamento: o chamador cai no backoff em vez de
+  // seguir uma URL truncada, que seria conectar no lugar errado.
+  {
+    std::string h = "HTTP/1.1 301 Moved\r\nLocation: http://x.com/";
+    h.append(150, 'b');
+    h += "\r\n\r\n";
+    radio::HeaderParser hp;
+    hp.reset();
+    hp.feed((const uint8_t *)h.data(), h.size());
+    check(hp.done() && hp.redirect(), "301 com Location de 164 bytes segue");
+  }
+  {
+    std::string h = "HTTP/1.1 301 Moved\r\nLocation: http://x.com/";
+    h.append(400, 'b'); // estoura a linha do parser
+    h += "\r\nContent-Length: 0\r\n\r\n";
+    radio::HeaderParser hp;
+    hp.reset();
+    const size_t used = hp.feed((const uint8_t *)h.data(), h.size());
+    check(hp.done() && !hp.redirect(), "Location truncado nao e seguido");
+    check(used == h.size(), "linha longa consumida inteira mesmo assim");
+  }
+  {
+    radio::HeaderParser hp;
+    hp.reset();
+    const char *h = "HTTP/1.1 302 Found\r\nContent-Type: text/html\r\n\r\n";
+    hp.feed((const uint8_t *)h, strlen(h));
+    check(hp.done() && !hp.redirect() && !hp.ok(), "302 sem Location nao redireciona");
+  }
+  {
+    radio::HeaderParser hp;
+    hp.reset();
+    const char *h = "HTTP/1.1 304 Not Modified\r\nLocation: /x\r\n\r\n";
+    hp.feed((const uint8_t *)h, strlen(h));
+    check(hp.done() && !hp.redirect(), "304 nao e redirecionamento");
+  }
+  check(radio::isRedirectStatus(307) && radio::isRedirectStatus(308), "307 e 308 seguem");
+  check(!radio::isRedirectStatus(200) && !radio::isRedirectStatus(300), "200 e 300 nao seguem");
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +728,7 @@ int main() {
   printf("=== probe_radio_stream — logica de rede do radio ===\n");
   testBackoff();
   testUrl();
+  testRedirect();
   testHeader();
   testStreamTitle();
   testSplitter();
