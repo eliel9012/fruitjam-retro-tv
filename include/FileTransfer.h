@@ -13,22 +13,32 @@
 // DECISOES DE DESENHO, com o porque
 // ---------------------------------------------------------------------------
 //
-// 1. HTTP puro, sem TLS. Decisao consciente. Um handshake mbedTLS custa 4 a 6 KB
-//    de pilha (AGENTS 2.3) num aparelho que tem ~41 KB de heap interno livre, e
-//    o AES por software do ESP32 derruba a vazao para perto da metade num link
-//    que ja e o gargalo. O trafego fica dentro da LAN e a senha e descartavel,
-//    valida so enquanto a tela estiver aberta. Quem precisar de sigilo de
-//    verdade continua com o leitor de cartao.
+// 1. HTTP puro, sem TLS. No Fruit Jam nem ha escolha: a rede e o ESP32-C6 com
+//    firmware NINA (WiFiNINA, por SPI1), e o NINA so faz TLS do lado CLIENTE.
+//    O trafego fica dentro da LAN e a senha e descartavel, valida so enquanto
+//    a tela estiver aberta. Quem precisar de sigilo de verdade continua com o
+//    leitor de cartao.
 //
-// 2. Sem tarefa FreeRTOS. Uma pilha de 8 KB seria ~20% do heap interno livre
-//    (medido: ~41 KB livres, minimo historico ~35 KB). Em vez disso `handle()`
-//    e chamado do `loop()` e trabalha por fatias curtas (SLICE_MS), sem
-//    `delay()` e sem laco bloqueante: o `loop()` continua girando.
+// 2. Sem tarefa FreeRTOS: `handle()` e chamado do `loop()` e trabalha por
+//    fatias curtas (SLICE_MS), sem `delay()` e sem laco bloqueante. Toda
+//    chamada WiFiNINA roda com `net::Lock` tomado, UMA operacao por vez (um
+//    read, um write de ate WRITE_CHUNK, um status), nunca a fatia inteira: o
+//    SPI1 e dividido com as outras tarefas de rede. O custo disso e que o
+//    `loop()` espera se outra tarefa estiver no meio de uma transacao longa
+//    (um connect HTTPS da previsao) — com a tela de transferencia aberta o
+//    resto do aparelho fica suspenso, entao isso e raro.
+//
+//    Limites do NINA que moldam o codigo abaixo: poucos sockets no C6
+//    (CONFIG_LWIP_MAX_SOCKETS, divididos com radio, previsao e radar) — aqui
+//    sao dois, o de escuta e UM cliente por vez; leitura de no maximo 1500 B
+//    por transacao (o WiFiSocketBuffer do WiFiNINA); escrita de no maximo ~4 KB
+//    por transacao (o buffer de comando do C6), por isso WRITE_CHUNK; e o
+//    socket de escuta nunca fecha (ver detail::Listener).
 //
 // 3. Buffer de transferencia em PSRAM (`ps_malloc`), nunca na pilha e nunca na
-//    SRAM interna. Este repositorio ja estourou pilha duas vezes exatamente
-//    assim (AGENTS 2.3). Se a PSRAM faltar, `begin()` falha em vez de cair para
-//    a SRAM — o framebuffer do CVBS precisa dos 153.600 bytes dele.
+//    SRAM interna. O upstream ja estourou pilha duas vezes exatamente assim
+//    (AGENTS 2.3). Se a PSRAM faltar, `begin()` falha em vez de cair para a
+//    SRAM — o framebuffer do DVI precisa dos 153.600 bytes dele.
 //
 // 4. `PUT /upload/<caminho>` com o corpo cru, sem multipart. Multipart exigiria
 //    procurar a fronteira dentro do fluxo, guardar resto entre blocos e
@@ -39,12 +49,13 @@
 //
 // 5. Tamanho do bloco: 8 KiB (`BLOCK`). O cartao escreve em setores de 512 B, e
 //    8 KiB sao 16 setores inteiros — nao ha leitura-modificacao-escrita no
-//    FatFs, e como a gravacao e sequencial dentro do cluster (tipicamente
+//    SdFat, e como a gravacao e sequencial dentro do cluster (tipicamente
 //    32 KiB no FAT32) tambem nao ha desperdicio de cluster. Pelo outro lado:
 //    8 KiB a ~1,5 MB/s sao ~5 ms segurando o `sdMutex`, folgado dentro do prazo
-//    do I2S de audio; 32 KiB seriam ~20 ms e ja arriscariam um estouro de
-//    buffer na tarefa RCA_PCM. Menor que 8 KiB multiplicaria as idas ao mutex
-//    sem ganhar nada.
+//    da tarefa de audio; 32 KiB seriam ~20 ms e ja arriscariam um buraco no
+//    som. Menor que 8 KiB multiplicaria as idas ao mutex sem ganhar nada. Como
+//    o socket do NINA entrega no maximo 1500 B por vez, os pedacos se acumulam
+//    no buffer ate fechar um bloco (ver pumpBody).
 //
 // 6. Instalacao atomica por arquivo: grava em `<destino>.part` e so renomeia
 //    quando o ultimo byte chegou. Uma queda no meio deixa um `.part`, que o
@@ -95,13 +106,15 @@
 // ---------------------------------------------------------------------------
 // Custo de memoria
 // ---------------------------------------------------------------------------
-// Medido no objeto compilado para o alvo (xtensa-esp32-elf-nm), nao estimado:
-//   objeto FileTransfer : 1.216 B de .bss (SRAM interna)
-//   TRANSFER_PAGE       : 1.276 B de .rodata (flash, nao SRAM)
+// Medido no ESP32 original (xtensa-esp32-elf-nm): objeto FileTransfer com
+// ~1,2 KB de .bss; no Fruit Jam soma ~40 B de estado de rede. Alem disso:
+//   TRANSFER_PAGE       : ~1,3 KB de .rodata (flash, nao SRAM)
 //   buffer de bloco     : 8 KiB de PSRAM, alocado em begin(), liberado em stop()
+//   WiFiServer          : um objeto de poucos bytes, criado uma vez e nunca
+//                         liberado (o socket do C6 tambem nao fecha)
+//   WiFiNINA            : 1500 B de SRAM (malloc do WiFiSocketBuffer) por
+//                         socket em uso, liberados no stop() do socket
 //   pilha               : nenhuma alocacao grande; tudo o que e grande e membro
-// Ou seja: ~1,2 KB dos ~41 KB de heap interno livre, contra os ~8 KB que a
-// pilha de uma tarefa FreeRTOS custaria.
 //
 // ---------------------------------------------------------------------------
 // Como testar
@@ -163,7 +176,7 @@ enum class PathError : uint8_t {
   EXTENSAO    // extensao que a categoria nao aceita (hoje so fotos/ filtra)
 };
 
-// Texto curto e ASCII para mandar ao navegador e mostrar no LCD.
+// Texto curto e ASCII para mandar ao navegador e mostrar na TV.
 inline const char *pathErrorText(PathError error) {
   switch (error) {
   case PathError::OK:
@@ -744,12 +757,38 @@ template <class FS> bool ensureParents(FS &fs, const char *path, char *scratch, 
 #include <Arduino.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <WiFi.h>
-#include <SD.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
+#include <SD.h> // SD do arduino-pico (SDIO, fj/Storage.h); FILE_WRITE aqui ANEXA
+
+// NUNCA <WiFi.h>: o arduino-pico tem uma WiFi propria (lwIP/CYW43) com classes
+// de mesmo nome, e as duas juntas quebram o link. A rede do Fruit Jam e o
+// WiFiNINA, que chega por fj/Net.h junto com o net::Lock.
+#include "fj/Net.h"
+#include "fj/Platform.h" // FreeRTOS (semaforo do sdMutex), ps_malloc, esp_random
 
 namespace xfer {
+
+namespace detail {
+// O socket de escuta do NINA NAO FECHA. O WiFiNINA nao tem WiFiServer::end(), e
+// no firmware NINA o comando de fechar socket (stopClientTcp) so fecha o lado
+// cliente: o NetworkServer do slot continua escutando. Criar um WiFiServer novo
+// a cada visita a tela gastaria um slot do C6 por visita (sao poucos, divididos
+// com radio, previsao e radar) e ainda deixaria dois servidores disputando a
+// mesma porta. Entao o servidor e um so por programa, criado na primeira visita
+// e REUSADO nas seguintes; fora da tela ele so deixa de ser atendido.
+// Estado ESTABLISHED do `wl_tcp_state` do WiFiNINA (utility/wifi_spi.h). Aquele
+// header nao e publico e traz uma penca de #define de comando SPI; o valor e
+// fixo no protocolo e o firmware NINA so devolve 4 ou 0 (getClientStateTcp).
+static const uint8_t NINA_TCP_ESTABLISHED = 4;
+
+struct Listener {
+  WiFiServer *server;
+  uint16_t port;
+};
+inline Listener &listener() {
+  static Listener l = {nullptr, 0};
+  return l;
+}
+} // namespace detail
 
 enum class TransferStatus : uint8_t {
   PARADO,    // begin() ainda nao foi chamado, ou stop() ja foi
@@ -842,7 +881,10 @@ public:
   bool active() const { return _active; }
   TransferStatus status() const { return _status; }
   uint16_t port() const { return _port; }
-  String ip() const { return WiFi.localIP().toString(); }
+  // Guardado, e nao perguntado ao NINA a cada chamada: a tela chama isto a cada
+  // repintura (4x/s recebendo), e cada pergunta seria uma transacao no SPI1
+  // tomando o net::Lock do loop(). handle() refresca de tempos em tempos.
+  String ip() const { return String(_ip); }
   const char *user() const { return "m5retro"; }
   const char *password() const { return _password; }
   const char *fileName() const { return _name; }   // nome curto do arquivo em curso
@@ -850,8 +892,8 @@ public:
   uint64_t total() const { return _total; }
   uint16_t filesInstalled() const { return _installed; }
   const char *lastError() const { return _error; }
-  // Diagnóstico: o socket de escuta realmente subiu? (WiFiServer::operator bool)
-  bool listening() { return (bool)_server; }
+  // Diagnóstico: o socket de escuta realmente subiu? (lido do NINA no begin())
+  bool listening() const { return _listening; }
   uint8_t percent() const {
     if (!_total)
       return 0;
@@ -863,6 +905,18 @@ public:
   static const size_t BLOCK = 8192;          // ver decisao 5
   static const uint32_t SLICE_MS = 12;       // fatia maxima por handle()
   static const uint32_t IDLE_MS = 20000;     // conexao parada e abandonada
+  // Conexao aceita que nao mandou NENHUM byte. Navegadores abrem conexoes
+  // especulativas e nao usam; como aqui ha uma conexao por vez, esperar os 20 s
+  // do IDLE_MS por uma delas travaria o envio de verdade que esta na fila.
+  static const uint32_t FIRST_BYTE_MS = 3000;
+  // De quanto em quanto tempo perguntar ao NINA se o socket ainda esta de pe
+  // quando nao chega nada. Cada pergunta e uma transacao no SPI1.
+  static const uint32_t ALIVE_CHECK_MS = 250;
+  // Escrita por transacao SPI. O buffer de comando do NINA e de ~4 KB (o maximo
+  // do DMA do SPI escravo do C6); 2 KB deixam folga para o cabecalho do comando
+  // e ainda mandam a pagina inteira em uma ou duas idas.
+  static const size_t WRITE_CHUNK = 2048;
+  static const uint32_t IP_REFRESH_MS = 10000; // DHCP pode trocar o endereco
   static const uint32_t SD_WAIT_MS = 1000;   // espera pelo sdMutex por bloco
   static const uint32_t MAX_HEADER = 2048;   // teto do bloco de cabecalhos
   static const size_t LINE_CAP = 512;        // linha de pedido / cabecalho
@@ -874,11 +928,21 @@ private:
   enum class Method : uint8_t { OUTRO, GET, HEAD, PUT };
   enum class Route : uint8_t { DESCONHECIDA, RAIZ, UPLOAD, CONTROLE, COMANDO };
 
-  WiFiServer _server{80};
+  WiFiServer *_server = nullptr; // de detail::listener(); nao e nosso
   WiFiClient _client;
   File _file;
   SemaphoreHandle_t _sd = nullptr;
+  // PSRAM, BLOCK bytes. Tres usos que nunca se sobrepoem: bytes crus do
+  // cabecalho (_hdrPos.._hdrLen), acumulador do corpo ate um bloco inteiro
+  // (_fill) e leitura de volta do cabecalho JPEG em completeBody().
   uint8_t *_buffer = nullptr;
+  size_t _hdrPos = 0, _hdrLen = 0;
+  size_t _fill = 0;
+  char _ip[16] = {0};
+  uint32_t _ipCheckMs = 0;
+  uint32_t _aliveCheckMs = 0;
+  uint32_t _acceptedMs = 0;
+  bool _listening = false;
 
   bool _active = false;
   TransferStatus _status = TransferStatus::PARADO;
@@ -915,8 +979,21 @@ private:
       xSemaphoreGive(_sd);
   }
 
+  // ---- rede (toda chamada WiFiNINA com net::Lock, uma operacao por vez) ------
+  //
+  // Nada de WiFiClient::connected() aqui. No WiFiNINA ele poe o socket em 255
+  // quando ve a conexao caida — e depois disso stop() nao faz nada. Para um
+  // socket ACEITO pelo servidor o firmware NINA nao libera o slot sozinho
+  // (so libera os abertos por connect), entao o slot vazaria a cada navegador
+  // que fechasse primeiro, e em poucas conexoes o C6 pararia de aceitar. Por
+  // isso a vida do socket e lida com status() e o fim e sempre stop().
+  bool peerAlive();
+  int netRead(uint8_t *dst, size_t cap);
+  bool netWriteAll(const uint8_t *data, size_t len);
+  void refreshIp();
+  bool flushFill();
+
   // ---- conexao -------------------------------------------------------------
-  bool connectionAlive() { return _client && (_client.connected() || _client.available() > 0); }
   void beginRequest();
   void closeConnection(bool discardPartial);
   bool expired() const { return int32_t(millis() - _deadline) >= 0; }
@@ -965,14 +1042,19 @@ inline bool FileTransfer::begin(SemaphoreHandle_t sdMutex, uint16_t port) {
   _sd = sdMutex;
   _port = port ? port : 80;
   _error = "";
-  if (WiFi.status() != WL_CONNECTED) {
+  bool conectado;
+  {
+    net::Lock lock;
+    conectado = WiFi.status() == WL_CONNECTED;
+  }
+  if (!conectado) {
     _error = "sem Wi-Fi";
     _status = TransferStatus::FALHA;
     return false;
   }
-  // PSRAM, nunca SRAM: os 153.600 bytes do framebuffer do CVBS precisam da
-  // interna e este repositorio ja estourou pilha duas vezes com buffer grande
-  // no lugar errado. Sem PSRAM, falhar e mais honesto do que roubar SRAM.
+  // PSRAM, nunca SRAM: o framebuffer do DVI ja leva 153.600 B da interna e o
+  // upstream ja estourou pilha duas vezes com buffer grande no lugar errado.
+  // Sem PSRAM, falhar e mais honesto do que roubar SRAM.
   if (!_buffer)
     _buffer = (uint8_t *)ps_malloc(BLOCK);
   if (!_buffer) {
@@ -980,13 +1062,36 @@ inline bool FileTransfer::begin(SemaphoreHandle_t sdMutex, uint16_t port) {
     _status = TransferStatus::FALHA;
     return false;
   }
+  {
+    net::Lock lock;
+    detail::Listener &l = detail::listener();
+    if (!l.server || l.port != _port) {
+      // Porta nova: o socket antigo fica orfao no C6 (nao ha como fecha-lo, ver
+      // detail::Listener) e o objeto antigo tambem fica — sao poucos bytes, e
+      // o WiFiServer nao tem destrutor virtual para um delete limpo. Na pratica
+      // a porta e sempre 80 e isto roda uma vez por boot.
+      l.server = new WiFiServer(_port);
+      l.port = _port;
+      l.server->begin();
+    } else if (!l.server->status()) {
+      // O C6 foi reiniciado (reset do GPIO 22) ou o servidor caiu: escuta de novo.
+      l.server->begin();
+    }
+    _server = l.server;
+    _listening = _server->status() != 0;
+  }
+  if (!_listening) {
+    _error = "servidor HTTP nao subiu";
+    _status = TransferStatus::FALHA;
+    return false;
+  }
+  refreshIp();
   makePassword();
   _installed = 0;
   _received = _total = 0;
+  _fill = _hdrPos = _hdrLen = 0;
   _name[0] = '\0';
   _phase = Phase::OCIOSA;
-  _server.begin(_port);
-  _server.setNoDelay(true);
   _active = true;
   _status = TransferStatus::AGUARDANDO;
   return true;
@@ -994,9 +1099,15 @@ inline bool FileTransfer::begin(SemaphoreHandle_t sdMutex, uint16_t port) {
 
 inline void FileTransfer::stop() {
   // O `.part` sobrevive de proposito: sair da tela e voltar depois retoma o
-  // arquivo de onde parou em vez de reenviar 45 MB.
+  // arquivo de onde parou em vez de reenviar 45 MB. O que estava acumulado no
+  // buffer vai para o cartao antes, para a retomada perder o minimo.
+  if (_phase == Phase::CORPO && _fill)
+    flushFill();
   closeConnection(false);
-  _server.end();
+  // O servidor NAO e fechado (o NINA nao sabe fechar, ver detail::Listener):
+  // so deixa de ser atendido. Conexoes que chegarem agora esperam na fila do C6
+  // ate o navegador desistir.
+  _server = nullptr;
   if (_buffer) {
     free(_buffer);
     _buffer = NULL;
@@ -1017,6 +1128,55 @@ inline void FileTransfer::makePassword() {
   _password[PASSWORD_LEN] = '\0';
 }
 
+inline void FileTransfer::refreshIp() {
+  IPAddress addr;
+  {
+    net::Lock lock;
+    addr = WiFi.localIP();
+  }
+  snprintf(_ip, sizeof(_ip), "%u.%u.%u.%u", (unsigned)addr[0], (unsigned)addr[1],
+           (unsigned)addr[2], (unsigned)addr[3]);
+  _ipCheckMs = millis();
+}
+
+inline bool FileTransfer::peerAlive() {
+  net::Lock lock;
+  if (!_client)
+    return false;
+  if (_client.available() > 0)
+    return true; // ainda ha bytes a ler, mesmo que o outro lado ja tenha fechado
+  return _client.status() == detail::NINA_TCP_ESTABLISHED;
+}
+
+inline int FileTransfer::netRead(uint8_t *dst, size_t cap) {
+  net::Lock lock;
+  if (!_client || !cap)
+    return 0;
+  // Traz no maximo o que o WiFiNINA ja tem no buffer dele (ate 1500 B por
+  // transacao SPI); nao espera chegar mais.
+  return _client.read(dst, cap);
+}
+
+// Escreve tudo ou devolve false. Uma transacao por pedaco de WRITE_CHUNK, com o
+// lock so durante ela: a pagina de 2 KB nao segura o SPI1 de uma vez.
+inline bool FileTransfer::netWriteAll(const uint8_t *data, size_t len) {
+  while (len) {
+    const size_t k = len > WRITE_CHUNK ? WRITE_CHUNK : len;
+    size_t w;
+    {
+      net::Lock lock;
+      if (!_client)
+        return false;
+      w = _client.write(data, k);
+    }
+    if (!w)
+      return false; // o C6 recusou: conexao caiu ou buffer de envio cheio demais
+    data += w;
+    len -= w;
+  }
+  return true;
+}
+
 inline void FileTransfer::beginRequest() {
   _phase = Phase::CABECALHO;
   _lineLen = 0;
@@ -1029,6 +1189,9 @@ inline void FileTransfer::beginRequest() {
   _length = _offset = 0;
   _authUser[0] = _authPass[0] = '\0';
   _path[0] = _part[0] = '\0';
+  _hdrPos = _hdrLen = 0;
+  _fill = 0;
+  _acceptedMs = _aliveCheckMs = millis();
   touch();
 }
 
@@ -1045,9 +1208,16 @@ inline void FileTransfer::closeConnection(bool discardPartial) {
     }
     _file = File();
   }
-  if (_client)
-    _client.stop();
+  {
+    // stop() SEMPRE, mesmo com o outro lado ja fechado: e o que devolve o slot
+    // do socket ao C6 (ver peerAlive). stop() do WiFiNINA espera o NINA
+    // confirmar o fechamento, que no firmware atual e imediato.
+    net::Lock lock;
+    if (_client)
+      _client.stop();
+  }
   _client = WiFiClient();
+  _fill = _hdrPos = _hdrLen = 0;
   _phase = Phase::OCIOSA;
   if (_status == TransferStatus::RECEBENDO)
     _status = TransferStatus::AGUARDANDO;
@@ -1059,19 +1229,22 @@ inline void FileTransfer::handle() {
 
   // Uma conexao por vez. O cartao e um recurso serial: atender dois envios
   // juntos so dividiria a mesma banda em dois e dobraria o estado a manter.
-  if (!connectionAlive()) {
-    if (_phase != Phase::OCIOSA)
-      closeConnection(false); // caiu no meio; o `.part` fica para retomada
-    WiFiClient next = _server.available();
+  if (_phase == Phase::OCIOSA) {
+    if (uint32_t(millis() - _ipCheckMs) >= IP_REFRESH_MS)
+      refreshIp();
+    WiFiClient next;
+    {
+      net::Lock lock;
+      next = _server ? _server->available() : WiFiClient();
+    }
     if (!next)
       return;
     _client = next;
-    _client.setNoDelay(true);
     beginRequest();
   }
 
   const uint32_t sliceStart = millis();
-  while (connectionAlive()) {
+  for (;;) {
     if (millis() - sliceStart >= SLICE_MS)
       return; // devolve o loop(); o resto continua na proxima volta
     if (_phase == Phase::CABECALHO) {
@@ -1084,20 +1257,38 @@ inline void FileTransfer::handle() {
       return; // ja respondeu e fechou
     }
   }
-  closeConnection(false);
 }
 
+// Le o cabecalho em blocos para `_buffer` e interpreta byte a byte a partir
+// dali. A sobra do ultimo bloco depois da linha vazia ja e CORPO: startBody()
+// a aproveita como o comeco do acumulador, sem perder nem repetir byte.
 inline bool FileTransfer::pumpHeader() {
-  int avail = _client.available();
-  if (avail <= 0) {
-    if (expired())
-      closeConnection(false);
-    return false;
+  if (_hdrPos >= _hdrLen) {
+    // Um bloco inteiro: o teto do cabecalho (MAX_HEADER) e conferido byte a
+    // byte abaixo, e o que passar dele ja e corpo.
+    const int n = netRead(_buffer, BLOCK);
+    if (n <= 0) {
+      const uint32_t now = millis();
+      if (_headerBytes == 0 && now - _acceptedMs >= FIRST_BYTE_MS) {
+        closeConnection(false); // conexao especulativa do navegador: libera a vez
+        return false;
+      }
+      if (expired()) {
+        closeConnection(false);
+        return false;
+      }
+      if (now - _aliveCheckMs >= ALIVE_CHECK_MS) {
+        _aliveCheckMs = now;
+        if (!peerAlive())
+          closeConnection(false);
+      }
+      return false;
+    }
+    _hdrPos = 0;
+    _hdrLen = size_t(n);
   }
-  while (avail-- > 0) {
-    const int c = _client.read();
-    if (c < 0)
-      break;
+  while (_hdrPos < _hdrLen) {
+    const char c = char(_buffer[_hdrPos++]);
     if (++_headerBytes > MAX_HEADER) {
       respond(431, "Request Header Fields Too Large", "text/plain", "cabecalho grande demais");
       return false;
@@ -1109,7 +1300,7 @@ inline bool FileTransfer::pumpHeader() {
         respond(431, "Request Header Fields Too Large", "text/plain", "linha grande demais");
         return false;
       }
-      _line[_lineLen++] = char(c);
+      _line[_lineLen++] = c;
       continue;
     }
     _line[_lineLen] = '\0';
@@ -1347,8 +1538,18 @@ inline void FileTransfer::startBody() {
     respond(503, "Service Unavailable", "text/plain", "cartao ocupado");
     return;
   }
-  const uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+  // O SD do arduino-pico nao tem totalBytes()/usedBytes(); o espaco vem do
+  // SDFS.info(). Num cartao grande a primeira chamada varre a FAT inteira (o
+  // SdFat guarda a contagem depois), entao pode segurar o sdMutex por um
+  // instante — uma vez por arquivo, nao por bloco.
+  FSInfo info;
+  const bool infoOk = SDFS.info(info);
   sdGive();
+  if (!infoOk) {
+    respond(503, "Service Unavailable", "text/plain", "cartao nao respondeu");
+    return;
+  }
+  const uint64_t freeBytes = info.totalBytes > info.usedBytes ? info.totalBytes - info.usedBytes : 0;
   if (!fitsOnCard(freeBytes, _length, RESERVE)) {
     respond(507, "Insufficient Storage", "text/plain", "sem espaco no cartao");
     return;
@@ -1387,8 +1588,11 @@ inline void FileTransfer::startBody() {
     respond(503, "Service Unavailable", "text/plain", "cartao ocupado");
     return;
   }
-  // "a" continua no fim (retomada); "w" trunca (envio do zero).
-  _file = SD.open(_part, start ? FILE_APPEND : FILE_WRITE);
+  // "a" continua no fim (retomada); "w" trunca (envio do zero). Modo em TEXTO
+  // de proposito: no arduino-pico FILE_WRITE e O_APPEND (PORTING.md 3.7), e um
+  // envio "do zero" por cima de um `.part` velho viraria anexo — o arquivo
+  // final sairia com o lixo antigo na frente.
+  _file = SD.open(_part, start ? "a" : "w");
   sdGive();
   if (!_file) {
     respond(500, "Internal Server Error", "text/plain", "nao abriu o arquivo temporario");
@@ -1399,53 +1603,85 @@ inline void FileTransfer::startBody() {
   _total = expected;
   _status = TransferStatus::RECEBENDO;
   _phase = Phase::CORPO;
+  // A sobra do ultimo bloco do cabecalho ja e o comeco do corpo: vira o comeco
+  // do acumulador. Bytes alem do Content-Length sao de um pedido seguinte que
+  // este servidor nao atende (Connection: close) e ficam de fora.
+  size_t leftover = _hdrLen > _hdrPos ? _hdrLen - _hdrPos : 0;
+  if (uint64_t(leftover) > _length)
+    leftover = size_t(_length);
+  if (leftover)
+    memmove(_buffer, _buffer + _hdrPos, leftover);
+  _fill = leftover;
+  _hdrPos = _hdrLen = 0;
   touch();
 }
 
-inline bool FileTransfer::pumpBody() {
-  if (_received >= _total) {
-    completeBody();
-    return false;
-  }
-  const int avail = _client.available();
-  if (avail <= 0) {
-    if (expired())
-      abortBody("conexao parou no meio");
-    return false;
-  }
-  size_t want = size_t(avail) > BLOCK ? BLOCK : size_t(avail);
-  const uint64_t remaining = _total - _received;
-  if (uint64_t(want) > remaining)
-    want = size_t(remaining);
-
-  const int got = _client.read(_buffer, want);
-  if (got <= 0) {
-    if (expired())
-      abortBody("conexao parou no meio");
-    return false;
-  }
-
-  // Toma e devolve o mutex POR BLOCO — nunca durante o arquivo inteiro. Mesma
-  // disciplina do runVideoBenchmark: segurar durante 45 MB mataria de fome a
-  // tarefa de audio. Se o mutex nao vier, aborta: os bytes ja sairam do socket
-  // e grava-los fora de ordem corromperia o arquivo. O `.part` continua com
-  // exatamente `_received` bytes, entao a retomada ainda bate.
+// Grava o acumulador no cartao. Toma e devolve o mutex POR BLOCO — nunca
+// durante o arquivo inteiro. Mesma disciplina do runVideoBenchmark: segurar
+// durante 45 MB mataria de fome a tarefa de audio. Se o mutex nao vier, aborta:
+// os bytes ja sairam do socket e grava-los fora de ordem corromperia o arquivo.
+// O `.part` continua com exatamente `_received` bytes, entao a retomada bate.
+inline bool FileTransfer::flushFill() {
+  if (!_fill)
+    return true;
   if (!sdTake(SD_WAIT_MS)) {
     abortBody("cartao ocupado tempo demais");
     return false;
   }
-  const size_t written = _file.write(_buffer, size_t(got));
+  const size_t written = _file.write(_buffer, _fill);
   sdGive();
-  if (written != size_t(got)) {
+  if (written != _fill) {
     abortBody("escrita no cartao falhou");
     return false;
   }
-
   _received += written;
-  touch();
-  if (_received >= _total) {
+  _fill = 0;
+  return true;
+}
+
+// O socket entrega no maximo 1500 B por vez (o buffer do WiFiNINA), mas o
+// cartao quer blocos de 8 KiB (decisao 5): um bloco de 16 setores vai numa
+// escrita multibloco do SDIO, e 1500 B desalinhados virariam varias escritas
+// de setor avulso, bem mais lentas. Entao os pedacos do socket se acumulam em
+// `_buffer` e o cartao so e tocado com bloco cheio ou no fim do arquivo.
+inline bool FileTransfer::pumpBody() {
+  const uint64_t remaining = _total - _received; // o que ainda nao esta no cartao
+  if (uint64_t(_fill) >= remaining) {
+    if (!flushFill())
+      return false;
     completeBody();
     return false;
+  }
+  if (_fill == BLOCK && !flushFill())
+    return false;
+
+  size_t want = BLOCK - _fill;
+  if (uint64_t(want) > remaining - _fill)
+    want = size_t(remaining - _fill);
+  const int got = netRead(_buffer + _fill, want);
+  if (got <= 0) {
+    const uint32_t now = millis();
+    bool dead = expired();
+    if (!dead && now - _aliveCheckMs >= ALIVE_CHECK_MS) {
+      _aliveCheckMs = now;
+      dead = !peerAlive();
+    }
+    if (dead) {
+      // Salva o que ja chegou antes de largar: a retomada perde o minimo.
+      if (flushFill())
+        abortBody("conexao parou no meio");
+    }
+    return false;
+  }
+  _fill += size_t(got);
+  touch();
+  if (_fill == BLOCK || uint64_t(_fill) == remaining) {
+    if (!flushFill())
+      return false;
+    if (_received >= _total) {
+      completeBody();
+      return false;
+    }
   }
   return true;
 }
@@ -1517,53 +1753,42 @@ inline void FileTransfer::abortBody(const char *reason) {
 
 inline void FileTransfer::respond(int code, const char *reason, const char *type, const char *body,
                                   const char *extra) {
-  if (_client) {
-    const size_t len = body ? strlen(body) : 0;
-    char head[224];
-    const int n = snprintf(head, sizeof(head),
-                           "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: %s\r\n"
-                           "Content-Length: %u\r\n%s\r\n",
-                           code, reason, type, (unsigned)len, extra ? extra : "");
-    if (n > 0)
-      _client.write((const uint8_t *)head, size_t(n) < sizeof(head) ? size_t(n) : sizeof(head) - 1);
-    if (len)
-      _client.write((const uint8_t *)body, len);
-    _client.flush();
-  }
+  const size_t len = body ? strlen(body) : 0;
+  char head[224];
+  const int n = snprintf(head, sizeof(head),
+                         "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: %s\r\n"
+                         "Content-Length: %u\r\n%s\r\n",
+                         code, reason, type, (unsigned)len, extra ? extra : "");
+  bool ok = n > 0 &&
+            netWriteAll((const uint8_t *)head, size_t(n) < sizeof(head) ? size_t(n) : sizeof(head) - 1);
+  if (ok && len)
+    netWriteAll((const uint8_t *)body, len);
   closeConnection(false);
 }
 
 inline void FileTransfer::respondControl(bool bodyToo) {
-  if (_client) {
-    const size_t len = sizeof(CONTROL_PAGE) - 1;
-    char head[160];
-    const int n = snprintf(head, sizeof(head),
-                           "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n"
-                           "Content-Length: %u\r\n\r\n",
-                           (unsigned)len);
-    if (n > 0)
-      _client.write((const uint8_t *)head, size_t(n));
-    if (bodyToo)
-      _client.write((const uint8_t *)CONTROL_PAGE, len);
-    _client.flush();
-  }
+  const size_t len = sizeof(CONTROL_PAGE) - 1;
+  char head[160];
+  const int n = snprintf(head, sizeof(head),
+                         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n"
+                         "Content-Length: %u\r\n\r\n",
+                         (unsigned)len);
+  const bool ok = n > 0 && size_t(n) < sizeof(head) && netWriteAll((const uint8_t *)head, size_t(n));
+  if (ok && bodyToo)
+    netWriteAll((const uint8_t *)CONTROL_PAGE, len);
   closeConnection(false);
 }
 
 inline void FileTransfer::respondPage(bool bodyToo) {
-  if (_client) {
-    const size_t len = sizeof(TRANSFER_PAGE) - 1;
-    char head[160];
-    const int n = snprintf(head, sizeof(head),
-                           "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n"
-                           "Content-Length: %u\r\n\r\n",
-                           (unsigned)len);
-    if (n > 0)
-      _client.write((const uint8_t *)head, size_t(n));
-    if (bodyToo)
-      _client.write((const uint8_t *)TRANSFER_PAGE, len);
-    _client.flush();
-  }
+  const size_t len = sizeof(TRANSFER_PAGE) - 1;
+  char head[160];
+  const int n = snprintf(head, sizeof(head),
+                         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n"
+                         "Content-Length: %u\r\n\r\n",
+                         (unsigned)len);
+  const bool ok = n > 0 && size_t(n) < sizeof(head) && netWriteAll((const uint8_t *)head, size_t(n));
+  if (ok && bodyToo)
+    netWriteAll((const uint8_t *)TRANSFER_PAGE, len);
   closeConnection(false);
 }
 

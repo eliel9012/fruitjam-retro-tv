@@ -1,19 +1,23 @@
 // ============================================================================
 // Bancada nativa da logica pura do include/RtcClock.h.
 //
-// O BM8563 nao existe no PC, entao o que da para testar aqui e exatamente o que
+// O Fruit Jam nao tem RTC: a hora vem so do NTP do ESP32-C6 (firmware NINA).
+// Nada disso existe no PC, entao o que da para testar aqui e exatamente o que
 // pode estar errado sem ninguem perceber no aparelho:
 //
 //   1. conversao data/hora UTC -> epoch (substitui o timegm que o newlib nao
-//      tem, e e o que semeia o settimeofday no boot);
-//   2. o criterio de validade do RTC (ano < 2020 rejeitado, 2026 aceito);
-//   3. o fuso: uma data UTC conhecida tem que render horario de Brasilia.
+//      tem);
+//   2. o criterio de validade de uma data/epoch vinda de fora (ano < 2020
+//      rejeitado, 2026 aceito) — e o que separa "o NINA ainda nao tem hora"
+//      de uma hora de verdade;
+//   3. o fuso: uma data UTC conhecida tem que render horario de Brasilia;
+//   4. o backoff das consultas ao NINA e o estado inicial "sem hora" (--:--).
 //
-// Compilado em C++11, que e o padrao do firmware — o simulador usa C++17 e ja
-// escondeu um constexpr com laco que so quebrava no aparelho.
+// Compilado em C++11 de proposito: o simulador usa C++17 e ja escondeu um
+// constexpr com laco que so quebrava no firmware do upstream.
 //
-//   g++ -std=gnu++11 -I../../include sim/probes/rtc_clock.cpp -o probe_rtc_clock
-//   ./probe_rtc_clock
+//   g++ -std=gnu++11 -I include sim/probes/rtc_clock.cpp -o /tmp/probe_rtc_clock
+//   /tmp/probe_rtc_clock
 //
 // Tambem sai junto com os demais em `make -C sim probes`.
 // ============================================================================
@@ -81,11 +85,11 @@ static void testEpoch() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Validade do que sai do BM8563
+// 2. Validade de uma data vinda de fora (era a leitura do BM8563)
 // ---------------------------------------------------------------------------
 static void testValidade() {
   std::printf("\n-- isPlausibleDate (rejeicao de RTC zerado/podre) --\n");
-  // O caso real: BM8563 sem bateria devolve 2000-01-01 00:00:00.
+  // Um RTC sem bateria devolveria 2000-01-01 00:00:00: continua rejeitado.
   check(!rtcclock::isPlausibleDate(2000, 1, 1, 0, 0, 0), "2000-01-01 (bateria morta) rejeitado");
   check(!rtcclock::isPlausibleDate(1970, 1, 1, 0, 0, 0), "1970-01-01 rejeitado");
   check(!rtcclock::isPlausibleDate(2019, 12, 31, 23, 59, 59), "2019-12-31 rejeitado (ano < 2020)");
@@ -187,16 +191,16 @@ static void testFuso() {
   localtime_r(&t, &devolta);
   checkEq(devolta.tm_hour, 14, "hora local volta a 14 depois do sequestro");
 
-  // O caminho completo do boot: o que o BM8563 entrega -> epoch -> tela.
-  const time_t doRtc = rtcclock::epochFromUtc(2026, 9, 23, 2, 30, 0); // guardado em UTC
+  // O caminho completo: o epoch UTC que o NINA entrega -> tela.
+  const time_t doRtc = rtcclock::epochFromUtc(2026, 9, 23, 2, 30, 0); // sempre UTC
   struct tm tela;
   memset(&tela, 0, sizeof(tela));
   localtime_r(&doRtc, &tela);
-  char texto[32];
+  char texto[80];
   snprintf(texto, sizeof(texto), "%02d/%02d/%04d  %02d:%02d:%02d", tela.tm_mday, tela.tm_mon + 1,
            tela.tm_year + 1900, tela.tm_hour, tela.tm_min, tela.tm_sec);
   std::printf("   drawHomeClock mostraria: \"%s\"\n", texto);
-  check(strcmp(texto, "22/09/2026  23:30:00") == 0, "BM8563 02:30Z de 23/09 -> 23:30 de 22/09");
+  check(strcmp(texto, "22/09/2026  23:30:00") == 0, "NTP 02:30Z de 23/09 -> 23:30 de 22/09");
 }
 
 // ---------------------------------------------------------------------------
@@ -215,14 +219,41 @@ static void testStatus() {
   check(ascii, "nenhum byte acima de 0x7f nos rotulos");
   std::printf("   sizeof(rtcclock::State) = %zu bytes de SRAM\n", sizeof(rtcclock::State));
   check(sizeof(rtcclock::State) <= 40, "estado cabe em 40 bytes");
+
+  // Sem RTC: o aparelho nasce sem hora, e a tela tem de saber disso para
+  // desenhar --:-- em vez de 1970.
+  check(!rtcclock::hasTime(), "sem NTP ainda: hasTime() falso");
+  check(!rtcclock::synced(), "sem NTP ainda: synced() falso");
+  check(!rtcclock::present(), "Fruit Jam nao tem RTC: present() falso");
+  check(!rtcclock::batteryLow(), "sem RTC nao ha bateria fraca");
+  check(strcmp(rtcclock::sourceLabel(), "SEM HORA") == 0, "rotulo inicial SEM HORA");
+}
+
+// ---------------------------------------------------------------------------
+static void testBackoff() {
+  std::printf("\n-- backoff das consultas ao NINA --\n");
+  checkEq(rtcclock::queryBackoffMs(0), 2000, "1a espera 2 s");
+  checkEq(rtcclock::queryBackoffMs(1), 4000, "2a espera 4 s");
+  checkEq(rtcclock::queryBackoffMs(4), 32000, "5a espera 32 s");
+  checkEq(rtcclock::queryBackoffMs(5), 60000, "teto 60 s");
+  checkEq(rtcclock::queryBackoffMs(200), 60000, "teto nao estoura com tentativa grande");
+  bool monotono = true;
+  for (uint32_t i = 0; i < 20; ++i)
+    if (rtcclock::queryBackoffMs(i + 1) < rtcclock::queryBackoffMs(i))
+      monotono = false;
+  check(monotono, "backoff nunca diminui");
+  // O NINA zera abaixo de 2000; um epoch de 1970 com poucos segundos (C6 recem
+  // ligado) tambem nao pode passar por hora de verdade.
+  check(!rtcclock::isPlausibleEpoch(42), "epoch de C6 recem ligado rejeitado");
 }
 
 int main(void) {
-  std::printf("== bancada do RtcClock.h (logica pura, sem BM8563) ==\n");
+  std::printf("== bancada do RtcClock.h (logica pura, sem NINA) ==\n");
   testEpoch();
   testValidade();
   testFuso();
   testStatus();
+  testBackoff();
   std::printf("\n%d checagens, %d falha(s)\n", checagens, falhas);
   return falhas ? 1 : 0;
 }
