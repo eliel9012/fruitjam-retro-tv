@@ -33,6 +33,10 @@ public:
   }
   double toDouble() const { return atof(c_str()); }
   int toInt() const { return atoi(c_str()); }
+  bool concat(const char *s, unsigned n) {
+    append(s, n);
+    return true;
+  }
   void replace(const String &from, const String &to) {
     size_t p = 0;
     while ((p = find(from, p)) != npos) {
@@ -45,11 +49,3 @@ extern uint32_t fakeMillis;
 inline uint32_t millis() {
   return fakeMillis;
 }
-inline uint32_t esp_random() {
-  static uint32_t n = 1;
-  return ++n;
-}
-struct FakeESP {
-  uint64_t getEfuseMac() const { return 12345; }
-};
-extern FakeESP ESP;

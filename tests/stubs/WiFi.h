@@ -9,7 +9,7 @@ struct FakeWiFi {
   String ssid;
   String SSID() const { return ssid; }
   int status() const { return statusValue; }
-  void disconnect(bool, bool) { statusValue = 0; }
+  void disconnect(bool = false, bool = false) { statusValue = 0; }
   void mode(int) {}
   void begin(const char *name, const char *) {
     ssid = name;
