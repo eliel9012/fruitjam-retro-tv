@@ -1504,13 +1504,22 @@ void videoTick() {
   videoBehind = playing && videoFrameIndex < target;
 }
 
+// Texto de API vai para a tela: passa por ascii::normalize aqui, na única porta
+// de entrada, para que callsign, ICAO e modelo nunca cheguem com acento (um
+// UTF-8 acentuado são dois bytes sem glifo, ver AGENTS.md 2.7). 48 bytes cobrem
+// com folga qualquer um dos três campos; mais que isso nem cabe no painel.
+static String asciiField(const char *src) {
+  char buf[48];
+  ascii::normalize(buf, sizeof(buf), src ? src : "");
+  return String(buf);
+}
 String stringAlias(JsonObject o, const char *a, const char *b = nullptr, const char *c = nullptr) {
   if (o[a].is<const char *>())
-    return o[a].as<const char *>();
+    return asciiField(o[a].as<const char *>());
   if (b && o[b].is<const char *>())
-    return o[b].as<const char *>();
+    return asciiField(o[b].as<const char *>());
   if (c && o[c].is<const char *>())
-    return o[c].as<const char *>();
+    return asciiField(o[c].as<const char *>());
   return "";
 }
 double numberAlias(JsonObject o, const char *a, const char *b = nullptr, const char *c = nullptr) {
@@ -1573,50 +1582,94 @@ bool parseAircraft(JsonDocument &doc) {
   return true;
 }
 
+// Teto do corpo da resposta do radar. A API em uso é a do MeuLabApp
+// (/api/adsb/aircraft): na bancada de 20/09/2026 ela devolveu 22 aeronaves.
+// Cada item tem ~10 campos (icao, callsign, lat, lon, altitude_ft, speed_kt,
+// heading, model...), algo entre 250 e 700 bytes conforme o provedor — o
+// aircraft.json do readsb é o mais verboso. O parser só aproveita 64
+// aeronaves, e 64 x ~700 B dão ~45 KB. 64 KiB é o mesmo limite que o firmware
+// original já impunha pelo Content-Length ("RESPOSTA MUITO GRANDE"), então o
+// contrato com a API não muda. Na PSRAM, alocado só durante a consulta.
+static constexpr size_t RADAR_BODY_CAP = 64 * 1024;
+
+// Pilha das tarefas de rede. No Core2 eram 8 KB porque o handshake mbedTLS
+// rodava na própria tarefa (4 a 6 KB só nele, AGENTS.md 2.3). No Fruit Jam o
+// TLS roda DENTRO do ESP32-C6: o RP2350 só troca comandos SPI com o NINA, e o
+// net::httpGet() promete caber em 4 KB. O que sobra por cima é nosso:
+//  - deserializeJson é recursivo; com NestingLimit(12) são ~12 quadros de
+//    ~100 B, ~1,2 KB no pior caso;
+//  - Serial.printf passa pelo vsnprintf do newlib, ~1 KB de pilha.
+// 6 KB cobrem 4 + 1,2 + 1 com margem pequena mas real, e devolvem 2 KB de SRAM
+// por tarefa em relação aos 8 KB antigos. Não medido no aparelho: a tarefa
+// imprime a marca d'água da pilha no serial para que o primeiro teste diga se
+// 6 KB é folga ou aperto.
+static constexpr uint32_t NET_TASK_STACK = 6144;
+
+// Alocador do ArduinoJson na PSRAM. O documento do radar copia cada string da
+// resposta para o próprio pool (a versão 7 não tem mais modo zero-copy); com
+// 64 aeronaves isso chega a dezenas de KB, que na SRAM competiriam com as
+// pilhas e com o framebuffer do DVI. O free()/realloc() do arduino-pico
+// reconhecem ponteiro de PSRAM e devolvem ao heap certo.
+struct PsramJsonAllocator : ArduinoJson::Allocator {
+  void *allocate(size_t size) override { return ps_malloc(size); }
+  void deallocate(void *ptr) override { free(ptr); }
+  void *reallocate(void *ptr, size_t size) override {
+    // realloc(nullptr, n) cairia no malloc da SRAM; o primeiro bloco precisa
+    // nascer na PSRAM para que os seguintes o acompanhem.
+    return ptr ? realloc(ptr, size) : ps_malloc(size);
+  }
+};
+static PsramJsonAllocator psramJsonAllocator;
+
 void radarNetworkTask(void *argument) {
   auto *request = static_cast<RadarRequest *>(argument);
   auto *result = new RadarResponse;
+  // O operator= do JsonDocument troca (swap) com o temporário, allocator
+  // inclusive: daqui em diante o pool deste documento mora na PSRAM.
+  result->data = JsonDocument(&psramJsonAllocator);
   const uint32_t started = millis();
-  {
-    WiFiClientSecure client;
-    client.setHandshakeTimeout(12);
-    if (request->config.allowInsecureTls)
-      client.setInsecure();
+  const SecretsConfig &c = request->config;
+  // Cabeçalho de autenticação montado aqui, com "\r\n" no fim, no formato que
+  // o net::httpGet() espera. O portal já recusa CR/LF nos campos.
+  String headers;
+  if (c.authMode == "bearer")
+    headers = "Authorization: Bearer " + c.token + "\r\n";
+  else if (c.authMode == "x-api-key")
+    headers = "X-API-Key: " + c.token + "\r\n";
+  else if (c.authMode == "custom-header" && c.authHeader.length())
+    headers = c.authHeader + ": " + c.authPrefix + c.token + "\r\n";
+  const String url = c.baseUrl + c.endpoint;
+
+  // Buffer do corpo na PSRAM, nunca na pilha: 64 KiB não cabem em pilha
+  // nenhuma deste aparelho.
+  char *body = (char *)ps_malloc(RADAR_BODY_CAP);
+  if (!body) {
+    result->status = "SEM MEMORIA PARA API";
+  } else {
+    // 12 s de teto: o handshake TLS agora é feito pelo ESP32-C6 e é mais lento
+    // que no ESP32 nativo; a bancada do Core2 já mediu 9,5 s ponta a ponta.
+    const net::HttpResult r =
+        net::httpGet(url.c_str(), body, RADAR_BODY_CAP, 12000, headers.length() ? headers.c_str() : nullptr);
+    result->httpCode = r.status;
+    if (r.status == 200) {
+      if (r.truncated)
+        result->status = "RESPOSTA MUITO GRANDE";
+      else {
+        auto error = deserializeJson(result->data, body, r.length, DeserializationOption::NestingLimit(12));
+        result->parsed = !error;
+        result->status = error ? "RESPOSTA INVALIDA" : "CONECTADA";
+      }
+    } else if (r.status == 401 || r.status == 403)
+      result->status = "ERRO AUTENTICACAO";
     else
-      client.setCACert(request->ca.c_str());
-    HTTPClient http;
-    http.useHTTP10(true);
-    http.setConnectTimeout(5000);
-    http.setTimeout(5000);
-    if (!http.begin(client, request->config.baseUrl + request->config.endpoint))
       result->status = "SEM SERVIDOR";
-    else {
-      const SecretsConfig &c = request->config;
-      if (c.authMode == "bearer")
-        http.addHeader("Authorization", "Bearer " + c.token);
-      else if (c.authMode == "x-api-key")
-        http.addHeader("X-API-Key", c.token);
-      else if (c.authMode == "custom-header")
-        http.addHeader(c.authHeader, c.authPrefix + c.token);
-      result->httpCode = http.GET();
-      if (result->httpCode == HTTP_CODE_OK) {
-        if (http.getSize() > 65536)
-          result->status = "RESPOSTA MUITO GRANDE";
-        else {
-          auto error =
-              deserializeJson(result->data, http.getStream(), DeserializationOption::NestingLimit(12));
-          result->parsed = !error;
-          result->status = error ? "RESPOSTA INVALIDA" : "CONECTADA";
-        }
-      } else if (result->httpCode == 401 || result->httpCode == 403)
-        result->status = "ERRO AUTENTICACAO";
-      else
-        result->status = "SEM SERVIDOR";
-    }
-    http.end();
+    free(body);
   }
   result->elapsedMs = millis() - started;
   delete request;
+  Serial.printf("[RADAR] pilha livre minima: %u B de %u\n",
+                (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)),
+                (unsigned)NET_TASK_STACK);
   radarResponse.store(result);
   vTaskDelete(nullptr);
 }
@@ -1640,6 +1693,9 @@ void pollAircraft() {
     }
     delete result;
   }
+  // Backoff: lastApiPoll avança em TODA tentativa (aqui e na chegada da
+  // resposta), com sucesso ou não. Um portão que só andasse no sucesso viraria
+  // laço apertado criando tarefas quando a rede cai (AGENTS.md, armadilha 4).
   if (state != AIRCRAFT_RADAR || radarBusy || playing ||
       millis() - lastApiPoll < uint32_t(settings.refreshSeconds) * 1000)
     return;
@@ -1652,33 +1708,20 @@ void pollAircraft() {
     apiStatus = "SEM WI-FI";
     return;
   }
-  if (!secrets.insecure && time(nullptr) < 1704067200) {
-    apiStatus = "SINCRONIZANDO HORA";
-    return;
-  }
+  // Sem ca.pem e sem portão de hora: o TLS roda no ESP32-C6, que valida o
+  // certificado com o bundle de raízes do próprio firmware NINA e tem relógio
+  // próprio. O ca.pem do cartão e o allow_insecure_tls deixaram de ter efeito
+  // (continuam no JSON por compatibilidade). A API precisa, portanto, de um
+  // certificado emitido por uma CA pública que o NINA conheça.
   auto *request = new RadarRequest;
   request->config = currentSecrets();
-  if (!secrets.insecure) {
-    if (sdMutex)
-      xSemaphoreTake(sdMutex, portMAX_DELAY);
-    File ca = SD.open(CA_FILE, FILE_READ);
-    if (ca) {
-      request->ca = ca.readString();
-      ca.close();
-    }
-    if (sdMutex)
-      xSemaphoreGive(sdMutex);
-    if (!request->ca.length()) {
-      delete request;
-      apiStatus = "CERTIFICADO AUSENTE";
-      return;
-    }
-  }
   radarBusy = true;
   apiStatus = "CONSULTANDO";
-  // Keep TLS off core 0, where Wi-Fi and audio run. Idle priority lets the scheduler service the watchdog
-  // during expensive certificate verification; loop() applies the response.
-  if (xTaskCreatePinnedToCore(radarNetworkTask, "RADAR_HTTPS", 8192, request, 0, nullptr, 1) != pdPASS) {
+  // Fora do núcleo 0, onde ficam a interrupção de linha do DVI e a tarefa de
+  // áudio. Prioridade ociosa: a espera pelo ESP32-C6 é longa e não deve roubar
+  // tempo de ninguém; o loop() aplica a resposta.
+  if (xTaskCreatePinnedToCore(radarNetworkTask, "RADAR_HTTPS", NET_TASK_STACK, request, 0, nullptr, 1) !=
+      pdPASS) {
     radarBusy = false;
     delete request;
     apiStatus = "SEM MEMORIA PARA API";
@@ -2817,91 +2860,91 @@ static void drawAirplane(GfxTarget *d, int px, int py, double headingDeg, uint16
 }
 
 void drawRadar() {
-  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    d->fillScreen(TFT_NAVY);
+  // Só a TV: o Fruit Jam não tem tela local (PORTING.md 3.2).
+  GfxTarget *d = &tv;
+  d->fillScreen(TFT_NAVY);
 
-    // Título (canto superior esquerdo).
-    d->setTextDatum(top_left);
-    d->setTextSize(1);
+  // Título (canto superior esquerdo).
+  d->setTextDatum(top_left);
+  d->setTextSize(1);
+  d->setTextColor(TFT_WHITE, TFT_NAVY);
+  d->drawString(PTBR::APP, SAFE_L, SAFE_T);
+  d->drawString(PTBR::TRAFEGO, SAFE_L, SAFE_T + 15);
+
+  // Scope: anel externo (alcance total), anel interno (metade) e mira.
+  // Centro/raio escolhidos para que os rótulos N/S/L/O e a legenda de
+  // alcance caibam inteiros na área segura, sem encostar no painel lateral.
+  const int cx = 96, cy = 118, R = 58;
+  d->drawCircle(cx, cy, R, RCA_ACCENT);
+  d->drawCircle(cx, cy, R / 2, TFT_DARKCYAN);
+  d->drawFastHLine(cx - R, cy, 2 * R, TFT_DARKCYAN);
+  d->drawFastVLine(cx, cy - R, 2 * R, TFT_DARKCYAN);
+
+  // Pontos cardeais (fora do anel) + alcance na base do scope.
+  d->setTextDatum(middle_center);
+  d->setTextColor(RCA_ACCENT, TFT_NAVY);
+  d->drawString("N", cx, cy - R - 8);
+  d->drawString("S", cx, cy + R + 8);
+  d->drawString("W", cx - R - 8, cy);
+  d->drawString("E", cx + R + 8, cy);
+  d->setTextDatum(top_left);
+  d->drawString(String(settings.rangeKm) + " km", cx - R, cy + R + 4);
+
+  // Aeronaves (norte = cima, leste = direita). A selecionada ganha uma
+  // linha-guia a partir do centro, além do triângulo destacado.
+  d->setTextDatum(top_left);
+  for (int i = 0; i < aircraftCount; i++) {
+    double y = (aircraft[i].latitude - settings.lat) * 111.0;
+    double x = (aircraft[i].longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
+    if (x * x + y * y > double(settings.rangeKm) * settings.rangeKm)
+      continue;
+    int px = cx + (int)(x / settings.rangeKm * R), py = cy - (int)(y / settings.rangeKm * R);
+    if (sq(px - cx) + sq(py - cy) >= sq(R))
+      continue;
+    const bool sel = (i == radarSelection);
+    if (sel)
+      d->drawLine(cx, cy, px, py, RCA_ACCENT);
+    drawAirplane(d, px, py, aircraft[i].heading_deg, sel ? RCA_ACCENT : TFT_YELLOW);
+  }
+
+  // Painel lateral de dados (à direita do scope), sempre acima da barra de
+  // controle (y < 184).
+  const int PX = SAFE_L + 144; // 168
+  d->setTextDatum(top_left);
+  if (radarSelection >= 0 && radarSelection < aircraftCount) {
+    const Aircraft &p = aircraft[radarSelection];
     d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(PTBR::APP, SAFE_L, SAFE_T);
-    d->drawString(PTBR::TRAFEGO, SAFE_L, SAFE_T + 15);
-
-    // Scope: anel externo (alcance total), anel interno (metade) e mira.
-    // Centro/raio escolhidos para que os rótulos N/S/L/O e a legenda de
-    // alcance caibam inteiros na área segura, sem encostar no painel lateral.
-    const int cx = 96, cy = 118, R = 58;
-    d->drawCircle(cx, cy, R, RCA_ACCENT);
-    d->drawCircle(cx, cy, R / 2, TFT_DARKCYAN);
-    d->drawFastHLine(cx - R, cy, 2 * R, TFT_DARKCYAN);
-    d->drawFastVLine(cx, cy - R, 2 * R, TFT_DARKCYAN);
-
-    // Pontos cardeais (fora do anel) + alcance na base do scope.
+    d->drawString(p.callsign.length() ? p.callsign : p.icao, PX, SAFE_T + 18);
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
+    d->drawString("ALT FL" + String((int)(p.altitude_ft / 100)), PX, SAFE_T + 40);
+    d->drawString("VEL " + String((int)p.speed_kt) + " KT", PX, SAFE_T + 58);
+    double y = (p.latitude - settings.lat) * 111.0;
+    double x = (p.longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
+    int distKm = (int)sqrt(x * x + y * y);
+    int proa = (int)(atan2(x, y) * RAD_TO_DEG);
+    if (proa < 0)
+      proa += 360;
+    d->drawString("DIST " + String(distKm) + " km  PROA " + String(proa), PX, SAFE_T + 76);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    if (radarDetails) {
+      d->drawString(p.icao, PX, SAFE_T + 104);
+      d->drawString(p.aircraft_type, PX, SAFE_T + 120);
+    }
+  } else {
+    d->setTextColor(RCA_ACCENT, TFT_NAVY);
+    d->drawString(PTBR::AERONAVES_RASTREADAS, PX, SAFE_T + 32);
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
+    d->drawString(String(aircraftCount), PX, SAFE_T + 54);
+  }
+  d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
+  d->drawString(String(settings.rangeKm) + " km de alcance", PX, SAFE_T + 142);
+  d->setTextColor(RCA_ACCENT, TFT_NAVY);
+  d->drawString(apiStatus.substring(0, 20), PX, SAFE_T + 158);
+  if (!aircraftCount) {
+    d->setTextColor(TFT_WHITE, TFT_NAVY);
     d->setTextDatum(middle_center);
-    d->setTextColor(RCA_ACCENT, TFT_NAVY);
-    d->drawString("N", cx, cy - R - 8);
-    d->drawString("S", cx, cy + R + 8);
-    d->drawString("W", cx - R - 8, cy);
-    d->drawString("E", cx + R + 8, cy);
+    d->drawString(PTBR::NENHUMA_AERONAVE, cx, cy);
     d->setTextDatum(top_left);
-    d->drawString(String(settings.rangeKm) + " km", cx - R, cy + R + 4);
-
-    // Aeronaves (norte = cima, leste = direita). A selecionada ganha uma
-    // linha-guia a partir do centro, além do triângulo destacado.
-    d->setTextDatum(top_left);
-    for (int i = 0; i < aircraftCount; i++) {
-      double y = (aircraft[i].latitude - settings.lat) * 111.0;
-      double x = (aircraft[i].longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
-      if (x * x + y * y > double(settings.rangeKm) * settings.rangeKm)
-        continue;
-      int px = cx + (int)(x / settings.rangeKm * R), py = cy - (int)(y / settings.rangeKm * R);
-      if (sq(px - cx) + sq(py - cy) >= sq(R))
-        continue;
-      const bool sel = (i == radarSelection);
-      if (sel)
-        d->drawLine(cx, cy, px, py, RCA_ACCENT);
-      drawAirplane(d, px, py, aircraft[i].heading_deg, sel ? RCA_ACCENT : TFT_YELLOW);
-    }
-
-    // Painel lateral de dados (à direita do scope), sempre acima da barra de
-    // controle (y < 184).
-    const int PX = SAFE_L + 144; // 168
-    d->setTextDatum(top_left);
-    if (radarSelection >= 0 && radarSelection < aircraftCount) {
-      const Aircraft &p = aircraft[radarSelection];
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(p.callsign.length() ? p.callsign : p.icao, PX, SAFE_T + 18);
-      d->setTextColor(RCA_ACCENT, TFT_NAVY);
-      d->drawString("ALT FL" + String((int)(p.altitude_ft / 100)), PX, SAFE_T + 40);
-      d->drawString("VEL " + String((int)p.speed_kt) + " KT", PX, SAFE_T + 58);
-      double y = (p.latitude - settings.lat) * 111.0;
-      double x = (p.longitude - settings.lon) * 111.0 * cos(settings.lat * DEG_TO_RAD);
-      int distKm = (int)sqrt(x * x + y * y);
-      int proa = (int)(atan2(x, y) * RAD_TO_DEG);
-      if (proa < 0)
-        proa += 360;
-      d->drawString("DIST " + String(distKm) + " km  PROA " + String(proa), PX, SAFE_T + 76);
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      if (radarDetails) {
-        d->drawString(p.icao, PX, SAFE_T + 104);
-        d->drawString(p.aircraft_type, PX, SAFE_T + 120);
-      }
-    } else {
-      d->setTextColor(RCA_ACCENT, TFT_NAVY);
-      d->drawString(PTBR::AERONAVES_RASTREADAS, PX, SAFE_T + 32);
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(String(aircraftCount), PX, SAFE_T + 54);
-    }
-    d->setTextColor(TFT_DARKCYAN, TFT_NAVY);
-    d->drawString(String(settings.rangeKm) + " km de alcance", PX, SAFE_T + 142);
-    d->setTextColor(RCA_ACCENT, TFT_NAVY);
-    d->drawString(apiStatus.substring(0, 20), PX, SAFE_T + 158);
-    if (!aircraftCount) {
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->setTextDatum(middle_center);
-      d->drawString(PTBR::NENHUMA_AERONAVE, cx, cy);
-      d->setTextDatum(top_left);
-    }
   }
   drawControllerLabels("ANTERIOR", "DETALHES", "PROXIMO");
 }
@@ -2932,11 +2975,10 @@ static const char *weekdayPt(int wd) {
 // 24 KB, então o JSON chegava truncado e toda consulta caía em "ERRO NA
 // CONSULTA". A resposta do Open-Meteo abaixo tem ~800 bytes.
 // HTTP simples, nao HTTPS, de proposito: e previsao publica, sem credencial e
-// sem nada a proteger, e o mbedTLS custa dezenas de KB de heap que este
-// aparelho nao tem. Medido: com TLS o GET devolvia -1 (conexao) porque o maior
-// bloco contiguo de 8 bits chegava a 148 B durante a consulta. O radio ja usa
-// WiFiClient puro pela mesma razao; a previsao estava fora de linha com isso.
-// A resposta e byte a byte a mesma: 816 bytes.
+// sem nada a proteger. No Core2 o motivo era o heap do mbedTLS; no Fruit Jam o
+// TLS roda no ESP32-C6 e nao custa SRAM ao RP2350, mas ainda custa um handshake
+// lento no coprocessador e ocupa o SPI1 (net::Lock) por mais tempo, disputando
+// com o radio. A resposta e byte a byte a mesma: 816 bytes.
 static const char *WEATHER_URL =
     "http://api.open-meteo.com/v1/forecast?latitude=-20.5386&longitude=-47.4008"
     "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,"
@@ -3016,67 +3058,37 @@ static bool weatherParse(JsonDocument &doc, WeatherData &out) {
 }
 
 static bool weatherFetch(WeatherData &out) {
-  WiFiClient client; // sem TLS: ver a nota no WEATHER_URL
-  HTTPClient http;
-  http.useHTTP10(true);
-  http.setConnectTimeout(5000);
-  http.setTimeout(5000);
+  // A resposta tem ~800 bytes; 4 KB de teto dão folga para o Open-Meteo
+  // crescer sem aceitar lixo. O buffer fica na PSRAM, não na pilha: esta
+  // função roda na tarefa WEATHER_HTTP, e um array de KB numa pilha de tarefa
+  // de rede já estourou este firmware duas vezes (AGENTS.md 2.3).
+  constexpr size_t cap = 4096;
+  char *buf = (char *)ps_malloc(cap);
+  if (!buf) {
+    Serial.println("[M5RETRO] Tempo: sem memoria para a resposta");
+    return false;
+  }
   bool ok = false;
-  if (http.begin(client, WEATHER_URL)) {
-    const int code = http.GET();
-    if (code == HTTP_CODE_OK) {
-      // A resposta tem ~800 bytes, então lê tudo para um buffer contíguo (o
-      // leitor Stream do ArduinoJson 7.4.2 descarta escalares no ESP32) e
-      // rejeita corpo truncado em vez de publicar dados pela metade.
-      // O buffer fica na PSRAM, não na pilha: esta função roda na tarefa
-      // WEATHER_HTTP, que tem 8 KB de pilha e ainda precisa acomodar os quadros
-      // do HTTPClient e do mbedTLS. 4 KB de array local comiam metade dela.
-      constexpr int cap = 4096;
-      char *buf = (char *)ps_malloc(cap);
-      if (!buf) {
-        Serial.println("[M5RETRO] Tempo: sem memoria para a resposta");
-        http.end();
-        return false;
-      }
-      size_t len = 0;
-      uint32_t quiet = 0;
-      Stream &st = http.getStream();
-      while (len < cap - 1 && quiet < 3000) {
-        int avail = st.available();
-        if (avail > 0) {
-          int n = st.readBytes(buf + len, min(avail, cap - 1 - (int)len));
-          if (n <= 0)
-            break;
-          len += n;
-          quiet = 0;
-        } else if (!http.connected()) {
-          break;
-        } else {
-          delay(5);
-          quiet += 5;
-        }
-      }
-      buf[len] = 0;
-      if (len >= cap - 1) {
-        Serial.println("[M5RETRO] Tempo: resposta maior que o buffer");
-      } else if (len) {
-        JsonDocument doc;
-        auto err = deserializeJson(doc, buf, DeserializationOption::NestingLimit(8));
-        if (!err)
-          ok = weatherParse(doc, out);
-        else
-          Serial.printf("[M5RETRO] Tempo: parse %s (%u bytes)\n", err.c_str(), (unsigned)len);
-      } else {
-        Serial.println("[M5RETRO] Tempo: corpo vazio");
-      }
-      free(buf);
+  // O net::httpGet lê o corpo inteiro (Content-Length ou chunked) e avisa se
+  // cortou: corpo truncado é rejeitado em vez de publicar dados pela metade.
+  const net::HttpResult r = net::httpGet(WEATHER_URL, buf, cap, 10000);
+  if (r.status == 200) {
+    if (r.truncated) {
+      Serial.println("[M5RETRO] Tempo: resposta maior que o buffer");
+    } else if (r.length) {
+      JsonDocument doc(&psramJsonAllocator);
+      auto err = deserializeJson(doc, buf, r.length, DeserializationOption::NestingLimit(8));
+      if (!err)
+        ok = weatherParse(doc, out);
+      else
+        Serial.printf("[M5RETRO] Tempo: parse %s (%u bytes)\n", err.c_str(), (unsigned)r.length);
     } else {
-      Serial.printf("[M5RETRO] Tempo: HTTP %d\n", code);
+      Serial.println("[M5RETRO] Tempo: corpo vazio");
     }
   } else {
-    Serial.println("[M5RETRO] Tempo: begin falhou");
+    Serial.printf("[M5RETRO] Tempo: HTTP %d\n", r.status);
   }
-  http.end();
+  free(buf);
   return ok;
 }
 
@@ -3101,6 +3113,10 @@ void weatherNetworkTask(void *arg) {
     if (!weatherReady.load())
       weatherVersion.fetch_add(1);
   }
+  // Ver NET_TASK_STACK: a pilha caiu de 8 para 6 KB sem medição no aparelho.
+  Serial.printf("[WEATHER] pilha livre minima: %u B de %u\n",
+                (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)),
+                (unsigned)NET_TASK_STACK);
   weatherBusy.store(false);
   vTaskDelete(nullptr);
 }
@@ -3117,7 +3133,7 @@ void pollWeather() {
   // O backoff vale para toda tentativa, não só antes da primeira que der certo.
   // Antes, com dados já em mãos, o único portão era lastWeatherGood: se a
   // consulta falhasse ele não avançava, a condição seguia falsa e cada loop()
-  // criava outra tarefa HTTP de 8 KB — dezenas por segundo com o roteador fora.
+  // criava outra tarefa HTTP — dezenas por segundo com o roteador fora.
   if (lastWeatherAttempt && now - lastWeatherAttempt < WEATHER_RETRY_MS)
     return;
   if (weatherReady.load() && now - lastWeatherGood < WEATHER_REFRESH_MS)
@@ -3125,8 +3141,9 @@ void pollWeather() {
   lastWeatherAttempt = now;
   weatherBusy.store(true);
   int next = 1 - weatherActive.load();
-  if (xTaskCreatePinnedToCore(weatherNetworkTask, "WEATHER_HTTP", 8192, (void *)(intptr_t)next, 0,
-                              nullptr, 1) != pdPASS) {
+  // Mesmo núcleo e prioridade da tarefa do radar; ver NET_TASK_STACK.
+  if (xTaskCreatePinnedToCore(weatherNetworkTask, "WEATHER_HTTP", NET_TASK_STACK, (void *)(intptr_t)next,
+                              0, nullptr, 1) != pdPASS) {
     weatherBusy.store(false);
     weatherStatus.store("SEM MEMORIA");
     Serial.printf("[WEATHER] criacao da tarefa falhou: livre=%u interno=%u maior_interno=%u\n",
@@ -3154,7 +3171,7 @@ static uint16_t weatherBackground() { return WX_BOTTOM; }
 
 // Pinta o gradiente por linhas. Em RGB565 as 32 faixas de azul e 64 de verde
 // dão passos imperceptíveis a 240 linhas; em RGB332 isso bandearia, mas o
-// painel composto roda em 16 bits.
+// canvas do DVI é sempre RGB565.
 static inline uint16_t weatherGradientRow(int y) {
   const int r0 = (WX_TOP >> 11) & 0x1F, g0 = (WX_TOP >> 5) & 0x3F, b0 = WX_TOP & 0x1F;
   const int r1 = (WX_BOTTOM >> 11) & 0x1F, g1 = (WX_BOTTOM >> 5) & 0x3F, b1 = WX_BOTTOM & 0x1F;
@@ -3433,18 +3450,7 @@ void startWeather() {
   weatherFx.skip();
   weatherTickerBuild();
   drawWeatherFrame();
-
-  // No LCD do Core2, apenas uma placa simples (a experiência é na TV).
-  M5.Display.fillScreen(TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.setTextSize(2);
-  M5.Display.drawString(PTBR::WEATHER, 12, 8);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(RCA_ACCENT, TFT_NAVY);
-  M5.Display.drawString("EXIBINDO NA TV", 12, 64);
-  M5.Display.drawString("VOLTAR: BOTAO CENTRAL", 12, 88);
-  drawBackButton();
+  // A placa "EXIBINDO NA TV" do LCD do Core2 saiu: o Fruit Jam só tem a TV.
 }
 
 void stopWeather() {
@@ -3462,43 +3468,86 @@ void stopWeather() {
   state = HOME;
 }
 
+// Itens de CONFIGURAÇÕES, na ordem da tela. Nome em vez de índice literal: o
+// CORES saiu do meio da lista no port (PORTING.md 3.5), e com os números
+// espalhados por drawSettings() e handleNavigation() bastaria esquecer um para
+// o botão editar um item e a tela mostrar outro.
+enum SettingsItem : int {
+  SET_VIDEO,
+  SET_VOLUME,
+  SET_RADAR_RANGE,
+  SET_RADAR_REFRESH,
+  SET_AUDIO_OUT,
+  SET_VHS_OSD,
+  SET_WIFI,
+  SET_API,
+  SET_SD_CARD,
+  SET_SETUP_PORTAL,
+  SET_CHANNEL_MODE,
+  SET_SLEEP_TIMER,
+  SET_VHS_WEAR,
+  SET_COUNT
+};
+
 void drawSettings() {
-  const char *names[] = {"VIDEO", "VOLUME", "ALCANCE RADAR", "ATUALIZACAO", PTBR::SAIDA_AUDIO,
-                         PTBR::OSD_ESTILO_VHS, "WI-FI", "API", "CARTAO SD", "CONFIGURAR REDE",
-                         "CORES", "MODO CANAL", "DESLIGAR EM", "FITA VHS"};
-  String audio = settings.audioOutput == AudioOutput::RCA        ? PTBR::RCA
-                 : settings.audioOutput == AudioOutput::INTERNAL ? PTBR::ALTO_FALANTE_INTERNO
-                                                                 : PTBR::MUDO;
-  String value = settingsSelection == 0   ? "NTSC"
-                 : settingsSelection == 1 ? String(settings.volume) + "%"
-                 : settingsSelection == 2 ? String(settings.rangeKm) + " km"
-                 : settingsSelection == 3 ? String(settings.refreshSeconds) + " s"
-                 : settingsSelection == 4 ? audio
-                 : settingsSelection == 5 ? (settings.vhsOsd ? PTBR::ATIVADO : PTBR::DESATIVADO)
-                 : settingsSelection == 6
-                     ? (WiFi.status() == WL_CONNECTED ? PTBR::CONECTADO : PTBR::DESCONECTADO)
-                 : settingsSelection == 7  ? apiStatus
-                 : settingsSelection == 8  ? PTBR::DISPONIVEL
-                 : settingsSelection == 9  ? String("ABRIR")
-                 : settingsSelection == 10
-                     ? (settings.color16 ? String("MILHARES") : String("256 CORES"))
-                 : settingsSelection == 11 ? String(tvChannel.modeLabel())
-                 : settingsSelection == 12
-                     ? (sleepTimer.active() ? String(sleepTimer.minutes()) + " MIN"
-                                            : String("DESLIGADO"))
-                                           : String(vhs::wearLabel(settings.vhsWear));
-  M5.Display.fillScreen(TFT_NAVY);
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.drawString(PTBR::CONFIGURACOES, 12, 8);
-  M5.Display.drawFastHLine(8, 36, 304, RCA_ACCENT);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextColor(RCA_ACCENT, TFT_NAVY);
-  M5.Display.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], 20, 68);
-  M5.Display.setTextSize(3);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.drawString(value, 34, 110);
+  // Mesma ordem de SettingsItem.
+  const char *names[SET_COUNT] = {
+      "VIDEO",    "VOLUME", "ALCANCE RADAR", "ATUALIZACAO",     PTBR::SAIDA_AUDIO, PTBR::OSD_ESTILO_VHS,
+      "WI-FI",    "API",    "CARTAO SD",     "CONFIGURAR REDE", "MODO CANAL",      "DESLIGAR EM",
+      "FITA VHS",
+  };
+  // Rótulos da saída de som no Fruit Jam. Os valores do enum e do JSON ("rca",
+  // "interno") ficam por compatibilidade com o settings.json antigo; o que muda
+  // é o destino: RCA = fone P2 (que vai à TV), INTERNAL = alto-falante da placa.
+  const char *audio = settings.audioOutput == AudioOutput::RCA        ? "TV (P2)"
+                      : settings.audioOutput == AudioOutput::INTERNAL ? "ALTO-FALANTE"
+                                                                      : "MUDO";
+  String value;
+  switch (settingsSelection) {
+  case SET_VIDEO:
+    value = "DVI 640X480";
+    break;
+  case SET_VOLUME:
+    value = String(settings.volume) + "%";
+    break;
+  case SET_RADAR_RANGE:
+    value = String(settings.rangeKm) + " km";
+    break;
+  case SET_RADAR_REFRESH:
+    value = String(settings.refreshSeconds) + " s";
+    break;
+  case SET_AUDIO_OUT:
+    value = audio;
+    break;
+  case SET_VHS_OSD:
+    value = settings.vhsOsd ? PTBR::ATIVADO : PTBR::DESATIVADO;
+    break;
+  // network.connected() e não WiFi.status(): o estado já está em cache no
+  // NetworkManager, e cada WiFi.* é uma transação no SPI1 do ESP32-C6.
+  case SET_WIFI:
+    value = network.connected() ? PTBR::CONECTADO : PTBR::DESCONECTADO;
+    break;
+  case SET_API:
+    value = apiStatus;
+    break;
+  // A chave mecânica do soquete diz a verdade; antes o item dizia sempre
+  // DISPONIVEL.
+  case SET_SD_CARD:
+    value = board::cardInserted() ? PTBR::DISPONIVEL : PTBR::INDISPONIVEL;
+    break;
+  case SET_SETUP_PORTAL:
+    value = "ABRIR";
+    break;
+  case SET_CHANNEL_MODE:
+    value = tvChannel.modeLabel();
+    break;
+  case SET_SLEEP_TIMER:
+    value = sleepTimer.active() ? String(sleepTimer.minutes()) + " MIN" : String("DESLIGADO");
+    break;
+  default:
+    value = vhs::wearLabel(settings.vhsWear);
+    break;
+  }
   tv.fillScreen(TFT_NAVY);
   tv.setTextDatum(top_left);
   tv.setTextSize(2);
@@ -3507,7 +3556,8 @@ void drawSettings() {
   tv.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
   tv.setTextSize(1);
   tv.setTextColor(RCA_ACCENT, TFT_NAVY);
-  tv.drawString(String(settingsEditing ? "> " : "  ") + names[settingsSelection], SAFE_L, BODY_Y + 26);
+  const int sel = (settingsSelection >= 0 && settingsSelection < SET_COUNT) ? settingsSelection : 0;
+  tv.drawString(String(settingsEditing ? "> " : "  ") + names[sel], SAFE_L, BODY_Y + 26);
   tv.setTextColor(TFT_WHITE, TFT_NAVY);
   tv.drawString(value, SAFE_L + 10, BODY_Y + 58);
   drawControllerLabels(settingsEditing ? "-" : "ACIMA", settingsEditing ? "SALVAR" : "OK",
@@ -3737,51 +3787,81 @@ void stopRadio() {
 }
 
 void drawInfo() {
-  // Página 0: hardware; página 1: rede. Desenha tudo com datum top_left e
-  // linhas separadas, truncadas, para nunca vazar do LCD (320x240, fonte ASCII).
-  for (auto *d : {static_cast<GfxTarget *>(&tv), static_cast<GfxTarget *>(&M5.Display)}) {
-    d->fillScreen(TFT_NAVY);
-    d->setTextDatum(top_left);
-    d->setTextSize(2);
-    d->setTextColor(TFT_WHITE, TFT_NAVY);
-    d->drawString(PTBR::INFO_SISTEMA, SAFE_L, HEAD_Y);
-    d->drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
-    d->setTextSize(1);
-    const int y0 = BODY_Y;
-    d->setTextColor(RCA_ACCENT, TFT_NAVY);
-    if (!infoPage) {
-      d->drawString("MEMORIA LIVRE", SAFE_L, y0);
-      d->drawString("PSRAM LIVRE", SAFE_L, y0 + 26);
-      d->drawString("VERSAO", SAFE_L, y0 + 52);
-      d->drawString("FONTE DA HORA", SAFE_L, y0 + 78);
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(String(ESP.getFreeHeap()) + " bytes", SAFE_L + 116, y0);
-      d->drawString(String(ESP.getFreePsram()) + " bytes", SAFE_L + 116, y0 + 26);
-      d->drawString("core2", SAFE_L + 116, y0 + 52);
-      // RTC / NTP / SEM HORA. Sem isto nao ha como saber, olhando o aparelho,
-      // se o relogio sobreviveu a falta de Wi-Fi ou se esta chutando.
-      String fonte = rtcclock::sourceLabel();
-      if (rtcclock::batteryLow())
-        fonte += " (BAT)";
-      d->drawString(fonte, SAFE_L + 116, y0 + 78);
-    } else {
-      d->drawString(PTBR::STATUS_REDE, SAFE_L, y0);
-      d->drawString(PTBR::SINAL, SAFE_L, y0 + 26);
-      const String st = (WiFi.status() == WL_CONNECTED) ? PTBR::CONECTADO : PTBR::DESCONECTADO;
-      d->setTextColor(TFT_WHITE, TFT_NAVY);
-      d->drawString(st, SAFE_L + 144, y0);
-      if (WiFi.status() == WL_CONNECTED) {
-        d->drawString(String(WiFi.RSSI()) + " dBm", SAFE_L + 144, y0 + 26);
-        d->setTextColor(RCA_ACCENT, TFT_NAVY);
-        d->drawString(PTBR::ENDERECO_IP, SAFE_L, y0 + 52);
-        d->setTextColor(TFT_WHITE, TFT_NAVY);
-        d->drawString(WiFi.localIP().toString(), SAFE_L + 144, y0 + 52);
-      } else {
-        d->drawString("-", SAFE_L + 144, y0 + 26);
+  // Página 0: hardware; página 1: rede. Datum top_left e uma linha por item,
+  // com o valor cortado em 26 caracteres: da coluna de valores (x = 140) até a
+  // borda direita da área segura (296) cabem 26 glifos de 6 px.
+  constexpr int VAL_X = SAFE_L + 116, STEP = 22, VAL_MAX = 26;
+  tv.fillScreen(TFT_NAVY);
+  tv.setTextDatum(top_left);
+  tv.setTextSize(2);
+  tv.setTextColor(TFT_WHITE, TFT_NAVY);
+  tv.drawString(PTBR::INFO_SISTEMA, SAFE_L, HEAD_Y);
+  tv.drawFastHLine(SAFE_L, HEAD_RULE_Y, SAFE_W, RCA_ACCENT);
+  tv.setTextSize(1);
+  const int y0 = BODY_Y;
+  auto row = [&](int i, const char *label, const String &value) {
+    tv.setTextColor(RCA_ACCENT, TFT_NAVY);
+    tv.drawString(label, SAFE_L, y0 + i * STEP);
+    tv.setTextColor(TFT_WHITE, TFT_NAVY);
+    tv.drawString(value.substring(0, VAL_MAX), VAL_X, y0 + i * STEP);
+  };
+  if (!infoPage) {
+    // Relógio real, não o nominal: o DVHSTX sobe o RP2350 para 264 MHz por
+    // conta própria, apesar do f_cpu de 150 MHz no platformio.ini.
+    row(0, "PROCESSADOR", "RP2350B " + String(ESP.getCpuFreqMHz()) + " MHz");
+    row(1, "SRAM LIVRE", String(ESP.getFreeHeap() / 1024) + " KB");
+    row(2, "PSRAM LIVRE", String(ESP.getFreePsram() / 1024) + " KB");
+    String cartao = "AUSENTE";
+    if (board::cardInserted()) {
+      // size64() pode ir ao cartão: toma o sdMutex por esta operação só, como
+      // todo acesso ao SD que disputa com a tarefa de áudio.
+      if (sdMutex)
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+      const uint64_t bytes = SD.size64();
+      if (sdMutex)
+        xSemaphoreGive(sdMutex);
+      cartao = bytes ? String((uint32_t)(bytes / (1024ULL * 1024ULL))) + " MB" : String("SEM LEITURA");
+    }
+    row(3, "CARTAO SD", cartao);
+    row(4, "VERSAO", "fruitjam");
+    // Sem RTC com bateria no Fruit Jam: ou a hora veio do NTP do ESP32-C6, ou
+    // não há hora — e aí a tela diz "--:--" em vez de inventar 1970.
+    String hora = "--:--";
+    const time_t agora = time(nullptr);
+    if (rtcclock::synced() && rtcclock::isPlausibleEpoch(agora)) {
+      struct tm local;
+      char hhmm[8];
+      localtime_r(&agora, &local);
+      snprintf(hhmm, sizeof(hhmm), "%02d:%02d", local.tm_hour, local.tm_min);
+      hora = hhmm;
+    }
+    row(5, "HORA", hora + "  " + rtcclock::sourceLabel());
+  } else {
+    const bool conectado = network.connected();
+    String ssid, ip = "-", sinal = "-", nina;
+    {
+      // Toda chamada WiFiNINA passa pelo net::Lock (o SPI1 é compartilhado
+      // com as tarefas de rede). Uma tomada só para as quatro leituras.
+      net::Lock lock;
+      nina = net::firmwareVersion();
+      if (conectado) {
+        ssid = WiFi.SSID();
+        ip = WiFi.localIP().toString();
+        sinal = String(WiFi.RSSI()) + " dBm";
       }
     }
+    if (!conectado)
+      ssid = network.ssid(); // a rede configurada, para saber qual falhou
+    // SSID e versão vêm de fora (usuário e firmware do C6): ASCII antes da tela.
+    char buf[40];
+    ascii::normalize(buf, sizeof(buf), ssid.c_str());
+    row(0, PTBR::STATUS_REDE, conectado ? PTBR::CONECTADO : PTBR::DESCONECTADO);
+    row(1, "WI-FI", buf[0] ? String(buf) : String("-"));
+    row(2, PTBR::SINAL, sinal);
+    row(3, PTBR::ENDERECO_IP, ip);
+    ascii::normalize(buf, sizeof(buf), nina.c_str());
+    row(4, "ESP32-C6 NINA", buf[0] ? String(buf) : String("-"));
   }
-  drawBackButton();
   drawControllerLabels(PTBR::ANTERIOR, PTBR::DETALHES, PTBR::PROXIMO);
 }
 
@@ -3945,10 +4025,8 @@ void handleNavigation(NavAction a) {
     return;
   }
   if (state == SETTINGS) {
-    // 11 itens: o ultimo e CORES. Acrescentado no fim de proposito -- os
-    // indices desta tela sao literais espalhados pelo bloco abaixo, entao
-    // inserir no meio deslocaria todos eles.
-    constexpr int SETTINGS_COUNT = 14;
+    // Itens nomeados por SettingsItem (logo acima de drawSettings()). O CORES
+    // saiu no port: o canvas do DVI é sempre RGB565 (PORTING.md 3.5).
     if (a == NavAction::BACK) {
       if (settingsEditing)
         settingsEditing = false;
@@ -3961,11 +4039,13 @@ void handleNavigation(NavAction a) {
       return;
     }
     if (a == NavAction::SELECT) {
-      if (!settingsEditing && settingsSelection == 9) {
+      if (!settingsEditing && settingsSelection == SET_SETUP_PORTAL) {
         startSetupPortal();
         return;
       }
-      if (settingsSelection == 0 || (settingsSelection >= 6 && settingsSelection <= 8))
+      // Itens só de leitura: não entram em edição.
+      if (settingsSelection == SET_VIDEO || settingsSelection == SET_WIFI || settingsSelection == SET_API ||
+          settingsSelection == SET_SD_CARD)
         return;
       settingsEditing = !settingsEditing;
       if (!settingsEditing) {
@@ -3974,55 +4054,40 @@ void handleNavigation(NavAction a) {
           return;
       }
     } else if (!settingsEditing && (a == NavAction::LEFT || a == NavAction::RIGHT))
-      settingsSelection =
-          (settingsSelection + (a == NavAction::LEFT ? SETTINGS_COUNT - 1 : 1)) % SETTINGS_COUNT;
+      settingsSelection = (settingsSelection + (a == NavAction::LEFT ? SET_COUNT - 1 : 1)) % SET_COUNT;
     else if (settingsEditing && (a == NavAction::LEFT || a == NavAction::RIGHT)) {
       int d = a == NavAction::LEFT ? -1 : 1;
-      if (settingsSelection == 1)
+      if (settingsSelection == SET_VOLUME)
         settings.volume = constrain(settings.volume + d * 5, 0, 100);
-      else if (settingsSelection == 2) {
+      else if (settingsSelection == SET_RADAR_RANGE) {
         int v[] = {50, 100, 250, 500}, i = 0;
         while (i < 3 && v[i] != settings.rangeKm)
           i++;
         settings.rangeKm = v[(i + d + 4) % 4];
-      } else if (settingsSelection == 3) {
+      } else if (settingsSelection == SET_RADAR_REFRESH) {
         int v[] = {5, 10, 30}, i = 0;
         while (i < 2 && v[i] != settings.refreshSeconds)
           i++;
         settings.refreshSeconds = v[(i + d + 3) % 3];
-      } else if (settingsSelection == 4) {
+      } else if (settingsSelection == SET_AUDIO_OUT) {
         AudioOutput next = settings.audioOutput == AudioOutput::RCA        ? AudioOutput::INTERNAL
                            : settings.audioOutput == AudioOutput::INTERNAL ? AudioOutput::MUTED
                                                                            : AudioOutput::RCA;
         setAudioOutput(next);
         if (state == ERROR_SCREEN)
           return;
-      } else if (settingsSelection == 5)
+      } else if (settingsSelection == SET_VHS_OSD)
         settings.vhsOsd = !settings.vhsOsd;
-      else if (settingsSelection == 11)
+      else if (settingsSelection == SET_CHANNEL_MODE)
         tvChannel.cycleMode();
-      else if (settingsSelection == 12)
+      else if (settingsSelection == SET_SLEEP_TIMER)
         sleepTimer.cycle(millis());
-      else if (settingsSelection == 13) {
+      else if (settingsSelection == SET_VHS_WEAR) {
         settings.vhsWear = d > 0 ? vhs::nextWear(settings.vhsWear) : vhs::prevWear(settings.vhsWear);
         // Se ja esta tocando, o filtro tem de saber agora: sem isto a mudanca so
         // valeria no proximo programa.
         if (playing)
           vhsFilter.configure(vhs::presetFor(settings.vhsWear));
-      }
-      else if (settingsSelection == 10 && !playing) {
-        // Realoca o framebuffer do CVBS, entao so com o video parado. Chegar
-        // aqui tocando nao deveria acontecer (esta tela nao reproduz), mas a
-        // troca derrubaria o sinal no meio do quadro, entao o ramo e guardado.
-        // A repintura vem do drawSettings() no fim do bloco: o framebuffer novo
-        // nasce em branco.
-        settings.color16 = !settings.color16;
-        if (!applyColorDepth()) {
-          // A PSRAM nao deu conta do RGB565 e a biblioteca caiu sozinha para 8
-          // bits. Guardar o que o aparelho esta realmente usando, nao o que foi
-          // pedido: senao a tela mentiria ate o proximo boot.
-          settings.color16 = false;
-        }
       }
     }
     drawSettings();
