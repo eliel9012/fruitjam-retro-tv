@@ -127,7 +127,8 @@ original, e divide por 4. Consequências:
 
 | Tarefa | Pilha (bytes) | Observação |
 |---|---:|---|
-| `loop()` | do arduino-pico | não é criada pelo firmware |
+| `APP` (`setup()`/`loop()`) | 16384 | a `CORE0` do arduino-pico tem 4 KB fixos; o `setup()` dela só cria a `APP`, no núcleo 0 |
+| `VIDEO_DEC` | 8192 | decode MJPEG no núcleo 1, prioridade 2 (abaixo do áudio) |
 | `WEATHER_HTTP` | 8192 | uma consulta, publica e morre |
 | `RADAR_HTTPS` | 8192 | idem |
 | `RADIO_ICY` | 8192 | leitura do stream do rádio |
@@ -339,13 +340,17 @@ Renomeações do port, para ler diffs contra o upstream: `rca` → **`tv`**,
 
 | Contexto | O que faz |
 |---|---|
-| `loop()` | interface, decodificação JPEG, desenho, diagnóstico serial |
+| `loop()` (tarefa `APP`, núcleo 0) | interface, leitura do quadro no cartão, desenho, diagnóstico serial |
+| `VIDEO_DEC` (núcleo 1, prio 2) | decodifica o quadro MJPEG direto no framebuffer, a pedido do `videoTick()` |
 | `RCA_PCM` | lê PCM do cartão e entrega ao `audioout::write()`, ritmado pelo relógio de amostras |
 | `WEATHER_HTTP` / `RADAR_HTTPS` (prio 0) | uma consulta HTTP(S) via `net::httpGet`, publica e morre |
 | `RADIO_ICY` | lê o stream do rádio, bloco a bloco, com `net::Lock` por bloco |
 | interrupção do DVI | alimenta o HSTX linha a linha, no núcleo do `setup()` |
 
-**Todo desenho acontece no `loop()`.** As tarefas de rede nunca desenham: elas
+**Todo desenho acontece no `loop()`**, com uma exceção: a `VIDEO_DEC` escreve o
+quadro do filme no framebuffer. Enquanto um decode está em voo o `loop()` não
+desenha no `tv` nem usa o `jpeg`; quem precisa desenhar durante o vídeo chama
+`waitVideoDecodeIdle()` antes (ver 3.5). As tarefas de rede nunca desenham: elas
 escrevem num buffer e publicam por `std::atomic`.
 
 ### 3.3 Sincronização
@@ -407,7 +412,8 @@ visita anterior já deixou a tela da previsão em branco permanentemente.
 
 ```
 cartão (SDIO) → MjpegReader.next() → jpegBuffer (PSRAM, 128 KiB)
-              → JPEGDEC.decode()   → jpegDraw() por bloco de MCU, RGB565_BIG_ENDIAN
+              → [núcleo 1, VIDEO_DEC]
+                JPEGDEC.decode()   → jpegDraw() por bloco de MCU, RGB565_BIG_ENDIAN
               → tv (LGFX_Sprite)   = framebuffer do DVI (SRAM)
               → HSTX, linha a linha → GPIO 12..19 → monitor
 ```
@@ -415,6 +421,16 @@ cartão (SDIO) → MjpegReader.next() → jpegBuffer (PSRAM, 128 KiB)
 O relógio é o **PCM entregue**, não `millis()`: `videoTick()` calcula o quadro
 alvo a partir de `samplesPlayed` e pula quadros atrasados **sem decodificar**
 (passando `render = false`).
+
+O `loop()` lê o quadro (sdMutex) e entrega o decode à `VIDEO_DEC` por
+`submitVideoFrame()`; o `videoTick()` seguinte colhe o resultado
+(`collectVideoFrame()`), publica `renderedSeq`/`lastJpegUsed` e **devolve a vez
+antes de submeter o próximo**, para o OSD e a legenda pintarem sobre o quadro
+limpo. Com um framebuffer só, a regra é: **nada desenha no `tv` com um decode em
+voo** — `drawPlaybackOsd`, `redrawCurrentFrame`, `stopProgram`, a vinheta do modo
+canal e o desligamento chamam `waitVideoDecodeIdle()`, que espera e já colhe. O
+primeiro quadro e o descarte (`render = false`) continuam síncronos no `loop()`.
+Estudo de desempenho: `docs/codecs-video-fruitjam.md`.
 
 Por isso há dois contadores diferentes, e confundi-los já causou bug:
 
