@@ -30,7 +30,7 @@ só fala DVI.
 
 | | Core2 + RCA (upstream) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, 264 MHz (o DVHSTX sobe o relógio) |
+| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, 240 MHz (o DVHSTX sobe o relógio; ver 2.2) |
 | SRAM / PSRAM | ~320 KB / 4,5 MB | 520 KB / 8 MB (QSPI) |
 | Vídeo | CVBS NTSC 320×240 | DVI 640×480@60, quadro lógico 320×240 |
 | Tela local | LCD 320×240 + touch | **nenhuma** |
@@ -523,8 +523,11 @@ A plataforma é a comunitária do Max Gerhardt
 (`maxgerhardt/platform-raspberrypi`) com o core do Earle Philhower
 (arduino-pico): a plataforma oficial `raspberrypi` do PlatformIO não tem RP2350.
 `board_build.f_cpu` fica em 150 MHz no `platformio.ini` porque a biblioteca do
-DVHSTX recusa compilar com outro valor e sobe o relógio para 264 MHz sozinha.
-As bibliotecas estão fixadas por commit.
+DVHSTX recusa compilar com outro valor. Ela mesma sobe o relógio de verdade
+depois: o `#error` de compilação dela fala em 264 MHz, mas a conta do
+`clock_configure` no commit fixado dá **240 MHz** (PLL USB 480 MHz / 2) —
+mensagem de erro desatualizada da própria lib, não do nosso código; ver AGENTS
+2.2 abaixo. As bibliotecas estão fixadas por commit.
 
 Sem acesso ao registro do PlatformIO: clone as bibliotecas de `lib_deps` numa
 pasta e crie `platformio_local.ini` (ignorado pelo git):

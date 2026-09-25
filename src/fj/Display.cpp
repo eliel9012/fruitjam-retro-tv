@@ -3,6 +3,7 @@
 #include <Adafruit_dvhstx.h>
 
 #include "hardware/structs/hstx_ctrl.h"
+#include "psram.h" // psram_reinit_timing() -- ver o comentário em display::begin()
 
 LGFX_Sprite tv;
 
@@ -51,6 +52,14 @@ bool begin() {
   if (!dvi.init(W, H, pimoroni::DVHSTX::MODE_RGB565, false, DVHSTX_PINOUT_DEFAULT))
     return false;
   configureSwappedRgb565();
+  // O construtor global do DVHSTX (prioridade mais alta que a nossa) sobe
+  // clk_sys ANTES do nosso código rodar, mas DEPOIS que o runtime do pico-sdk
+  // já cronometrou o QMI da PSRAM para o clock de boot (~150 MHz). Ninguém
+  // reprograma esse timing sozinho: sem isto, a PSRAM roda ~10% acima do teto
+  // do datasheet (109 MHz) a partir do primeiro dvi.init(), e o primeiro a
+  // sentir isso é o jpegBuffer (ps_malloc logo no boot). Chamar de novo aqui,
+  // já com clk_sys no valor final, resolve.
+  psram_reinit_timing();
   tv.setColorDepth(lgfx::rgb565_2Byte);
   tv.setBuffer(dvi.get_back_buffer<uint16_t>(), W, H, lgfx::rgb565_2Byte);
   tv.fillScreen(TFT_BLACK);
