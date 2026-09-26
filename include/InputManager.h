@@ -16,11 +16,13 @@ enum class NavAction : uint8_t {
   SEEK_BACKWARD,
   SEEK_FORWARD
 };
-// WEB: comando vindo do controle remoto pelo navegador. Entra pela mesma fila
-// dos botoes de proposito -- assim nao existe um segundo caminho de navegacao
-// capaz de divergir do fisico. (LCD_BUTTON e BOTTOM_TOUCH eram do touch do
-// Core2; o Fruit Jam nao tem tela local.)
-enum class InputSource : uint8_t { WEB };
+// WEB: comando vindo do controle remoto pelo navegador. USB: teclado ou
+// gamepad nas portas USB host (fj/UsbHost.h), decodificado para NavAction por
+// fj/UsbHidMap.h. Os dois entram pela mesma fila dos botoes de proposito --
+// assim nao existe um segundo caminho de navegacao capaz de divergir do
+// fisico. (LCD_BUTTON e BOTTOM_TOUCH eram do touch do Core2; o Fruit Jam nao
+// tem tela local.)
+enum class InputSource : uint8_t { WEB, USB };
 
 // Junta os tres botoes fisicos do Fruit Jam (board::buttonDown) e os comandos
 // injetados numa fila de uma acao so.

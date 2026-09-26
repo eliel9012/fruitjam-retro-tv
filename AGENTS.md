@@ -30,7 +30,7 @@ só fala DVI.
 
 | | Core2 + RCA (upstream) | Fruit Jam (este fork) |
 |---|---|---|
-| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, 240 MHz (o DVHSTX sobe o relógio; ver 2.2) |
+| CPU | ESP32, 2 núcleos Xtensa, 240 MHz | RP2350B, 2× Cortex-M33, **240 MHz** (o DVHSTX sobe o relógio uma vez, no preinit; o modo de vídeo reprograma só o pll_sys/clk_hstx, domínio separado -- ver fj/UsbHost.h e 2.2) |
 | SRAM / PSRAM | ~320 KB / 4,5 MB | 520 KB / 8 MB (QSPI) |
 | Vídeo | CVBS NTSC 320×240 | DVI 640×480@60, quadro lógico 320×240 |
 | Tela local | LCD 320×240 + touch | **nenhuma** |
@@ -127,7 +127,8 @@ original, e divide por 4. Consequências:
 
 | Tarefa | Pilha (bytes) | Observação |
 |---|---:|---|
-| `loop()` | do arduino-pico | não é criada pelo firmware |
+| `APP` (`setup()`/`loop()`) | 16384 | a `CORE0` do arduino-pico tem 4 KB fixos; o `setup()` dela só cria a `APP`, no núcleo 0 |
+| `VIDEO_DEC` | 8192 | decode MJPEG no núcleo 1, prioridade 2 (abaixo do áudio) |
 | `WEATHER_HTTP` | 8192 | uma consulta, publica e morre |
 | `RADAR_HTTPS` | 8192 | idem |
 | `RADIO_ICY` | 8192 | leitura do stream do rádio |
@@ -307,6 +308,8 @@ include/fj/Board.h      pinos, board::begin, botões, detecção do cartão
 include/fj/Storage.h    SD em SDIO
 include/fj/AudioOut.h   TLV320DAC3100: rota, volume, taxa, write()
 include/fj/Net.h        ESP32-C6/WiFiNINA: net::Lock, httpGet, ntpEpoch
+include/fj/UsbHost.h    teclado/gamepad USB host (Adafruit_TinyUSB + Pico-PIO-USB)
+include/fj/UsbHidMap.h  decodificação HID -> NavAction, funções puras (testadas)
 src/fj/*.cpp            implementações das acima
 
 include/PlaybackIO.h    leitor de MJPEG concatenado e de WAV PCM
@@ -339,13 +342,17 @@ Renomeações do port, para ler diffs contra o upstream: `rca` → **`tv`**,
 
 | Contexto | O que faz |
 |---|---|
-| `loop()` | interface, decodificação JPEG, desenho, diagnóstico serial |
+| `loop()` (tarefa `APP`, núcleo 0) | interface, leitura do quadro no cartão, desenho, diagnóstico serial |
+| `VIDEO_DEC` (núcleo 1, prio 2) | decodifica o quadro MJPEG direto no framebuffer, a pedido do `videoTick()` |
 | `RCA_PCM` | lê PCM do cartão e entrega ao `audioout::write()`, ritmado pelo relógio de amostras |
 | `WEATHER_HTTP` / `RADAR_HTTPS` (prio 0) | uma consulta HTTP(S) via `net::httpGet`, publica e morre |
 | `RADIO_ICY` | lê o stream do rádio, bloco a bloco, com `net::Lock` por bloco |
 | interrupção do DVI | alimenta o HSTX linha a linha, no núcleo do `setup()` |
 
-**Todo desenho acontece no `loop()`.** As tarefas de rede nunca desenham: elas
+**Todo desenho acontece no `loop()`**, com uma exceção: a `VIDEO_DEC` escreve o
+quadro do filme no framebuffer. Enquanto um decode está em voo o `loop()` não
+desenha no `tv` nem usa o `jpeg`; quem precisa desenhar durante o vídeo chama
+`waitVideoDecodeIdle()` antes (ver 3.5). As tarefas de rede nunca desenham: elas
 escrevem num buffer e publicam por `std::atomic`.
 
 ### 3.3 Sincronização
@@ -407,7 +414,8 @@ visita anterior já deixou a tela da previsão em branco permanentemente.
 
 ```
 cartão (SDIO) → MjpegReader.next() → jpegBuffer (PSRAM, 128 KiB)
-              → JPEGDEC.decode()   → jpegDraw() por bloco de MCU, RGB565_BIG_ENDIAN
+              → [núcleo 1, VIDEO_DEC]
+                JPEGDEC.decode()   → jpegDraw() por bloco de MCU, RGB565_BIG_ENDIAN
               → tv (LGFX_Sprite)   = framebuffer do DVI (SRAM)
               → HSTX, linha a linha → GPIO 12..19 → monitor
 ```
@@ -415,6 +423,16 @@ cartão (SDIO) → MjpegReader.next() → jpegBuffer (PSRAM, 128 KiB)
 O relógio é o **PCM entregue**, não `millis()`: `videoTick()` calcula o quadro
 alvo a partir de `samplesPlayed` e pula quadros atrasados **sem decodificar**
 (passando `render = false`).
+
+O `loop()` lê o quadro (sdMutex) e entrega o decode à `VIDEO_DEC` por
+`submitVideoFrame()`; o `videoTick()` seguinte colhe o resultado
+(`collectVideoFrame()`), publica `renderedSeq`/`lastJpegUsed` e **devolve a vez
+antes de submeter o próximo**, para o OSD e a legenda pintarem sobre o quadro
+limpo. Com um framebuffer só, a regra é: **nada desenha no `tv` com um decode em
+voo** — `drawPlaybackOsd`, `redrawCurrentFrame`, `stopProgram`, a vinheta do modo
+canal e o desligamento chamam `waitVideoDecodeIdle()`, que espera e já colhe. O
+primeiro quadro e o descarte (`render = false`) continuam síncronos no `loop()`.
+Estudo de desempenho: `docs/codecs-video-fruitjam.md`.
 
 Por isso há dois contadores diferentes, e confundi-los já causou bug:
 
@@ -477,6 +495,32 @@ Fonte dos dados: **Open-Meteo** (`api.open-meteo.com`), pública e sem chave, co
 resposta de ~800 bytes, buscada por `net::httpGet` num buffer na PSRAM. Os
 ícones são escolhidos pelo **código WMO**, não por comparação de string.
 
+### 3.9 Controles USB
+
+Teclado e gamepad pelas portas USB host (D+ GPIO 1, 5V_EN GPIO 11), novo neste
+fork -- o Core2 não tinha USB host. `include/fj/UsbHost.h` documenta por
+extenso as decisões (pilha, PIO, núcleo, clock) e `PORTING.md` §3.11 resume o
+porquê de cada uma; aqui só o que muda no fluxo de navegação:
+
+`fj/UsbHost.cpp` decodifica os relatórios HID com `fj/UsbHidMap.h` (funções
+puras, testadas em `tests/test_core.cpp`: teclado boot, gamepad genérico via
+parser do report descriptor, DualShock4/DualSense por VID/PID) e entrega uma
+`NavAction` por um `ActionHandler` (ponteiro de função) que `appSetup()`
+fornece -- o mesmo desenho do controle web (`webCommand`/
+`FileTransfer::setCommandHandler`): a camada `fj/` não inclui `InputManager.h`
+nem sabe da fila do `loop()`. A função entra pela mesma fila do
+`InputManager` (`InputSource::USB`), então nunca existe um segundo caminho de
+navegação capaz de divergir do físico. XInput (Xbox) fica de fora -- ver
+`PLANO_E_REVISAO.md`.
+
+**NÃO TESTADO NO APARELHO.** O `clk_sys` fica em 240 MHz mesmo com o DVI ativo
+(o modo de vídeo só reprograma o pll_sys/clk_hstx, nunca o clk_sys -- ver
+`fj/UsbHost.h`), e 240 MHz é múltiplo exato de 12 MHz, a regra que os próprios
+exemplos da Adafruit para PIO-USB tratam como obrigatória; `diag usb` confirma
+isso no aparelho real via `logClockFit()`. O maior risco não testado aqui não
+é o clock, e sim o compartilhamento do núcleo 1 (RCA_PCM + VIDEO_DEC + o
+alarme de 1 ms do PIO-USB) e o mapeamento de botões dos gamepads genéricos.
+
 ---
 
 ## 4. Compilar e testar
@@ -504,11 +548,17 @@ A plataforma é a comunitária do Max Gerhardt
 (`maxgerhardt/platform-raspberrypi`) com o core do Earle Philhower
 (arduino-pico): a plataforma oficial `raspberrypi` do PlatformIO não tem RP2350.
 `board_build.f_cpu` fica em 150 MHz no `platformio.ini` porque a biblioteca do
-DVHSTX recusa compilar com outro valor. Ela mesma sobe o relógio de verdade
-depois: o `#error` de compilação dela fala em 264 MHz, mas a conta do
-`clock_configure` no commit fixado dá **240 MHz** (PLL USB 480 MHz / 2) —
-mensagem de erro desatualizada da própria lib, não do nosso código; ver AGENTS
-2.2 abaixo. As bibliotecas estão fixadas por commit.
+DVHSTX recusa compilar com outro valor. Ela mesma sobe o `clk_sys` sozinha em
+tempo de execução, uma vez, num preinit antes do `setup()`: o `#error` de
+compilação fala em 264 MHz, mas a conta do `clock_configure` no commit fixado
+dá **240 MHz** (PLL USB 480 MHz / 2) — mensagem de erro desatualizada da
+própria lib, não do nosso código; ver AGENTS 2.2 abaixo. O modo de vídeo
+escolhido depois em `display::begin()` reprograma só o `pll_sys`/`clk_hstx`
+(o clock de pixel do HSTX, 126 MHz para 640×480@60) — domínio separado do
+`clk_sys`, que segue 240 MHz mesmo com o DVI ativo (ver o comentário de clock
+em `include/fj/UsbHost.h`, que precisou conferir isto linha a linha porque o
+PIO-USB depende do `clk_sys` ser múltiplo de 12 MHz). As bibliotecas estão
+fixadas por commit.
 
 Sem acesso ao registro do PlatformIO: clone as bibliotecas de `lib_deps` numa
 pasta e crie `platformio_local.ini` (ignorado pelo git):
@@ -539,6 +589,7 @@ diag colors        confere o caminho RGB565 dos blocos JPEG
 diag bench         mede leitura do cartão, decode e blit em microssegundos
 diag time          origem e valor da hora do sistema
 diag radio         estado do rádio pela internet
+diag usb           dispositivos USB conectados (VID:PID, tipo) e último evento
 diag play/pause/resume/stop/home/back/next/previous/select/left/right
 diag radar/weather/music
 diag audio toggle|tv|internal|mute

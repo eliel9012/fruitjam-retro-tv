@@ -15,8 +15,11 @@
 #include "fj/AudioOut.h"
 #include "fj/Net.h"
 #include "fj/Storage.h"
+#include "fj/UsbHost.h"
 
 #include "SafeArea.h"
+#include "Config.h"
+#include "BootSplash.h"
 #include "RtcClock.h"
 #include "ChannelMode.h"
 #include "PhotoShow.h"
@@ -286,6 +289,12 @@ uint32_t lastHttpMs = 0;
 bool networkConfigPresent = false;
 
 InputManager input;
+// Callback do teclado/gamepad USB (fj/UsbHost.cpp): so enfileira, do mesmo
+// jeito que webCommand() faz para o controle remoto do navegador -- um so
+// caminho de navegacao, para os tres nunca divergirem.
+static void usbNavAction(NavAction action) {
+  input.inject(action, InputSource::USB);
+}
 int homeSelection = 0, librarySelection = 0, radarSelection = -1, settingsSelection = 0, infoPage = 0;
 // Modo canal (reproducao continua) e temporizador de desligar. Aqui em cima
 // porque startProgram(), bem antes de scanLibrary(), ja precisa deles.
@@ -397,6 +406,27 @@ void dualText(const String &line1, const String &line2 = "") {
   tv.setTextColor(RCA_ACCENT, TFT_NAVY);
   tv.setTextSize(1);
   tv.drawString(l2, 160, 130);
+}
+// Etapa do boot na abertura (BootSplash.h): a primeira chamada pinta a tela
+// inteira com o nome do dono; as seguintes trocam só a linha de status, sem
+// piscar. Erro de boot continua saindo por setError()/dualText().
+static uint32_t bootSplashSince = 0;
+static void bootStep(const char *status) {
+  static bool painted = false;
+  if (!painted) {
+    bootsplash::draw(&tv, cfg::OWNER, PTBR::APP, status, cfg::VERSION_SHORT);
+    bootSplashSince = millis();
+    painted = true;
+  } else
+    bootsplash::drawStatus(&tv, status);
+}
+
+// Segura a abertura por um mínimo de tempo: com cartão rápido e sem Wi-Fi o boot
+// acaba em menos de um segundo, e o nome piscaria sem dar para ler.
+static void bootSplashHold() {
+  constexpr uint32_t MIN_MS = 2000;
+  while (millis() - bootSplashSince < MIN_MS)
+    delay(20);
 }
 void setError(const String &message) {
   if (playing || wavFile)
@@ -863,10 +893,14 @@ bool validateMjpegStream() {
   return mjpegFile.seek(0);
 }
 
-bool readAndShowOneFrame(bool render) {
+// Lê o próximo quadro do cartão. Com render=false só pula o quadro (catch-up do
+// videoTick, sem tocar no jpegBuffer); com render=true copia o JPEG para o
+// jpegBuffer e devolve o tamanho em `used`. Roda sempre no loop(): o cartão é
+// disputado com a tarefa de áudio pelo sdMutex.
+static bool readVideoFrame(bool render, size_t &used) {
+  used = 0;
   if (!mjpegFile || !jpegBuffer)
     return false;
-  size_t used = 0;
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(150)) != pdTRUE) {
     videoReadError = true;
     return false;
@@ -881,24 +915,23 @@ bool readAndShowOneFrame(bool render) {
     }
     return false;
   }
-  if (!render)
-    return true;
-  const uint32_t started = millis();
-  if (!jpeg.openRAM(jpegBuffer, used, jpegDraw)) {
-    jpegErrors++;
-    videoReadError = true;
+  return true;
+}
+
+// Decodifica o JPEG que está no jpegBuffer direto no framebuffer. Não mexe em
+// contador nenhum que o loop() leia: devolve o sucesso, e quem publica o quadro
+// é finishVideoFrame(). Por isso pode rodar tanto no loop() quanto na tarefa de
+// decode do núcleo 1 (ver videoDecodeTask).
+static bool decodeVideoFrame(size_t used, bool firstFrame) {
+  if (!jpeg.openRAM(jpegBuffer, used, jpegDraw))
     return false;
-  }
   const int width = jpeg.getWidth(), height = jpeg.getHeight();
   if (width < 1 || height < 1 || width > 320 || height > 240) {
     jpeg.close();
-    videoReadError = true;
-    jpegErrors++;
     return false;
   }
   // Limpa a tela no primeiro quadro (ou quando a resolução muda), para o
   // letterbox em volta de um vídeo menor que 320x240 começar preto.
-  const bool firstFrame = (videoFrameIndex == 0);
   if (width != videoWidth || height != videoHeight || firstFrame) {
     videoWidth = width;
     videoHeight = height;
@@ -913,21 +946,131 @@ bool readAndShowOneFrame(bool render) {
   jpeg.close();
   if (decoded)
     vhsFilter.drawOverlay(&tv); // faixa de troca de cabeca e banda de tracking
+  return decoded;
+}
+
+// Publica o resultado de um decode (no loop(), sempre). Só depois de um decode
+// bem-sucedido o par (jpegBuffer, tamanho) está comprovadamente coerente, que é
+// a pré-condição do redrawCurrentFrame().
+static bool finishVideoFrame(bool decoded, size_t used, uint32_t elapsedMs) {
   if (!decoded) {
+    lastJpegUsed = 0;
     jpegErrors++;
     videoReadError = true;
     return false;
   }
-  // Só agora o par (jpegBuffer, tamanho) está comprovadamente coerente, que é a
-  // pré-condição do redrawCurrentFrame().
   lastJpegUsed = used;
   decodedFrames++;
   renderedFrames++;
   ++renderedSeq;
-  const uint32_t elapsed = millis() - started;
-  jpegDecodeTotalMs += elapsed;
-  jpegDecodeMaxMs = max(jpegDecodeMaxMs, elapsed);
+  jpegDecodeTotalMs += elapsedMs;
+  jpegDecodeMaxMs = max(jpegDecodeMaxMs, elapsedMs);
   return true;
+}
+
+// Caminho síncrono: lê e decodifica no próprio loop(). Serve ao primeiro quadro
+// do startProgram() e ao descarte de quadros (render=false). O ritmo normal do
+// filme passa pela tarefa do núcleo 1 (videoTick).
+bool readAndShowOneFrame(bool render) {
+  size_t used = 0;
+  if (!readVideoFrame(render, used))
+    return false;
+  if (!render)
+    return true;
+  const uint32_t started = millis();
+  const bool decoded = decodeVideoFrame(used, videoFrameIndex == 0);
+  return finishVideoFrame(decoded, used, millis() - started);
+}
+
+// ============================================================================
+// Decode no núcleo 1
+//
+// No Fruit Jam o núcleo 0 carrega o loop() e a interrupção de linha do DVI (que
+// copia o framebuffer para os buffers de linha, ~10% do núcleo), e o núcleo 1
+// só tem o áudio (~1%). Um quadro MJPEG 320x240 custa ~31-37 ms estimados
+// (docs/codecs-video-fruitjam.md): no núcleo 0 isso fica no limite dos 30 fps e
+// ainda trava botões e OSD enquanto decodifica. Aqui o loop() lê o quadro do
+// cartão e entrega o decode a uma tarefa no núcleo 1, com prioridade ABAIXO da
+// do áudio (o áudio é quem dita o relógio do filme).
+//
+// Regra que mantém isto correto com um framebuffer só: enquanto um decode está
+// em voo, o loop() NÃO desenha no `tv` nem usa o `jpeg`. Quem precisa desenhar
+// durante o vídeo (OSD, legenda, vinheta, parada) chama waitVideoDecodeIdle()
+// antes. O loop() é o único que submete trabalho, então depois dessa espera
+// ninguém mais decodifica até ele mesmo submeter de novo.
+// ============================================================================
+enum class DecodeJob : uint8_t { IDLE, BUSY, DONE };
+static std::atomic<DecodeJob> decodeJob{DecodeJob::IDLE};
+static TaskHandle_t videoDecodeHandle = nullptr;
+// Parâmetros e resultado do job. Escritos antes do store(BUSY)/store(DONE) e
+// lidos depois do load() correspondente: o atomic (seq_cst) publica os dois lados.
+static size_t decodeUsed = 0;
+static bool decodeFirst = false, decodeOk = false;
+static uint32_t decodeElapsedMs = 0;
+static constexpr uint32_t DECODE_STACK_BYTES = 8192;
+static constexpr UBaseType_t DECODE_PRIO = 2; // áudio é 4, rede 0-1
+
+static void videoDecodeTask(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (decodeJob.load() != DecodeJob::BUSY)
+      continue;
+    const uint32_t started = millis();
+    decodeOk = decodeVideoFrame(decodeUsed, decodeFirst);
+    decodeElapsedMs = millis() - started;
+    decodeJob.store(DecodeJob::DONE);
+  }
+}
+
+static bool startVideoDecodeTask() {
+  if (videoDecodeHandle)
+    return true;
+  return xTaskCreatePinnedToCore(videoDecodeTask, "VIDEO_DEC", DECODE_STACK_BYTES, nullptr,
+                                 DECODE_PRIO, &videoDecodeHandle, 1) == pdPASS;
+}
+
+static bool videoDecodeBusy() { return decodeJob.load() == DecodeJob::BUSY; }
+
+
+// Lê o quadro e entrega o decode ao núcleo 1. Sem a tarefa (falha de memória no
+// boot) cai no caminho síncrono, que é o comportamento do upstream.
+static bool submitVideoFrame() {
+  if (!videoDecodeHandle)
+    return readAndShowOneFrame(true);
+  size_t used = 0;
+  if (!readVideoFrame(true, used))
+    return false;
+  decodeUsed = used;
+  decodeFirst = videoFrameIndex == 0;
+  decodeJob.store(DecodeJob::BUSY);
+  xTaskNotifyGive(videoDecodeHandle);
+  return true;
+}
+
+// Colhe um decode terminado e publica o quadro (renderedSeq, lastJpegUsed,
+// estatísticas). Quadro que não decodificou encerra o filme, como no caminho
+// síncrono. Devolve true se havia um quadro para colher.
+static bool collectVideoFrame() {
+  if (decodeJob.load() != DecodeJob::DONE)
+    return false;
+  const bool ok = finishVideoFrame(decodeOk, decodeUsed, decodeElapsedMs);
+  decodeJob.store(DecodeJob::IDLE);
+  if (!ok) {
+    playbackFinished = true;
+    playing = false;
+  }
+  return true;
+}
+
+// Espera o decode em voo terminar e já publica o quadro. Depois disto ninguém
+// escreve no `tv` nem usa o `jpeg` até o loop() submeter de novo, e o
+// lastJpegUsed volta a descrever o que está no jpegBuffer — sem colher, um
+// redrawCurrentFrame() logo depois decodificaria o quadro novo com o tamanho do
+// velho.
+static void waitVideoDecodeIdle() {
+  while (decodeJob.load() == DecodeJob::BUSY)
+    vTaskDelay(1);
+  collectVideoFrame();
 }
 
 // ============================================================================
@@ -1200,6 +1343,9 @@ bool startProgram(const String &dir) {
 }
 void stopProgram() {
   playing = false;
+  // O núcleo 1 pode estar no meio de um quadro, escrevendo no framebuffer que a
+  // próxima tela vai desenhar.
+  waitVideoDecodeIdle();
   if (srtOpen) {
     srtFile.close();
     srtOpen = false;
@@ -1236,33 +1382,49 @@ void stopProgram() {
 }
 void videoTick() {
   videoBehind = false;
+  // Decode em voo no núcleo 1: nada a fazer até ele terminar. O loop() segue
+  // livre para botões e rede.
+  if (videoDecodeBusy()) {
+    // Soneca curta: o quadro termina a qualquer momento, e cada ms que ele
+    // espera para ser colhido e o próximo ser submetido sai do orçamento de
+    // 33 ms do quadro seguinte.
+    videoBehind = true;
+    return;
+  }
+  // Quadro recém-decodificado: publica e devolve a vez ao loop(), para o OSD e a
+  // legenda pintarem por cima ANTES do próximo decode começar a escrever no
+  // mesmo framebuffer.
+  const bool fresh = collectVideoFrame();
   if (!playing || paused)
     return;
   const uint32_t target = uint32_t((double(samplesPlayed.load()) * fps) / sampleRate);
-  // Catch up without JPEG decoding. Bound the work so navigation stays responsive.
-  int skipped = 0;
-  while (videoFrameIndex < target && skipped < 4) {
-    if (!readAndShowOneFrame(false)) {
-      playbackFinished = true;
-      playing = false;
-      return;
-    }
-    videoFrameIndex++;
-    droppedFrames++;
-    skipped++;
-  }
-  if (videoFrameIndex == target) {
-    if (readAndShowOneFrame())
+  if (!fresh) {
+    // Catch up without JPEG decoding. Bound the work so navigation stays responsive.
+    int skipped = 0;
+    while (videoFrameIndex < target && skipped < 4) {
+      if (!readAndShowOneFrame(false)) {
+        playbackFinished = true;
+        playing = false;
+        return;
+      }
       videoFrameIndex++;
-    else {
-      playbackFinished = true;
-      playing = false;
+      droppedFrames++;
+      skipped++;
+    }
+    if (videoFrameIndex == target) {
+      if (submitVideoFrame())
+        videoFrameIndex++;
+      else {
+        playbackFinished = true;
+        playing = false;
+      }
     }
   }
   // Legendas por cima do quadro recem desenhado. A posicao vem do relogio de
   // audio; a leitura do .srt e sequencial e precisa do mutex do cartao, como
-  // todo acesso ao SD.
-  if (srtOpen && playing) {
+  // todo acesso ao SD. Só com quadro recém-colhido: é o único momento em que o
+  // núcleo 1 não está escrevendo no framebuffer.
+  if (fresh && srtOpen && playing) {
     const uint32_t posMs =
         sampleRate ? (uint32_t)((uint64_t)samplesPlayed.load() * 1000ULL / sampleRate) : 0;
     if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -1271,8 +1433,8 @@ void videoTick() {
     }
     subtitles.draw(&tv, 0, 0, posMs);
   }
-  // Ainda atrás do relógio depois de trabalhar: o loop não deve dormir 4 ms.
-  videoBehind = playing && videoFrameIndex < target;
+  // Ainda atrás do relógio, ou com um decode em voo: o loop não deve dormir 4 ms.
+  videoBehind = playing && (videoDecodeBusy() || videoFrameIndex < target);
 }
 
 // Texto de API vai para a tela: passa por ascii::normalize aqui, na única porta
@@ -1642,6 +1804,7 @@ static void clearOsdLetterbox() {
 // Custa um decode e só roda com o vídeo pausado, a cada meio segundo, para o
 // PAUSE piscar sobre a imagem parada.
 static bool redrawCurrentFrame() {
+  waitVideoDecodeIdle(); // o jpeg e o framebuffer são do núcleo 1 durante um decode
   if (!jpegBuffer || !lastJpegUsed)
     return false;
   if (!jpeg.openRAM(jpegBuffer, lastJpegUsed, jpegDraw))
@@ -1666,6 +1829,7 @@ void drawPlaybackOsd() {
   const bool blink = !isPaused || ((now / 500U) & 1U) == 0;
 
   if (visible && !show) {
+    waitVideoDecodeIdle();
     clearOsdLetterbox(); // o próximo quadro repinta o que ficou sobre a imagem
     visible = false;
     return;
@@ -1677,7 +1841,11 @@ void drawPlaybackOsd() {
   const bool changed = !visible || lastPaused != isPaused || lastDeadline != osdUntil || lastBlink != blink;
   if (!newFrame && !changed)
     return;
-  if (!newFrame) {
+  // Vai pintar: nada de decode em voo por baixo. A espera também colhe um quadro
+  // que tenha acabado, e aí ele conta como quadro novo (imagem limpa embaixo).
+  waitVideoDecodeIdle();
+  const bool newFrameNow = lastFrame != renderedSeq;
+  if (!newFrameNow) {
     // Sem quadro novo embaixo (pausado, ou mudança de estado entre quadros):
     // restaura a imagem para não empilhar tinta velha do OSD.
     redrawCurrentFrame();
@@ -1740,6 +1908,7 @@ void requestPowerOff() {
   weatherAudio = false;
   playing = false;
   paused = true;
+  waitVideoDecodeIdle(); // o dualText abaixo não pode dividir a tela com um decode
   if (portal.active())
     portal.stop();
   network.disconnect();
@@ -3631,6 +3800,7 @@ void handleNavigation(NavAction a) {
     tvChannel.stop();
     if (playing || wavFile)
       stopProgram();
+    waitVideoDecodeIdle(); // decode pendente de um filme que já tinha acabado
     state = HOME;
     settingsEditing = false;
     drawHome();
@@ -4123,6 +4293,13 @@ void serviceDiagnostics() {
                     (unsigned long)radioStream.reconnects(), (unsigned long)audioUnderruns);
       return;
     }
+    if (command == "diag usb") {
+      const uint8_t n = usbhost::deviceCount();
+      Serial.printf("[USB] dispositivos=%u  ultimo evento: %s\n", (unsigned)n, usbhost::lastEvent());
+      for (uint8_t i = 0; i < n; ++i)
+        Serial.printf("[USB]   %s\n", usbhost::describe(i).text);
+      return;
+    }
     if (command == "diag time") {
       const time_t agora = time(nullptr);
       struct tm local, utc;
@@ -4328,12 +4505,12 @@ static void appSetup() {
   input.begin();
   input.setAutoRepeat(true);
   jpegBuffer = (uint8_t *)ps_malloc(MAX_JPEG);
-  dualText(PTBR::APP, PTBR::INICIANDO);
+  bootStep(PTBR::INICIANDO);
   if (!jpegBuffer) {
     setError(PTBR::MEMORIA_INSUFICIENTE);
     return;
   }
-  dualText(PTBR::APP, PTBR::VERIFICANDO_SD);
+  bootStep(PTBR::VERIFICANDO_SD);
   // SDIO próprio: o cartão não divide barramento com nada, ao contrário do
   // Core2, onde o VSPI era do LCD também.
   if (!storage::begin()) {
@@ -4353,12 +4530,17 @@ static void appSetup() {
   // Always inspect the card at boot. This keeps the video library usable when
   // Wi-Fi has not been configured and leaves serial evidence of the detected path.
   libraryProgramCount();
+  // Teclado/gamepad USB: pinos e PIO proprios (fj/UsbHost.h), nao disputa nada
+  // com SD/DAC/radio -- a posicao aqui so precisa vir depois de display::begin()
+  // (o clk_sys final do video ja esta fixado; UsbHost mede e loga, nao trava o
+  // boot se nao bater). Nunca bloqueia: sobe uma tarefa e volta na hora.
+  usbhost::begin(usbNavAction);
   // Rádio antes do DAC (ver acima). Falhar aqui não impede o uso offline: o
   // NetworkManager só vai continuar sem conectar.
-  dualText(PTBR::APP, PTBR::CONECTANDO_WIFI);
+  bootStep(PTBR::CONECTANDO_WIFI);
   if (!net::beginRadio())
     Serial.println("[M5RETRO] ERRO: ESP32-C6 nao respondeu; seguindo sem rede");
-  dualText(PTBR::APP, PTBR::INICIANDO_AUDIO);
+  bootStep(PTBR::INICIANDO_AUDIO);
   // O volume do usuário é aplicado em software (playback::scalePcm), como no
   // original. O volume digital do DAC fica em 0 dB: somar os dois atenuaria em
   // dobro.
@@ -4367,7 +4549,7 @@ static void appSetup() {
     setError(PTBR::FALHA_AUDIO);
     return;
   }
-  dualText(PTBR::APP, PTBR::CARREGANDO_CONFIG);
+  bootStep(PTBR::CARREGANDO_CONFIG);
   if (!loadConfiguration()) {
     apiStatus = PTBR::CONFIG_REDE_AUSENTE;
     dualText(PTBR::CONFIG_REDE_AUSENTE, PTBR::EDITE_SECRETS);
@@ -4386,7 +4568,12 @@ static void appSetup() {
     setError(PTBR::MEMORIA_INSUFICIENTE);
     return;
   }
-  dualText(PTBR::APP, PTBR::SISTEMA_PRONTO);
+  // Decode de vídeo no núcleo 1. Sem ela o player cai no decode síncrono do
+  // upstream (mais lento, mas funciona), então a falha só vai para o serial.
+  if (!startVideoDecodeTask())
+    Serial.println("[M5RETRO] ERRO: tarefa de decode nao subiu; decode no loop()");
+  bootStep(PTBR::SISTEMA_PRONTO);
+  bootSplashHold();
   // Offline playback must not be hidden behind network setup. The portal stays
   // available from CONFIGURACOES when the owner wants to add Wi-Fi later.
   bootReady = true;
@@ -4493,6 +4680,7 @@ static void appLoop() {
     // inteiro na primeira chamada de cada vinheta; depois so a barra cresce,
     // entao chamar a cada volta do loop nao pisca.
     if (tvChannel.bumperActive()) {
+      waitVideoDecodeIdle();
       const uint32_t agora = millis();
       tvChannel.drawBumper(&tv, 0, 0, nullptr, agora);
       const int proximo = tvChannel.ready(agora);

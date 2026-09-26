@@ -89,8 +89,8 @@ configuração do DAC. Por isso a ordem do boot é fixa:
 | Botão 3 — "C" (direita / próximo) | 5 | ativo em nível baixo |
 | NeoPixels (5 LEDs) | 32 | apagados no *soft-off* |
 | LED vermelho | 29 | não usado |
-| USB host D+ / D− | 1 / 2 | não usado |
-| 5V do USB host (enable) | 11 | não usado |
+| USB host D+ / D− | 1 / 2 | teclado/gamepad, via Pico-PIO-USB (D− é sempre D+ +1) |
+| 5V do USB host (enable) | 11 | nível alto liga o 5V do conector; ver `include/fj/UsbHost.h` |
 | A0..A5 | 40..45 | não usados |
 | PSRAM CS | 47 | 8 MB QSPI, mapeada em memória |
 
