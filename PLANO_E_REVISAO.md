@@ -180,6 +180,35 @@ por quadro; medir com `diag bench` antes e depois.
 - Sair e voltar da tela não congela (armadilha 3 do `AGENTS.md`: `stopProgram()`
   esperando `audioIdle`).
 
+### 12. Controles USB — pendente
+
+Teclado e gamepad pelas portas USB host. Nada disto rodou num Fruit Jam ainda;
+`include/fj/UsbHost.h` tem as decisões (pilha/PIO/núcleo/clock) por extenso.
+
+- `diag usb` mostra o `clk_sys` real e se é múltiplo de 12 MHz. Em teoria
+  (lendo `dvhstx.cpp`, não medição) é 240 MHz — o preinit do DVHSTX fixa o
+  `clk_sys` uma vez só; o modo de vídeo reprograma o `pll_sys`/`clk_hstx`
+  (clock de pixel, 126 MHz para 640×480@60), domínio separado que não afeta o
+  `clk_sys`. 240 MHz É múltiplo de 12 MHz, a regra que os exemplos da Adafruit
+  para PIO-USB tratam como obrigatória — confirmar com `diag usb` no aparelho
+  real continua valendo, mas não é o primeiro suspeito esperado.
+- Teclado USB: setas navegam, Enter seleciona, Esc/Backspace volta, Espaço
+  pausa/retoma, PgUp/PgDn é anterior/próximo.
+- Gamepad genérico (HID, sem VID/PID reconhecido): d-pad ou analógico esquerdo
+  navegam; o mapeamento dos botões (confirmar/voltar/atalhos) é uma convenção
+  comum entre gamepads USB baratos, **não testada com um gamepad real** — pode
+  sair trocada num modelo específico.
+- DualShock4 e DualSense (VID Sony `0x054C`): d-pad, Cruz/Círculo, L1, PS.
+  Layout de domínio público (hid-sony do Linux), não conferido contra o
+  controle físico.
+- Hub USB com mais de um dispositivo (teclado + gamepad juntos, por exemplo).
+- **Pendência conhecida, fora do escopo desta rodada**: XInput (controle
+  Xbox) não é HID puro e precisaria do driver `tusb_xinput`
+  (Ryzee119, MIT, <https://github.com/Ryzee119/tusb_xinput>) integrado à
+  parte — não incluído.
+- Ligar/desligar o dispositivo com o firmware já rodando (hot-plug), não só no
+  boot.
+
 ### Limites conhecidos do fork
 
 - Sem RTC: sem Wi-Fi não há hora.
@@ -190,6 +219,7 @@ por quadro; medir com `diag bench` antes e depois.
   são comparáveis aos do Core2.
 - Nenhum número de desempenho do Fruit Jam existe ainda. Os da Parte 2 são do
   Core2.
+- USB host: sem XInput (Xbox); ver item 12 acima.
 
 ---
 

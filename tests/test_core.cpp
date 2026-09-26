@@ -5,6 +5,7 @@
 #include "NetworkManager.h"
 #include "fj/Board.h" // o stub de tests/stubs, não o do aparelho
 #include "fj/Net.h"   // idem
+#include "fj/UsbHidMap.h"
 #include <cassert>
 #include <algorithm>
 #include <iostream>
@@ -303,12 +304,120 @@ void testNetwork() {
   }
   assert(manager.failures() == 255);
 }
+void testUsbHidMap() {
+  using namespace usbhidmap;
+  // Descritor de um gamepad generico: X/Y de 8 bits, hat switch de 4 bits
+  // (0..7, 8=centro), 4 bits de preenchimento e 8 botoes -- 4 bytes de
+  // relatorio ao todo. Bytes conferidos a mao contra a tabela de itens curtos
+  // do HID 1.11 (secao 6.2.2).
+  const uint8_t desc[] = {
+      0x05, 0x01,       // Usage Page (Generic Desktop)
+      0x09, 0x05,       // Usage (Gamepad)
+      0xA1, 0x01,       // Collection (Application)
+      0x09, 0x30,       //   Usage (X)
+      0x09, 0x31,       //   Usage (Y)
+      0x15, 0x00,       //   Logical Minimum (0)
+      0x26, 0xFF, 0x00, //   Logical Maximum (255)
+      0x75, 0x08,       //   Report Size (8)
+      0x95, 0x02,       //   Report Count (2)
+      0x81, 0x02,       //   Input (Data,Var,Abs)
+      0x09, 0x39,       //   Usage (Hat switch)
+      0x15, 0x00,       //   Logical Minimum (0)
+      0x25, 0x07,       //   Logical Maximum (7)
+      0x75, 0x04,       //   Report Size (4)
+      0x95, 0x01,       //   Report Count (1)
+      0x81, 0x42,       //   Input (Data,Var,Abs,Null)
+      0x75, 0x04,       //   Report Size (4) -- preenchimento
+      0x95, 0x01,       //   Report Count (1)
+      0x81, 0x01,       //   Input (Constant)
+      0x05, 0x09,       //   Usage Page (Button)
+      0x19, 0x01,       //   Usage Minimum (1)
+      0x29, 0x08,       //   Usage Maximum (8)
+      0x15, 0x00,       //   Logical Minimum (0)
+      0x25, 0x01,       //   Logical Maximum (1)
+      0x75, 0x01,       //   Report Size (1)
+      0x95, 0x08,       //   Report Count (8)
+      0x81, 0x02,       //   Input (Data,Var,Abs)
+      0xC0,             // End Collection
+  };
+  GamepadFieldLayout layout = parseGamepadFieldLayout(desc, sizeof(desc));
+  assert(layout.valid);
+  assert(layout.reportId == 0);
+  assert(layout.hasAxisX && layout.axisXBitOffset == 0 && layout.axisXBitSize == 8);
+  assert(layout.hasAxisY && layout.axisYBitOffset == 8 && layout.axisYBitSize == 8);
+  assert(layout.hasHat && layout.hatBitOffset == 16 && layout.hatBitSize == 4);
+  assert(layout.hatLogicalMin == 0 && layout.hatLogicalMax == 7);
+  assert(layout.axisLogicalMin == 0 && layout.axisLogicalMax == 255);
+  assert(layout.buttonBitOffset == 24 && layout.buttonCount == 8);
+
+  // Hat para cima (dir=0), analogico centrado, botoes 0 (select) e 6 (home).
+  {
+    const uint8_t report[4] = {128, 128, 0x00, 0x41};
+    LogicalButtons b = fromGeneric(layout, report, sizeof(report));
+    assert(b.up && !b.down && !b.left && !b.right);
+    assert(b.select && b.home);
+    // Navegacao tem prioridade sobre os atalhos no mesmo relatorio.
+    assert(primaryAction(b) == NavAction::UP);
+  }
+  // Hat centrado (valor 8 = null): cai para o analogico. X puxado para a
+  // direita, Y no meio; botao 1 (back) sozinho.
+  {
+    const uint8_t report[4] = {250, 128, 0x08, 0x02};
+    LogicalButtons b = fromGeneric(layout, report, sizeof(report));
+    assert(!b.up && !b.down && !b.left && b.right);
+    assert(b.back && !b.select);
+    assert(primaryAction(b) == NavAction::RIGHT);
+  }
+  // So o botao de voltar, sem direcao nenhuma.
+  {
+    const uint8_t report[4] = {128, 128, 0x08, 0x02};
+    LogicalButtons b = fromGeneric(layout, report, sizeof(report));
+    assert(!b.up && !b.down && !b.left && !b.right && b.back);
+    assert(primaryAction(b) == NavAction::BACK);
+  }
+
+  // Teclado boot HID: seta e Enter/Esc/Espaco/PgUp/PgDn.
+  {
+    const uint8_t left[8] = {0, 0, hidkey::LEFT, 0, 0, 0, 0, 0};
+    assert(primaryAction(fromKeyboardBootReport(left)) == NavAction::LEFT);
+    const uint8_t enter[8] = {0, 0, hidkey::ENTER, 0, 0, 0, 0, 0};
+    assert(primaryAction(fromKeyboardBootReport(enter)) == NavAction::SELECT);
+    const uint8_t esc[8] = {0, 0, hidkey::ESC, 0, 0, 0, 0, 0};
+    assert(primaryAction(fromKeyboardBootReport(esc)) == NavAction::BACK);
+    const uint8_t space[8] = {0, 0, hidkey::SPACE, 0, 0, 0, 0, 0};
+    assert(primaryAction(fromKeyboardBootReport(space)) == NavAction::PLAY_PAUSE);
+    const uint8_t pgup[8] = {0, 0, hidkey::PAGE_UP, 0, 0, 0, 0, 0};
+    assert(primaryAction(fromKeyboardBootReport(pgup)) == NavAction::PREVIOUS);
+    // Enter e Esc juntos (repique/tecla presa): BACK vence, mesma prioridade
+    // fixa de primaryAction().
+    const uint8_t both[8] = {0, 0, hidkey::ENTER, hidkey::ESC, 0, 0, 0, 0};
+    assert(primaryAction(fromKeyboardBootReport(both)) == NavAction::BACK);
+  }
+
+  // DualShock4: hat=5 (sudoeste -> baixo e esquerda juntos), Cruz (select),
+  // L1 (previous) e o botao PS (home).
+  {
+    const uint8_t ds4[8] = {0, 0, 0, 0, 0x25, 0x01, 0x01, 0};
+    LogicalButtons b = fromDualShock4(ds4, sizeof(ds4));
+    assert(b.down && b.left && !b.up && !b.right);
+    assert(b.select && b.previous && b.home);
+    // Diagonal: left vence na prioridade fixa sobre down/home/select.
+    assert(primaryAction(b) == NavAction::LEFT);
+    // DualSense usa o mesmo layout de eixos/d-pad/botoes.
+    assert(primaryAction(fromDualSense(ds4, sizeof(ds4))) == NavAction::LEFT);
+  }
+  assert(isDualShock4(VID_SONY, PID_DUALSHOCK4_V1));
+  assert(isDualShock4(VID_SONY, PID_DUALSHOCK4_V2));
+  assert(isDualSense(VID_SONY, PID_DUALSENSE));
+  assert(!isDualShock4(0x046D, 0xC216)); // Logitech generico -- nao e Sony
+}
 int main(int argc, char **argv) {
   testMjpeg();
   testWav();
   testStorage();
   testNavigation();
   testNetwork();
+  testUsbHidMap();
   if (argc == 3) {
     MemoryStream video, audio;
     std::ifstream v(argv[1], std::ios::binary), a(argv[2], std::ios::binary);
@@ -329,5 +438,5 @@ int main(int argc, char **argv) {
     std::cout << "Real media: " << count << " frames, 2 seconds stereo PCM, " << video.reads
               << " SD block reads\n";
   }
-  std::cout << "PASS: MJPEG, WAV, PCM volume, storage recovery, navigation, input, network\n";
+  std::cout << "PASS: MJPEG, WAV, PCM volume, storage recovery, navigation, input, network, USB HID\n";
 }

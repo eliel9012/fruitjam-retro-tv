@@ -15,6 +15,7 @@
 #include "fj/AudioOut.h"
 #include "fj/Net.h"
 #include "fj/Storage.h"
+#include "fj/UsbHost.h"
 
 #include "SafeArea.h"
 #include "Config.h"
@@ -294,6 +295,12 @@ uint32_t lastHttpMs = 0;
 bool networkConfigPresent = false;
 
 InputManager input;
+// Callback do teclado/gamepad USB (fj/UsbHost.cpp): so enfileira, do mesmo
+// jeito que webCommand() faz para o controle remoto do navegador -- um so
+// caminho de navegacao, para os tres nunca divergirem.
+static void usbNavAction(NavAction action) {
+  input.inject(action, InputSource::USB);
+}
 int homeSelection = 0, librarySelection = 0, radarSelection = -1, settingsSelection = 0, infoPage = 0;
 // Modo canal (reproducao continua) e temporizador de desligar. Aqui em cima
 // porque startProgram(), bem antes de scanLibrary(), ja precisa deles.
@@ -4394,6 +4401,13 @@ void serviceDiagnostics() {
                     (unsigned long)radioStream.reconnects(), (unsigned long)audioUnderruns);
       return;
     }
+    if (command == "diag usb") {
+      const uint8_t n = usbhost::deviceCount();
+      Serial.printf("[USB] dispositivos=%u  ultimo evento: %s\n", (unsigned)n, usbhost::lastEvent());
+      for (uint8_t i = 0; i < n; ++i)
+        Serial.printf("[USB]   %s\n", usbhost::describe(i).text);
+      return;
+    }
     if (command == "diag time") {
       const time_t agora = time(nullptr);
       struct tm local, utc;
@@ -4630,6 +4644,11 @@ static void appSetup() {
   // Always inspect the card at boot. This keeps the video library usable when
   // Wi-Fi has not been configured and leaves serial evidence of the detected path.
   libraryProgramCount();
+  // Teclado/gamepad USB: pinos e PIO proprios (fj/UsbHost.h), nao disputa nada
+  // com SD/DAC/radio -- a posicao aqui so precisa vir depois de display::begin()
+  // (o clk_sys final do video ja esta fixado; UsbHost mede e loga, nao trava o
+  // boot se nao bater). Nunca bloqueia: sobe uma tarefa e volta na hora.
+  usbhost::begin(usbNavAction);
   // Rádio antes do DAC (ver acima). Falhar aqui não impede o uso offline: o
   // NetworkManager só vai continuar sem conectar.
   bootStep(PTBR::CONECTANDO_WIFI);
