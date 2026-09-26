@@ -196,23 +196,25 @@ void testNavigation() {
   assert(!isBackButton(273, 10) && !isBackButton(300, 40));
   assert(isPlayerAudioButton(232, 160) && isPlayerAudioButton(315, 183));
   assert(!isPlayerAudioButton(231, 170) && !isPlayerAudioButton(316, 170) && !isPlayerAudioButton(250, 184));
-  // Ordem do menu inicial, em duas colunas de 6 e 5. A lista de rotulos em
+  // Ordem do menu inicial, em duas colunas de 6 e 6. A lista de rotulos em
   // drawHome() tem de andar junto -- la um static_assert prende o tamanho, e
   // aqui prende o destino de cada posicao.
   assert(homeTarget(0) == VIDEO_LIBRARY && homeTarget(1) == MUSIC_BROWSER &&
          homeTarget(2) == PHOTO_SHOW && homeTarget(3) == RADIO && homeTarget(4) == WEATHER &&
          homeTarget(5) == AIRCRAFT_RADAR && homeTarget(6) == TEST_PATTERN &&
          homeTarget(7) == FILE_TRANSFER && homeTarget(8) == SETTINGS &&
-         homeTarget(9) == SYSTEM_INFO);
+         homeTarget(9) == SYSTEM_INFO && homeTarget(10) == EMULATORS);
   // A ultima posicao e DESLIGAR: nao tem tela, e quem navega trata antes.
   assert(homeTarget(HOME_ITEM_COUNT - 1) == HOME && homeTarget(-1) == HOME &&
          homeTarget(HOME_ITEM_COUNT) == HOME);
-  // Toque: duas colunas, 6 linhas. Fora da grade devolve -1.
+  // Toque: duas colunas, 6 linhas cada agora (EMULADORES completou a coluna
+  // direita). Fora da grade devolve -1.
   assert(homeHit(12, 40, 12, 40, 148, 18) == 0);       // canto do primeiro item
   assert(homeHit(12, 40 + 5 * 18, 12, 40, 148, 18) == 5);   // fim da coluna esquerda
   assert(homeHit(160, 40, 12, 40, 148, 18) == 6);      // topo da coluna direita
-  assert(homeHit(160, 40 + 4 * 18, 12, 40, 148, 18) == 10); // DESLIGAR
-  assert(homeHit(160, 40 + 5 * 18, 12, 40, 148, 18) == -1); // 12a posicao nao existe
+  assert(homeHit(160, 40 + 4 * 18, 12, 40, 148, 18) == 10); // EMULADORES
+  assert(homeHit(160, 40 + 5 * 18, 12, 40, 148, 18) == 11); // DESLIGAR
+  assert(homeHit(160, 40 + 6 * 18, 12, 40, 148, 18) == -1); // fora da grade (HOME_ROWS)
   assert(homeHit(12, 10, 12, 40, 148, 18) == -1);      // acima da grade
   assert(homeHit(0, 40, 12, 40, 148, 18) == -1);       // a esquerda da grade
   assert(touchButton(12, 240) == -1 && touchButton(12, 183) == -1 && touchButton(12, 184) == 0 &&

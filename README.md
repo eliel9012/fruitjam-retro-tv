@@ -158,6 +158,36 @@ the bootloader instead of the firmware.
 No access to the PlatformIO registry? See `PORTING.md` §4 for a
 `platformio_local.ini` that builds from locally cloned libraries.
 
+## Emulators
+
+This TV can share the Fruit Jam's flash with a resident launcher (a small
+fork of [fhoedemakers/pico-bootLoader](https://github.com/fhoedemakers/pico-bootLoader),
+GPLv3, in its own repository) that also boots Genesis, Master System/Game
+Gear, SNES, Apple IIe and Macintosh emulators from the same SD card. Two
+`platformio.ini` environments cover the two ways to run this firmware:
+
+- `fruitjam` (default): standalone, at the start of flash (`0x10000000`), same
+  as always. The **EMULADORES** entry on the home menu just explains that it
+  needs the launcher — there is nowhere to return to after opening one.
+- `fruitjam-launcher`: the same firmware, relinked to a fixed 4 MB region near
+  the top of flash (`0x10C00000`) that the launcher reserves and never
+  overwrites when it flashes an emulator. Under this build, **EMULADORES**
+  really asks the launcher to show its emulator picker and reboots.
+
+To set it up: flash the launcher's `.uf2` once (built from its own
+repository, board 8 = Fruit Jam), then flash this TV's `fruitjam-launcher`
+`.uf2` into the region it reserved, then copy each emulator's `.uf2` to
+`/emu/8/` on the SD card. Mac and Apple IIe are not in the ready-made bundle:
+build [adafruit/pico-mac](https://github.com/adafruit/pico-mac) and
+[adafruit/reload-emulator](https://github.com/adafruit/reload-emulator)
+yourself as launcher apps — their own build scripts download the ROM they
+need, so there is nothing to fetch or commit here.
+
+Full architecture, the exact flash map, and the TV↔launcher protocol (two
+watchdog scratch registers, reimplemented here — no launcher code was
+copied into this repository) are in `PORTING.md`, section "Emuladores".
+**None of this has run on real hardware yet.**
+
 ## Preparing the card
 
 Format the card as **FAT32**. The firmware creates what is missing under
@@ -507,6 +537,36 @@ modo de gravação em vez do firmware.
 
 Sem acesso ao registro do PlatformIO? O `PORTING.md` §4 mostra um
 `platformio_local.ini` que compila a partir de bibliotecas clonadas localmente.
+
+## Emuladores
+
+Esta TV pode compartilhar a flash do Fruit Jam com um lançador residente (um
+fork pequeno do [fhoedemakers/pico-bootLoader](https://github.com/fhoedemakers/pico-bootLoader), GPLv3, em repositório
+próprio) que também sobe emuladores de Genesis, Master System/Game Gear,
+SNES, Apple IIe e Macintosh a partir do mesmo cartão SD. Dois ambientes do
+`platformio.ini` cobrem as duas formas de rodar este firmware:
+
+- `fruitjam` (padrão): sozinho, no início da flash (`0x10000000`), como
+  sempre. O item **EMULADORES** do menu inicial só explica que precisa do
+  lançador — não há para onde voltar depois de abrir um emulador.
+- `fruitjam-launcher`: o mesmo firmware, relinkado para uma região fixa de
+  4 MB perto do topo da flash (`0x10C00000`) que o lançador reserva e nunca
+  sobrescreve ao gravar um emulador. Nesse build, **EMULADORES** de fato pede
+  ao lançador para mostrar o menu de emuladores e reinicia a placa.
+
+Para instalar: grave o `.uf2` do lançador uma vez (compilado do repositório
+dele, placa 8 = Fruit Jam), depois grave o `.uf2` `fruitjam-launcher` desta TV
+na região que ele reservou, e por fim copie o `.uf2` de cada emulador para
+`/emu/8/` no cartão SD. Mac e Apple IIe não vêm no bundle pronto: compile
+[adafruit/pico-mac](https://github.com/adafruit/pico-mac) e
+[adafruit/reload-emulator](https://github.com/adafruit/reload-emulator)
+localmente como apps do lançador — os scripts de build deles mesmos baixam a
+ROM que precisam, então não há nada para buscar ou versionar aqui.
+
+A arquitetura completa, o mapa de flash exato e o protocolo TV↔lançador
+(dois watchdog scratch registers, reimplementados aqui — nenhum código do
+lançador foi copiado para este repositório) estão no `PORTING.md`, seção
+"Emuladores". **Nada disto rodou num aparelho de verdade ainda.**
 
 ## Preparar o cartão
 

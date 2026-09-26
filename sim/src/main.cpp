@@ -95,18 +95,20 @@ static void controllerLabels(const char *left, const char *center, const char *r
 //  Telas
 // ---------------------------------------------------------------------------
 static void screenHome() {
-  // Mesma ordem e mesmo layout de drawHome() no firmware: 11 itens em duas
-  // colunas de 6 e 5. Em coluna unica terminariam em 246 px, alem da barra.
+  // Mesma ordem e mesmo layout de drawHome() no firmware: 12 itens em duas
+  // colunas de 6 e 6 (EMULADORES entrou entre SISTEMA e DESLIGAR -- ver
+  // PORTING.md, secao "Emuladores"). Em coluna unica terminariam alem da
+  // barra.
   const char *items[] = {"VIDEOS",          "MUSICA",  "FOTOS",
                          "RADIO",           "TEMPO",   "TRAFEGO AEREO",
                          "PADRAO DE TESTE", "TRANSFERIR ARQUIVOS", "CONFIGURACOES",
-                         "SISTEMA",         "DESLIGAR"};
+                         "SISTEMA",         "EMULADORES", "DESLIGAR"};
   tv.fillScreen(TFT_NAVY);
   header("M5 RETRO TV");
   tv.setTextSize(1);
   tv.setTextColor(TFT_WHITE, TFT_NAVY);
   tv.drawString("QUA 23 SET   14:32:07", SAFE_L, crt::HEAD_RULE_Y + 4);
-  for (int i = 0; i < 11; ++i) {
+  for (int i = 0; i < 12; ++i) {
     const int x = SAFE_L + 4 + (i / 6) * 124;
     const int y = crt::HEAD_RULE_Y + 24 + (i % 6) * 16;
     tv.setTextColor(i == 0 ? ACCENT : TFT_WHITE, TFT_NAVY);
